@@ -1,0 +1,17 @@
+Two players take alternating turns on a 4x4 grid.
+First player is randomly chosen.
+Each turn, a player can place a piece on an empty cell.
+Each player has two pieces of each of four types in their initial supply: 2x Diag, 2x Ortho, 2x Near, 2x Far.
+When a player plays a piece, that piece is taken from their supply.  A player cannot play using a type of piece if they have none of those pieces remaining in their supply.
+Each piece forces the opponent to place in a specific region relative to the piece just played:
+The Diag piece forces the opponent to play diagonally to the piece just played, at any distance.
+The Ortho piece forces the opponent to play orthogonally to the piece just played, at any distance.
+The Near piece forces the opponent to play adjacent to the piece just played, diagonally or orthogonally.
+The Far piece forces the opponent to play at least two cells away from the piece just played, diagonally or orthogonally.
+If a player cannot make make a legal move (e.g. all cells in allowed region are occupied), they pass their turn, and the opposing player has no restrictions on their next turn. The game does not end just because a player has no legal moves.
+The game ends as soon as a player starts their turn with zero pieces remaining out of their initial 8 pieces.  This means that an opponent is able to make one last move after a player plays their final piece.  A player starting their turn with zero pieces remaining in their supply is the only end condition for the game.
+A line of three is 1 point, a line of four is 2 points.  Most points wins.  Draws are possible.
+
+Adjustments for Human vs AI play:
+The human always gets to pick whether to go first or second before the game starts.
+The human is always represented as blue, the AI is always represented as red.

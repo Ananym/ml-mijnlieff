@@ -36,6 +36,9 @@
           {{ gameState.currentPlayer === Player.ONE ? 'Player One' : 'Player Two' }}
         </div> -->
       </div>
+      <div v-if="!gameOver">
+        Prediction: {{ prediction }}
+      </div>
       <div v-if="gameOver">
         <h2>Game Over! {{ winnerProclamation }}</h2>
         <p>Human Score: {{ scores.HUMAN }}</p>
@@ -89,6 +92,7 @@ export default {
     const isAIThinking: Ref<boolean> = ref(false);
     const isHumanFirst: Ref<boolean> = ref(true);
     const lastAIMove: Ref<Move | null> = ref(null);
+    const prediction: Ref<number | null> = ref(null);
     const rulesVisible: Ref<boolean> = ref(false);
 
     const useRandomDummy = false;
@@ -258,7 +262,9 @@ export default {
           if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
           }
-          move = await response.json();
+          const data = await response.json();
+          prediction.value = data.prediction;
+          move = data;
         }
 
         const turnResult = makeMove(gameState.value, move);
@@ -299,6 +305,7 @@ export default {
       validMoves,
       gameOver,
       scores,
+      prediction,
       isAIThinking,
       isHumanFirst,
       lastAIMove,

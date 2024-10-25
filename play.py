@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 import numpy as np
 from game import GameState, Move, Player, PieceType, print_full_legal_moves
-from agent import RLAgent
+from agent import FutureStateWithOutcomePrediction, RLAgent
 import random
 
 app = Flask(__name__)
@@ -15,13 +15,11 @@ CORS(
     },
 )
 
-# Initialize the AI agents
-first_player_agent = RLAgent()
-second_player_agent = RLAgent()
+# Initialize the AI agent
+agent = RLAgent()
 
-# Load the pre-trained models
-first_player_agent.load("final_agent1.pth")
-second_player_agent.load("final_agent2.pth")
+# Load the pre-trained model
+agent.load("final_agent.pth")
 
 
 def convert_frontend_state_to_game_state(frontend_state):
@@ -78,19 +76,16 @@ def get_ai_move():
     if np.all(legal_moves_grid == 0):
         abort(400, "No legal moves available.")
 
-    # Select the appropriate agent based on the current player
-    agent = first_player_agent if game_state.current_player == Player.ONE else second_player_agent
-
-    # Get the game state representation
-    game_state_representation = game_state.get_game_state_representation()
-
     print(f"Current player: {game_state.current_player}")
     print_full_legal_moves(legal_moves_grid)
 
-    move = agent.select_move(legal_moves_grid, game_state_representation)
+    next_state: FutureStateWithOutcomePrediction = agent.select_move(
+        game_state.get_possible_next_states(),
+        game_state.current_player == Player.ONE, 0)
 
-    if move:
-
+    if next_state:
+        # move = Move(next_state.move.x, next_state.move.y, PieceType(next_state.move.piece_type))
+        move = next_state.move
         relevent_piece_counts = game_state.piece_counts[
             game_state.current_player]
         if relevent_piece_counts[move.piece_type] == 0:
@@ -101,7 +96,8 @@ def get_ai_move():
         json_move = jsonify({
             "x": int(move.x),
             "y": int(move.y),
-            "pieceType": int(move.piece_type.value) + 1
+            "pieceType": int(move.piece_type.value) + 1,
+            "prediction": float(next_state.predicted_outcome),
         })
 
         return json_move

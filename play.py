@@ -20,7 +20,7 @@ CORS(
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 network_wrapper = DualNetworkWrapper(device)
-network_wrapper.load("agent_20241029_122037.pth")
+network_wrapper.load("agent_20241111_155803.pth")
 mcts_player = MCTS(network_wrapper, num_simulations=400)
 
 

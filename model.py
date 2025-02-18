@@ -141,7 +141,7 @@ class DualNetworkWrapper:
 
         value_loss = F.binary_cross_entropy(value_pred, value_targets)
 
-        total_loss = policy_loss + value_loss
+        total_loss = policy_loss + 0.5 * value_loss
 
         total_loss.backward()
 

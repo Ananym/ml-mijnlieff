@@ -1,0 +1,45 @@
+# Game and Model Design Decisions
+
+## Game Representation
+
+- Board State: 4x4x3 grid
+  - 3 channels: Player 1 pieces, Player 2 pieces, Empty spaces
+- Available Moves: 4x4x4 grid
+  - 4 channels: Permitted play area for each piece type (Diag, Ortho, Near, Far)
+
+## Model Architecture
+
+- Value Network
+  - Estimates probability of winning from any given state
+
+## Training Approach
+
+- Self-play adversarial training
+- Full games from the start (no curriculum learning)
+- Reinforcement Learning algorithm: To be determined (no specific preference)
+
+## Reward Structure
+
+- Win: +1
+- Loss: -1
+- Draw: 0
+- Rewards given at the end of the game
+
+## Special Cases
+
+- Implement a simple heuristic for "passing turn" scenario
+
+## Training Details
+
+- Number of training games/episodes: To be determined during experimentation
+- Training environment: Reasonably capable desktop PC
+
+## Evaluation
+
+- Performance evaluation to be handled separately (not part of this implementation)
+
+## Not Implemented
+
+- Separate opponent model
+- Point system in rewards
+- Curriculum learning

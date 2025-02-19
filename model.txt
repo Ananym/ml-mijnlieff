@@ -1,0 +1,31 @@
+Two players take alternating turns on a 4x4 grid.
+Each turn, a player can place a piece on an empty cell.
+Each player has two pieces of each of four types in their initial supply: 2x Diag, 2x Ortho, 2x Near, 2x Far.
+When a player plays a piece, that piece is taken from their supply.  A player cannot play using a type of piece if they have none of those pieces remaining in their supply.
+Each piece forces the opponent to place in a specific region relative to the piece just played:
+The Diag piece forces the opponent to play diagonally to the piece just played, at any distance.
+The Ortho piece forces the opponent to play orthogonally to the piece just played, at any distance.
+The Near piece forces the opponent to play adjacent to the piece just played, diagonally or orthogonally.
+The Far piece forces the opponent to play at least two cells away from the piece just played, diagonally or orthogonally.
+If a player cannot make make a legal move (e.g. all cells in allowed region are occupied), they pass their turn, and the opposing player has no restrictions on their next turn. The game does not end just because a player has no legal moves.
+The game ends as soon as a player starts their turn with zero pieces remaining out of their initial 8 pieces.  This means that an opponent is able to make one last move after a player plays their final piece.  A player starting their turn with zero pieces remaining in their supply is the only end condition for the game.
+A line of three is 1 point, a line of four is 2 points.  Most points wins.  Draws are possible.
+The game may be enhanced by terrain tiles, which impose certain effects.
+
+We're going to make a ML model to play this game.
+
+Input shape:
+Input is a 4x4 grid with six layers: Player 1 pieces, player 2 pieces, terrain 1, terrain 2, terrain 3, terrain 4
+All values in the input grid are either 0 or 1.
+
+Additionally, an extra flat input of 8 values, representing the number of pieces of each type each player has remaining.
+All values in this flat array are either 0, 1, or 2.
+
+Output shape:
+4x4x4 grid (x, y, piece type)
+Continuous values, which represent probabilities of each move being played.
+
+Model layers:
+1. One or more layers to accomodate the primary input grid
+2. One or more fully connected layer to accomodate the convolutional output and the additional flat input.
+

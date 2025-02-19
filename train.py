@@ -16,210 +16,321 @@ import time
 import signal
 import sys
 from dataclasses import dataclass
-from mcts import MCTS
+from model import ModelWrapper
+from tqdm import tqdm, trange
 
 debugPrint = False
 
 
 @dataclass
 class TrainingExample:
-    state_representation: GameStateRepresentation
-    mcts_policy: np.ndarray  # 4x4x4 probabilities from MCTS
-    value_target: float  # Final game outcome
+    state_rep: GameState
+    policy: np.ndarray  # One-hot encoded actual move made
+    value: float  # Game outcome
 
 
-def play_game_mcts(
-    mcts_player: MCTS, temperature_schedule: List[float]
+def self_play_game(
+    model: ModelWrapper, temperature: float = 1.0, debug: bool = False
 ) -> List[TrainingExample]:
-    """Play a complete game using MCTS, returning state/policy pairs for training."""
+    """Play a game using the current policy, return state/action pairs"""
     game = GameState()
-    training_examples = []
+    examples = []
     move_count = 0
-    game_start = time.time()
-
-    if debugPrint:
-        print(f"Starting new game...")
 
     while True:
-        move_start = time.time()
+        # Get legal moves
+        legal_moves = game.get_legal_moves()
+        if not np.any(legal_moves):
+            # No legal moves, must pass
+            game.pass_turn()
+            continue
 
-        # Determine temperature based on move number
-        temperature = temperature_schedule[
-            min(move_count, len(temperature_schedule) - 1)
-        ]
+        # Get move probabilities from policy network
+        state_rep = game.get_game_state_representation()
+        policy, _ = model.predict(state_rep.board, state_rep.flat_values, legal_moves)
 
-        if debugPrint:
-            print(f"\nMove {move_count + 1}")
-            print(f"Current player: {game.current_player.name}")
-            print(f"Temperature: {temperature}")
+        # Remove batch dimension from policy
+        policy = policy.squeeze(0)  # Now shape is (4, 4, 4)
 
-        # Get MCTS probabilities
-        mcts_probs = mcts_player.get_action_probabilities(game, temperature)
+        # Debug prints
+        if debug:
+            print(f"\nMove {move_count + 1}, Player {game.current_player.name}")
+            print(f"Legal moves sum: {legal_moves.sum()}")
+            print(f"Initial policy sum: {policy.sum()}")
+            print(f"Policy shape: {policy.shape}")
+            print(f"Legal moves shape: {legal_moves.shape}")
 
-        if debugPrint:
-            print(f"MCTS move selection took {time.time() - move_start:.2f} seconds")
+        # Ensure we only consider legal moves
+        masked_policy = policy * legal_moves  # Mask out illegal moves
+        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)  # Renormalize
 
-        # Store the current state and MCTS probabilities
-        training_examples.append(
+        if debug:
+            print(f"Masked policy sum: {masked_policy.sum()}")
+
+        # Verify the move is legal before choosing
+        if not np.any(masked_policy):
+            if debug:
+                print("Warning: No valid moves in masked policy!")
+            # Fallback to random legal move
+            legal_positions = np.argwhere(legal_moves)
+            idx = np.random.randint(len(legal_positions))
+            move_coords = tuple(legal_positions[idx])
+            if debug:
+                print(f"Falling back to random legal move: {move_coords}")
+        else:
+            # Choose move (either greedily or with temperature)
+            if (
+                temperature == 0 or move_count >= 12
+            ):  # Play deterministically in endgame
+                move_coords = tuple(
+                    np.unravel_index(masked_policy.argmax(), masked_policy.shape)
+                )
+            else:
+                # Sample from the probability distribution
+                policy_flat = masked_policy.flatten()
+                move_idx = np.random.choice(len(policy_flat), p=policy_flat)
+                move_coords = tuple(np.unravel_index(move_idx, masked_policy.shape))
+
+        # Double check the move is legal
+        x, y, piece_type = move_coords
+        if not legal_moves[x, y, piece_type]:
+            print(f"ERROR: Selected illegal move {move_coords}!")
+            print("Legal moves shape:", legal_moves.shape)
+            print("Policy shape:", policy.shape)
+            print(
+                "Selected move is legal according to mask:",
+                legal_moves[x, y, piece_type],
+            )
+            raise ValueError(f"Attempted to make illegal move {move_coords}")
+
+        move = Move(x, y, PieceType(piece_type))
+
+        # Create one-hot encoded policy target
+        policy_target = np.zeros_like(masked_policy)
+        policy_target[x, y, piece_type] = 1.0
+
+        # Store the example
+        examples.append(
             TrainingExample(
-                state_representation=game.get_game_state_representation(),
-                mcts_policy=mcts_probs,
-                value_target=0.0,  # Will be filled in later
+                state_rep=state_rep,
+                policy=policy_target,
+                value=0.0,  # Will be filled in later
             )
         )
 
-        # Choose move based on MCTS probabilities
-        if temperature == 0:
-            move_coords = np.unravel_index(mcts_probs.argmax(), mcts_probs.shape)
-        else:
-            # Sample from the probability distribution
-            move_coords = np.random.choice(64, p=mcts_probs.flatten())
-            move_coords = np.unravel_index(move_coords, mcts_probs.shape)
-
-        move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
-        if debugPrint:
-            print(f"Selected move: ({move.x}, {move.y}, {move.piece_type.name})")
-
-        # Make the move
+        # Make move
         result = game.make_move(move)
         move_count += 1
 
         if result == TurnResult.GAME_OVER:
             # Game is over, get the winner
             winner = game.get_winner()
-            if debugPrint:
-                print(f"\nGame over after {move_count} moves!")
-                print(f"Winner: {winner.name if winner else 'Draw'}")
-                print(f"Total game time: {time.time() - game_start:.2f} seconds")
 
             # Set value targets based on game outcome
-            for example in training_examples:
+            for example in examples:
                 if winner is None:
-                    example.value_target = 0.5  # Draw
+                    example.value = 0.5  # Draw
                 else:
-                    # 1 for P1 win, 0 for P2 win
-                    example.value_target = 1.0 if winner == Player.ONE else 0.0
+                    # 1 for P1 win, 0 for P2 win from P1's perspective
+                    example.value = 1.0 if winner == Player.ONE else 0.0
 
-            return training_examples
+            return examples
 
 
 def train_network(
-    network_wrapper,
-    training_minutes: int,
-    save_interval_minutes: int = 60 * 3,
+    model: ModelWrapper,
+    num_episodes: int = 100,
     batch_size: int = 128,
-    num_simulations: int = 100,
-    buffer_size: int = 10000,
-    temperature_schedule: List[float] = None,
-    save_callback=None,  # Add this parameter
+    save_interval: int = 10,
+    num_checkpoints: int = 3,
+    min_temp: float = 0.5,
+    debug: bool = False,
 ):
-    print("Starting training...")
-    print(f"Training will run for {training_minutes} minutes")
-    print(f"MCTS simulations per move: {num_simulations}")
-    print(f"Batch size: {batch_size}")
-    print(f"Buffer size: {buffer_size}")
+    """Main training loop that runs until interrupted"""
+    replay_buffer = []
+    running_loss = {"total": 0, "policy": 0, "value": 0}
+    running_count = 0
+    iteration = 0
+    training_start = time.time()
 
-    if temperature_schedule is None:
-        temperature_schedule = [1.0] * 10 + [0.5] * 10 + [0.25] * 10 + [0.0]
+    # Keep track of last N checkpoints
+    checkpoint_files = []
 
-    # Initialize MCTS
-    mcts_player = MCTS(network_wrapper, num_simulations=num_simulations)
+    # Setup interrupt handling
+    interrupt_received = False
 
-    # Initialize replay buffer
-    replay_buffer: List[TrainingExample] = []
+    def handle_interrupt(signum, frame):
+        nonlocal interrupt_received
+        if interrupt_received:  # Second interrupt, exit immediately
+            print("\nForced exit...")
+            sys.exit(1)
+        print("\nInterrupt received, finishing current iteration...")
+        interrupt_received = True
 
-    # Training loop setup
-    start_time = datetime.now()
-    end_time = start_time + timedelta(minutes=training_minutes)
-    last_save_time = start_time
-    game_count = 0
+    signal.signal(signal.SIGINT, handle_interrupt)
 
-    while datetime.now() < end_time:
-        if debugPrint:
-            print(f"\nStarting game {game_count + 1}")
-        game_start = time.perf_counter()
+    print(f"Starting infinite training loop")
+    print(f"Episodes per iteration: {num_episodes}")
+    print(f"Temperature range: {min_temp:.1f} - 2.0")
+    print(f"Press Ctrl+C to stop training gracefully")
 
-        # Play a game and get training examples
-        game_examples = play_game_mcts(mcts_player, temperature_schedule)
+    try:
+        while not interrupt_received:
+            iteration += 1
+            iteration_start = time.time()
 
-        game_duration = time.perf_counter() - game_start
-
-        # Add new examples to replay buffer
-        replay_buffer.extend(game_examples)
-
-        # Keep buffer size in check
-        if len(replay_buffer) > buffer_size:
-            replay_buffer = replay_buffer[-buffer_size:]
-
-        # Train on random minibatch from replay buffer
-        if len(replay_buffer) >= batch_size:
-            if debugPrint:
-                print("Training on minibatch...")
-            minibatch = random.sample(replay_buffer, batch_size)
-
-            # Prepare training data
-            grid_inputs = np.array([ex.state_representation.board for ex in minibatch])
-            flat_inputs = np.array(
-                [ex.state_representation.flat_values for ex in minibatch]
+            # Self-play phase
+            episode_pbar = tqdm(
+                range(num_episodes),
+                desc=f"Self-Play Games (Iter {iteration})",
+                leave=False,
             )
-            policy_targets = np.array([ex.mcts_policy for ex in minibatch])
-            value_targets = np.array([ex.value_target for ex in minibatch])
+            for episode in episode_pbar:
+                # Higher base temperature and slower decrease
+                # Also add some random fluctuation for more exploration
+                base_temp = max(min_temp, 2.0 - (1.5 * episode / num_episodes))
+                temperature = base_temp * (
+                    0.8 + 0.4 * random.random()
+                )  # Random fluctuation
 
-            # Train network
-            total_loss, policy_loss, value_loss = network_wrapper.train(
-                grid_inputs, flat_inputs, policy_targets, value_targets
-            )
-
-            if debugPrint:
-                print(f"Game {game_count + 1} completed in {game_duration:.1f} seconds")
-                print(f"Collected {len(game_examples)} training examples")
-            else:
-                print(f"Game {game_count + 1} completed in {game_duration:.1f} seconds")
-                print(
-                    f"Training losses - Total: {total_loss:.4f}, Policy: {policy_loss:.4f}, Value: {value_loss:.4f}"
+                game_examples = self_play_game(model, temperature, debug)
+                replay_buffer.extend(game_examples)
+                episode_pbar.set_postfix(
+                    {"buffer_size": len(replay_buffer), "temp": f"{temperature:.2f}"}
                 )
 
-        game_count += 1
+                # Keep buffer size in check
+                if len(replay_buffer) > 10000:
+                    replay_buffer = replay_buffer[-10000:]
 
-        # Save periodically
-        current_time = datetime.now()
-        if (
-            current_time - last_save_time
-        ).total_seconds() / 60 >= save_interval_minutes:
-            save_path = f"agent_{current_time.strftime('%Y%m%d_%H%M%S')}.pth"
-            if save_callback:
-                save_callback(network_wrapper, save_path)
-            else:
-                network_wrapper.save(save_path)
-            print(f"\nModel saved at {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            last_save_time = current_time
+            # Training phase
+            train_pbar = tqdm(range(10), desc="Training Epochs", leave=False)
+            epoch_losses = {"total": 0, "policy": 0, "value": 0}
+
+            for _ in train_pbar:
+                # Sample batch
+                batch = random.sample(
+                    replay_buffer, min(batch_size, len(replay_buffer))
+                )
+
+                # Prepare training data
+                board_inputs = np.array([ex.state_rep.board for ex in batch])
+                flat_inputs = np.array([ex.state_rep.flat_values for ex in batch])
+                policy_targets = np.array([ex.policy for ex in batch])
+                value_targets = np.array([ex.value for ex in batch])
+
+                # Train network
+                total_loss, policy_loss, value_loss = model.train_step(
+                    board_inputs, flat_inputs, policy_targets, value_targets
+                )
+
+                # Update running averages
+                running_count += 1
+                running_loss["total"] = (
+                    running_loss["total"] * (running_count - 1) + total_loss
+                ) / running_count
+                running_loss["policy"] = (
+                    running_loss["policy"] * (running_count - 1) + policy_loss
+                ) / running_count
+                running_loss["value"] = (
+                    running_loss["value"] * (running_count - 1) + value_loss
+                ) / running_count
+
+                # Update epoch losses
+                epoch_losses["total"] += total_loss
+                epoch_losses["policy"] += policy_loss
+                epoch_losses["value"] += value_loss
+
+                train_pbar.set_postfix(
+                    {
+                        "running_total": f"{running_loss['total']:.4f}",
+                        "running_policy": f"{running_loss['policy']:.4f}",
+                        "running_value": f"{running_loss['value']:.4f}",
+                    }
+                )
+
+            # Print epoch summary
+            avg_total = epoch_losses["total"] / 10
+            avg_policy = epoch_losses["policy"] / 10
+            avg_value = epoch_losses["value"] / 10
+            elapsed_time = time.time() - training_start
+            hours = elapsed_time // 3600
+            minutes = (elapsed_time % 3600) // 60
+
+            tqdm.write(
+                f"\nIteration {iteration} - Time: {int(hours)}h {int(minutes)}m"
+                f"\nAvg Losses: Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}"
+            )
+
+            # Save checkpoint with rotation
+            if iteration % save_interval == 0 or interrupt_received:
+                save_path = f"model_iter_{iteration}.pth"
+                model.save(save_path)
+                checkpoint_files.append(save_path)
+
+                # Remove old checkpoints if we have too many
+                while len(checkpoint_files) > num_checkpoints:
+                    old_checkpoint = checkpoint_files.pop(0)
+                    try:
+                        os.remove(old_checkpoint)
+                        tqdm.write(f"Removed old checkpoint: {old_checkpoint}")
+                    except OSError:
+                        pass
+
+                tqdm.write(f"Saved checkpoint: {save_path}")
+
+            tqdm.write(
+                f"Iteration completed in {time.time() - iteration_start:.1f} seconds\n"
+            )
+
+    finally:
+        # Training summary
+        elapsed_time = time.time() - training_start
+        hours = elapsed_time // 3600
+        minutes = (elapsed_time % 3600) // 60
+
+        print("\nTraining Summary:")
+        print(f"Total training time: {int(hours)}h {int(minutes)}m")
+        print(f"Iterations completed: {iteration}")
+        print(f"Final running losses:")
+        print(f"  Total: {running_loss['total']:.4f}")
+        print(f"  Policy: {running_loss['policy']:.4f}")
+        print(f"  Value: {running_loss['value']:.4f}")
+        print(f"\nCheckpoints saved: {', '.join(checkpoint_files)}")
 
 
-def evaluate_model(
-    network_wrapper,
-    num_games: int = 100,
-    num_simulations: int = 100,
-    temperature: float = 0.0,  # Use 0 for deterministic play in evaluation
-):
-    mcts_player = MCTS(network_wrapper, num_simulations=num_simulations)
-    wins = {Player.ONE: 0, Player.TWO: 0, None: 0}
+def evaluate_model(model: ModelWrapper, num_games: int = 100):
+    """Evaluate model by playing against itself"""
+    wins = {Player.ONE: 0, Player.TWO: 0, None: 0}  # None = draw
 
-    for game_idx in range(num_games):
+    for game_idx in tqdm(range(num_games), desc="Evaluation Games"):
         game = GameState()
-        while True:
-            # Get move from MCTS
-            move = mcts_player.get_best_move(game)
+        move_count = 0
 
-            # Make move
+        while True:
+            # Get legal moves
+            legal_moves = game.get_legal_moves()
+            if not np.any(legal_moves):
+                game.pass_turn()
+                continue
+
+            # Use policy network to choose move
+            state_rep = game.get_game_state_representation()
+            policy, _ = model.predict(
+                state_rep.board, state_rep.flat_values, legal_moves
+            )
+
+            # Choose best move
+            move_coords = np.unravel_index(policy.argmax(), policy.shape)
+            move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+
             result = game.make_move(move)
+            move_count += 1
 
             if result == TurnResult.GAME_OVER:
                 winner = game.get_winner()
                 wins[winner] += 1
                 break
-
-        if game_idx % 10 == 0:
-            print(f"Completed {game_idx + 1} evaluation games")
 
     print("\nEvaluation Results:")
     print(f"Player 1 wins: {wins[Player.ONE]} ({wins[Player.ONE]/num_games*100:.1f}%)")
@@ -231,55 +342,44 @@ def evaluate_model(
 
 if __name__ == "__main__":
     import argparse
-    from model import DualNetworkWrapper  # Import the new model
 
-    parser = argparse.ArgumentParser(description="Train the dual network with MCTS.")
+    parser = argparse.ArgumentParser(description="Train and evaluate the model")
+    parser.add_argument("--mode", choices=["train", "eval"], default="train")
     parser.add_argument(
-        "--training_minutes", type=int, default=60, help="Number of minutes to train"
-    )
-    parser.add_argument(
-        "--save_interval_minutes",
-        type=int,
-        default=15,
-        help="Minutes between model saves",
-    )
-    parser.add_argument(
-        "--num_simulations",
-        type=int,
-        default=100,
-        help="Number of MCTS simulations per move",
+        "--episodes", type=int, default=100, help="Episodes per iteration"
     )
     parser.add_argument(
         "--batch_size", type=int, default=128, help="Training batch size"
     )
     parser.add_argument(
-        "--buffer_size", type=int, default=10000, help="Size of replay buffer"
+        "--save_interval", type=int, default=10, help="Save every N iterations"
     )
     parser.add_argument(
-        "--load_model", type=str, default=None, help="Path to load existing model"
+        "--num_checkpoints", type=int, default=3, help="Number of checkpoints to keep"
     )
     parser.add_argument(
-        "--evaluate", action="store_true", help="Run evaluation instead of training"
+        "--load_model", type=str, default=None, help="Path to model to load"
     )
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
 
     args = parser.parse_args()
 
-    # Initialize network
+    # Initialize model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    network_wrapper = DualNetworkWrapper(device)
+    model = ModelWrapper(device)
 
     if args.load_model and os.path.exists(args.load_model):
-        network_wrapper.load(args.load_model)
+        model.load(args.load_model)
         print(f"Loaded model from {args.load_model}")
 
-    if args.evaluate:
-        evaluate_model(network_wrapper, num_simulations=args.num_simulations)
-    else:
+    if args.mode == "train":
         train_network(
-            network_wrapper,
-            training_minutes=args.training_minutes,
-            save_interval_minutes=args.save_interval_minutes,
-            num_simulations=args.num_simulations,
+            model,
+            num_episodes=args.episodes,
             batch_size=args.batch_size,
-            buffer_size=args.buffer_size,
+            save_interval=args.save_interval,
+            num_checkpoints=args.num_checkpoints,
+            debug=args.debug,
         )
+    else:
+        evaluate_model(model)

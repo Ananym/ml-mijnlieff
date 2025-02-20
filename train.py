@@ -145,9 +145,9 @@ def train_network(
     save_interval: int = 10,
     num_checkpoints: int = 3,
     min_temp: float = 0.5,
-    strategic_opponent_ratio: float = 0.7,
-    buffer_size: int = 15000,
-    policy_weight: float = 0.5,
+    strategic_opponent_ratio: float = 0.5,
+    buffer_size: int = 10000,
+    policy_weight: float = 1.0,
     num_epochs: int = 40,
     debug: bool = False,
 ):
@@ -160,6 +160,21 @@ def train_network(
     strategic_opponent = StrategicOpponent()
     latest_model_path = "model_latest.pth"
 
+    # Base stats template
+    stats_template = {
+        "strategic_wins_as_p1": 0,
+        "strategic_wins_as_p2": 0,
+        "strategic_games_as_p1": 0,
+        "strategic_games_as_p2": 0,
+        "self_play_p1_wins": 0,
+        "self_play_games": 0,
+        "total_moves": 0,  # Changed from avg_game_length
+        "total_games": 0,  # Changed from moves_tracked
+        "central_moves": 0,  # Moves in the 2x2 center
+        "policy_confidence": 0,  # Average max probability of chosen moves
+        "moves_counted": 0,
+    }
+
     # Keep track of last N checkpoints
     checkpoint_files = []
 
@@ -167,8 +182,8 @@ def train_network(
         move_count: int, total_moves: int = 12, is_strategic: bool = False
     ) -> float:
         """Unified temperature schedule with lower temps for strategic games"""
-        # Start cooler (1.5) for strategic games, normal (2.0) for self-play
-        max_temp = 1.5 if is_strategic else 2.0
+        # Start cooler (1.2) for strategic games, normal (2.0) for self-play
+        max_temp = 1.2 if is_strategic else 2.0
         base_temp = max(min_temp, max_temp - (1.5 * move_count / total_moves))
         # Less randomness for strategic games
         rand_factor = 0.2 if is_strategic else 0.4
@@ -200,6 +215,9 @@ def train_network(
         while not interrupt_received:
             iteration += 1
             iteration_start = time.time()
+
+            # Reset iteration stats
+            iter_stats = stats_template.copy()
 
             # Self-play phase
             episode_pbar = tqdm(
@@ -295,6 +313,14 @@ def train_network(
                         "type": "self-play",
                     }
                 )
+
+                # In self-play games, after game over:
+                if result == TurnResult.GAME_OVER:
+                    iter_stats["self_play_games"] += 1
+                    if winner == Player.ONE:
+                        iter_stats["self_play_p1_wins"] += 1
+                    iter_stats["total_moves"] += move_count
+                    iter_stats["total_games"] += 1
 
             # Strategic opponent games
             for episode in range(strategic_games):
@@ -393,6 +419,30 @@ def train_network(
                     {"buffer_size": len(replay_buffer), "type": "strategic"}
                 )
 
+                # In strategic opponent games, after game over:
+                if result == TurnResult.GAME_OVER:
+                    if model_is_player_one:
+                        iter_stats["strategic_games_as_p1"] += 1
+                        if winner == Player.ONE:
+                            iter_stats["strategic_wins_as_p1"] += 1
+                    else:
+                        iter_stats["strategic_games_as_p2"] += 1
+                        if winner == Player.TWO:
+                            iter_stats["strategic_wins_as_p2"] += 1
+                    iter_stats["total_moves"] += move_count
+                    iter_stats["total_games"] += 1
+
+                # When making any move (both self-play and strategic):
+                # Track policy confidence and central moves
+                if is_model_turn:  # Only track model's moves
+                    max_prob = masked_policy.max()
+                    iter_stats["policy_confidence"] += max_prob
+                    iter_stats["moves_counted"] += 1
+
+                    # Check if move was in center
+                    if 1 <= move.x <= 2 and 1 <= move.y <= 2:
+                        iter_stats["central_moves"] += 1
+
                 # Keep buffer size in check
                 if len(replay_buffer) > buffer_size:
                     replay_buffer = replay_buffer[-buffer_size:]
@@ -461,6 +511,27 @@ def train_network(
                 f"\nAvg Losses: Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}"
             )
 
+            # Update stats display
+            tqdm.write(
+                f"\nIteration {iteration} Statistics:"
+                f"\n  Time: {int(hours)}h {int(minutes)}m"
+                f"\n  Losses - Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}"
+                f"\n  Strategic Performance:"
+                f"\n    As P1: {iter_stats['strategic_wins_as_p1']}/{iter_stats['strategic_games_as_p1']} "
+                f"({100 * iter_stats['strategic_wins_as_p1'] / max(1, iter_stats['strategic_games_as_p1']):.1f}%)"
+                f"\n    As P2: {iter_stats['strategic_wins_as_p2']}/{iter_stats['strategic_games_as_p2']} "
+                f"({100 * iter_stats['strategic_wins_as_p2'] / max(1, iter_stats['strategic_games_as_p2']):.1f}%)"
+                f"\n  Self-play P1 Win Rate: {100 * iter_stats['self_play_p1_wins'] / max(1, iter_stats['self_play_games']):.1f}%"
+                f"\n  Model Behavior:"
+                f"\n    Avg Game Length: {iter_stats['total_moves'] / max(1, iter_stats['total_games']):.1f} moves"
+                f"\n    Central Move Rate: {100 * iter_stats['central_moves'] / max(1, iter_stats['moves_counted']):.1f}%"
+                f"\n    Avg Policy Confidence: {iter_stats['policy_confidence'] / max(1, iter_stats['moves_counted']):.3f}"
+            )
+
+            tqdm.write(
+                f"Iteration completed in {time.time() - iteration_start:.1f} seconds\n"
+            )
+
             # Save latest model after every iteration
             model.save(latest_model_path)
 
@@ -482,11 +553,12 @@ def train_network(
 
                 tqdm.write(f"Saved checkpoint: {save_path}")
 
-            tqdm.write(
-                f"Iteration completed in {time.time() - iteration_start:.1f} seconds\n"
-            )
-
     finally:
+        # Calculate final elapsed time
+        elapsed_time = time.time() - training_start
+        hours = elapsed_time // 3600
+        minutes = (elapsed_time % 3600) // 60
+
         # Always save final model state
         final_path = f"model_iter_final.pth"
         model.save(final_path)
@@ -494,18 +566,19 @@ def train_network(
         print(f"\nFinal model saved as: {final_path}")
         print(f"Latest model saved as: {latest_model_path}")
 
-        # Training summary
-        elapsed_time = time.time() - training_start
-        hours = elapsed_time // 3600
-        minutes = (elapsed_time % 3600) // 60
-
+        # Enhanced final summary
         print("\nTraining Summary:")
         print(f"Total training time: {int(hours)}h {int(minutes)}m")
         print(f"Iterations completed: {iteration}")
-        print(f"Final running losses:")
-        print(f"  Total: {running_loss['total']:.4f}")
-        print(f"  Policy: {running_loss['policy']:.4f}")
-        print(f"  Value: {running_loss['value']:.4f}")
+        print(f"Final Model State:")
+        print(f"  Loss Metrics:")
+        print(f"    Total: {running_loss['total']:.4f}")
+        print(f"    Policy: {running_loss['policy']:.4f}")
+        print(f"    Value: {running_loss['value']:.4f}")
+        print(
+            f"  Policy/Value Ratio: {running_loss['policy']/running_loss['value']:.2f}"
+        )
+        print(f"  Parameters: {sum(p.numel() for p in model.model.parameters()):,}")
         print(f"\nCheckpoints saved: {', '.join(checkpoint_files)}")
 
 
@@ -651,6 +724,11 @@ if __name__ == "__main__":
         help="Path to model to load",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start with a fresh model, ignoring existing checkpoints",
+    )
 
     args = parser.parse_args()
 
@@ -658,11 +736,14 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = ModelWrapper(device)
 
-    if args.load_model and os.path.exists(args.load_model):
+    if not args.fresh and args.load_model and os.path.exists(args.load_model):
         model.load(args.load_model)
         print(f"Loaded model from {args.load_model}")
     else:
-        print(f"No model found at {args.load_model}, starting fresh")
+        if args.fresh:
+            print("Starting with fresh model as requested")
+        else:
+            print(f"No model found at {args.load_model}, starting fresh")
 
     if args.mode == "train":
         train_network(

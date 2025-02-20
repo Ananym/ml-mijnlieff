@@ -10,17 +10,19 @@ class PolicyValueNet(nn.Module):
     def __init__(self):
         super().__init__()
         # Deeper network with more channels
-        self.conv1 = nn.Conv2d(10, 128, 3, padding=1)
-        self.conv2 = nn.Conv2d(128, 128, 3, padding=1)
-        self.conv3 = nn.Conv2d(128, 128, 3, padding=1)
-        self.conv4 = nn.Conv2d(128, 128, 3, padding=1)
+        self.conv1 = nn.Conv2d(10, 256, 3, padding=1)
+        self.conv2 = nn.Conv2d(256, 256, 3, padding=1)
+        self.conv3 = nn.Conv2d(256, 256, 3, padding=1)
+        self.conv4 = nn.Conv2d(256, 256, 3, padding=1)
+        self.conv5 = nn.Conv2d(256, 256, 3, padding=1)
 
         # Policy head (outputs 4x4x4 move probabilities)
-        self.policy_conv = nn.Conv2d(128, 4, 1)
+        self.policy_conv = nn.Conv2d(256, 4, 1)
 
         # Value head
-        self.value_conv = nn.Conv2d(128, 32, 1)
-        self.value_fc = nn.Linear(32 * 4 * 4 + 10, 1)
+        self.value_conv = nn.Conv2d(256, 64, 1)
+        self.value_fc = nn.Linear(64 * 4 * 4 + 10, 256)
+        self.value_out = nn.Linear(256, 1)
 
     def forward(self, board_state, flat_state):
         # Main trunk
@@ -28,6 +30,7 @@ class PolicyValueNet(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
+        x = F.relu(self.conv5(x))
 
         # Policy head
         policy = self.policy_conv(x)
@@ -37,7 +40,8 @@ class PolicyValueNet(nn.Module):
         value = F.relu(self.value_conv(x))
         value = value.flatten(1)  # Flatten all dims except batch
         value = torch.cat([value, flat_state], dim=1)
-        value = torch.tanh(self.value_fc(value))
+        value = F.relu(self.value_fc(value))
+        value = torch.tanh(self.value_out(value))
 
         return policy, value
 

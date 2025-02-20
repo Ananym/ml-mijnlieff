@@ -43,7 +43,10 @@ class ModelWrapper:
         self.device = device
         self.model = PolicyValueNet().to(device)
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=0.0001, weight_decay=1e-4, betas=(0.9, 0.999)
+            self.model.parameters(),
+            lr=0.00002,  # Reduced from 0.0001
+            weight_decay=1e-4,
+            betas=(0.9, 0.999),
         )
 
     def predict(self, board_state, flat_state, legal_moves=None):

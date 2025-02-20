@@ -18,6 +18,7 @@ import sys
 from dataclasses import dataclass
 from model import ModelWrapper
 from tqdm import tqdm, trange
+from opponents import RandomOpponent, StrategicOpponent
 
 debugPrint = False
 
@@ -140,10 +141,11 @@ def self_play_game(
 def train_network(
     model: ModelWrapper,
     num_episodes: int = 100,
-    batch_size: int = 128,
+    batch_size: int = 256,  # Increased from 128
     save_interval: int = 10,
     num_checkpoints: int = 3,
     min_temp: float = 0.5,
+    strategic_opponent_ratio: float = 0.3,  # 30% of games against strategic opponent
     debug: bool = False,
 ):
     """Main training loop that runs until interrupted"""
@@ -152,6 +154,7 @@ def train_network(
     running_count = 0
     iteration = 0
     training_start = time.time()
+    strategic_opponent = StrategicOpponent()
 
     # Keep track of last N checkpoints
     checkpoint_files = []
@@ -172,6 +175,8 @@ def train_network(
     print(f"Starting infinite training loop")
     print(f"Episodes per iteration: {num_episodes}")
     print(f"Temperature range: {min_temp:.1f} - 2.0")
+    print(f"Strategic opponent ratio: {strategic_opponent_ratio:.1%}")
+    print(f"Batch size: {batch_size}")
     print(f"Press Ctrl+C to stop training gracefully")
 
     try:
@@ -185,18 +190,110 @@ def train_network(
                 desc=f"Self-Play Games (Iter {iteration})",
                 leave=False,
             )
-            for episode in episode_pbar:
-                # Higher base temperature and slower decrease
-                # Also add some random fluctuation for more exploration
+
+            # Determine number of strategic opponent games
+            strategic_games = int(num_episodes * strategic_opponent_ratio)
+            selfplay_games = num_episodes - strategic_games
+
+            # Self-play games
+            for episode in range(selfplay_games):
                 base_temp = max(min_temp, 2.0 - (1.5 * episode / num_episodes))
-                temperature = base_temp * (
-                    0.8 + 0.4 * random.random()
-                )  # Random fluctuation
+                temperature = base_temp * (0.8 + 0.4 * random.random())
 
                 game_examples = self_play_game(model, temperature, debug)
                 replay_buffer.extend(game_examples)
+                episode_pbar.update(1)
                 episode_pbar.set_postfix(
-                    {"buffer_size": len(replay_buffer), "temp": f"{temperature:.2f}"}
+                    {
+                        "buffer_size": len(replay_buffer),
+                        "temp": f"{temperature:.2f}",
+                        "type": "self-play",
+                    }
+                )
+
+            # Strategic opponent games
+            for episode in range(strategic_games):
+                game = GameState()
+                examples = []
+                move_count = 0
+
+                # Randomly decide if model plays as Player 1 or 2
+                model_is_player_one = random.random() < 0.5
+
+                while True:
+                    legal_moves = game.get_legal_moves()
+                    if not np.any(legal_moves):
+                        game.pass_turn()
+                        continue
+
+                    is_model_turn = (
+                        game.current_player == Player.ONE
+                    ) == model_is_player_one
+
+                    if is_model_turn:
+                        # Model's turn
+                        state_rep = game.get_game_state_representation()
+                        policy, _ = model.predict(
+                            state_rep.board, state_rep.flat_values, legal_moves
+                        )
+
+                        policy = policy.squeeze(0)
+                        masked_policy = policy * legal_moves
+                        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+
+                        # Use temperature for exploration
+                        temperature = max(min_temp, 1.0 - move_count / 12)
+                        if temperature > 0:
+                            policy_flat = masked_policy.flatten()
+                            move_idx = np.random.choice(len(policy_flat), p=policy_flat)
+                            move_coords = np.unravel_index(
+                                move_idx, masked_policy.shape
+                            )
+                        else:
+                            move_coords = np.unravel_index(
+                                masked_policy.argmax(), masked_policy.shape
+                            )
+
+                        move = Move(
+                            move_coords[0], move_coords[1], PieceType(move_coords[2])
+                        )
+
+                        # Store training example
+                        policy_target = np.zeros_like(masked_policy)
+                        policy_target[move_coords] = 1.0
+                        examples.append(
+                            TrainingExample(
+                                state_rep=state_rep, policy=policy_target, value=0.0
+                            )
+                        )
+                    else:
+                        # Strategic opponent's turn
+                        move = strategic_opponent.get_move(game)
+                        if move is None:
+                            game.pass_turn()
+                            continue
+
+                    result = game.make_move(move)
+                    move_count += 1
+
+                    if result == TurnResult.GAME_OVER:
+                        winner = game.get_winner()
+                        # Set value targets based on game outcome
+                        for example in examples:
+                            if winner is None:
+                                example.value = 0.5
+                            else:
+                                example.value = (
+                                    1.0
+                                    if (winner == Player.ONE) == model_is_player_one
+                                    else 0.0
+                                )
+                        break
+
+                replay_buffer.extend(examples)
+                episode_pbar.update(1)
+                episode_pbar.set_postfix(
+                    {"buffer_size": len(replay_buffer), "type": "strategic"}
                 )
 
                 # Keep buffer size in check
@@ -204,7 +301,9 @@ def train_network(
                     replay_buffer = replay_buffer[-10000:]
 
             # Training phase
-            train_pbar = tqdm(range(10), desc="Training Epochs", leave=False)
+            train_pbar = tqdm(
+                range(20), desc="Training Epochs", leave=False
+            )  # Increased from 10
             epoch_losses = {"total": 0, "policy": 0, "value": 0}
 
             for _ in train_pbar:
@@ -250,9 +349,9 @@ def train_network(
                 )
 
             # Print epoch summary
-            avg_total = epoch_losses["total"] / 10
-            avg_policy = epoch_losses["policy"] / 10
-            avg_value = epoch_losses["value"] / 10
+            avg_total = epoch_losses["total"] / 20
+            avg_policy = epoch_losses["policy"] / 20
+            avg_value = epoch_losses["value"] / 20
             elapsed_time = time.time() - training_start
             hours = elapsed_time // 3600
             minutes = (elapsed_time % 3600) // 60
@@ -300,44 +399,121 @@ def train_network(
 
 
 def evaluate_model(model: ModelWrapper, num_games: int = 100):
-    """Evaluate model by playing against itself"""
-    wins = {Player.ONE: 0, Player.TWO: 0, None: 0}  # None = draw
+    """Evaluate model by playing against different opponents"""
+    opponents = {"random": RandomOpponent(), "strategic": StrategicOpponent()}
 
-    for game_idx in tqdm(range(num_games), desc="Evaluation Games"):
-        game = GameState()
-        move_count = 0
+    results = {
+        "as_p1": {opp: {"wins": 0, "losses": 0, "draws": 0} for opp in opponents},
+        "as_p2": {opp: {"wins": 0, "losses": 0, "draws": 0} for opp in opponents},
+    }
 
-        while True:
-            # Get legal moves
-            legal_moves = game.get_legal_moves()
-            if not np.any(legal_moves):
-                game.pass_turn()
-                continue
+    # Test model as both Player 1 and Player 2 against each opponent
+    for opponent_name, opponent in opponents.items():
+        # Model as Player 1
+        for game_idx in tqdm(range(num_games), desc=f"Model (P1) vs {opponent_name}"):
+            game = GameState()
+            while True:
+                if game.current_player == Player.ONE:
+                    # Model's turn
+                    legal_moves = game.get_legal_moves()
+                    if not np.any(legal_moves):
+                        game.pass_turn()
+                        continue
 
-            # Use policy network to choose move
-            state_rep = game.get_game_state_representation()
-            policy, _ = model.predict(
-                state_rep.board, state_rep.flat_values, legal_moves
-            )
+                    state_rep = game.get_game_state_representation()
+                    policy, _ = model.predict(
+                        state_rep.board, state_rep.flat_values, legal_moves
+                    )
 
-            # Choose best move
-            move_coords = np.unravel_index(policy.argmax(), policy.shape)
-            move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+                    # Apply legal moves mask
+                    policy = policy.squeeze(0)
+                    masked_policy = policy * legal_moves
+                    masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
 
-            result = game.make_move(move)
-            move_count += 1
+                    # Choose best legal move
+                    move_coords = np.unravel_index(
+                        masked_policy.argmax(), masked_policy.shape
+                    )
+                    move = Move(
+                        move_coords[0], move_coords[1], PieceType(move_coords[2])
+                    )
+                else:
+                    # Opponent's turn
+                    move = opponent.get_move(game)
+                    if move is None:
+                        game.pass_turn()
+                        continue
 
-            if result == TurnResult.GAME_OVER:
-                winner = game.get_winner()
-                wins[winner] += 1
-                break
+                result = game.make_move(move)
+                if result == TurnResult.GAME_OVER:
+                    winner = game.get_winner()
+                    if winner == Player.ONE:
+                        results["as_p1"][opponent_name]["wins"] += 1
+                    elif winner == Player.TWO:
+                        results["as_p1"][opponent_name]["losses"] += 1
+                    else:
+                        results["as_p1"][opponent_name]["draws"] += 1
+                    break
 
+        # Model as Player 2
+        for game_idx in tqdm(range(num_games), desc=f"Model (P2) vs {opponent_name}"):
+            game = GameState()
+            while True:
+                if game.current_player == Player.TWO:
+                    # Model's turn
+                    legal_moves = game.get_legal_moves()
+                    if not np.any(legal_moves):
+                        game.pass_turn()
+                        continue
+
+                    state_rep = game.get_game_state_representation()
+                    policy, _ = model.predict(
+                        state_rep.board, state_rep.flat_values, legal_moves
+                    )
+
+                    # Apply legal moves mask
+                    policy = policy.squeeze(0)
+                    masked_policy = policy * legal_moves
+                    masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+
+                    # Choose best legal move
+                    move_coords = np.unravel_index(
+                        masked_policy.argmax(), masked_policy.shape
+                    )
+                    move = Move(
+                        move_coords[0], move_coords[1], PieceType(move_coords[2])
+                    )
+                else:
+                    # Opponent's turn
+                    move = opponent.get_move(game)
+                    if move is None:
+                        game.pass_turn()
+                        continue
+
+                result = game.make_move(move)
+                if result == TurnResult.GAME_OVER:
+                    winner = game.get_winner()
+                    if winner == Player.TWO:
+                        results["as_p2"][opponent_name]["wins"] += 1
+                    elif winner == Player.ONE:
+                        results["as_p2"][opponent_name]["losses"] += 1
+                    else:
+                        results["as_p2"][opponent_name]["draws"] += 1
+                    break
+
+    # Print results
     print("\nEvaluation Results:")
-    print(f"Player 1 wins: {wins[Player.ONE]} ({wins[Player.ONE]/num_games*100:.1f}%)")
-    print(f"Player 2 wins: {wins[Player.TWO]} ({wins[Player.TWO]/num_games*100:.1f}%)")
-    print(f"Draws: {wins[None]} ({wins[None]/num_games*100:.1f}%)")
+    for role in ["as_p1", "as_p2"]:
+        print(f"\nModel playing as {'Player 1' if role == 'as_p1' else 'Player 2'}:")
+        for opp_name in opponents:
+            r = results[role][opp_name]
+            total = r["wins"] + r["losses"] + r["draws"]
+            print(f"\nVs {opp_name} opponent:")
+            print(f"Wins: {r['wins']} ({r['wins']/total*100:.1f}%)")
+            print(f"Losses: {r['losses']} ({r['losses']/total*100:.1f}%)")
+            print(f"Draws: {r['draws']} ({r['draws']/total*100:.1f}%)")
 
-    return wins
+    return results
 
 
 if __name__ == "__main__":
@@ -349,7 +525,7 @@ if __name__ == "__main__":
         "--episodes", type=int, default=100, help="Episodes per iteration"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=128, help="Training batch size"
+        "--batch_size", type=int, default=256, help="Training batch size"
     )
     parser.add_argument(
         "--save_interval", type=int, default=10, help="Save every N iterations"

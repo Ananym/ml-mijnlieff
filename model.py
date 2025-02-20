@@ -94,6 +94,7 @@ class ModelWrapper:
         target_policies,
         target_values,
         legal_moves=None,
+        policy_weight: float = 2.0,
     ):
         """Train on a batch of examples"""
         self.model.train()
@@ -124,8 +125,8 @@ class ModelWrapper:
         # Value loss (MSE)
         value_loss = F.mse_loss(value_pred.squeeze(), target_values)
 
-        # Total loss with L2 regularization (already included in optimizer)
-        total_loss = policy_loss + value_loss
+        # Total loss with weighted policy loss
+        total_loss = policy_weight * policy_loss + value_loss
 
         total_loss.backward()
         self.optimizer.step()

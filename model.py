@@ -9,21 +9,25 @@ class PolicyValueNet(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Shared layers
-        self.conv1 = nn.Conv2d(10, 32, 3, padding=1)
-        self.conv2 = nn.Conv2d(32, 32, 3, padding=1)
+        # Deeper network with more channels
+        self.conv1 = nn.Conv2d(10, 128, 3, padding=1)
+        self.conv2 = nn.Conv2d(128, 128, 3, padding=1)
+        self.conv3 = nn.Conv2d(128, 128, 3, padding=1)
+        self.conv4 = nn.Conv2d(128, 128, 3, padding=1)
 
         # Policy head (outputs 4x4x4 move probabilities)
-        self.policy_conv = nn.Conv2d(32, 4, 1)
+        self.policy_conv = nn.Conv2d(128, 4, 1)
 
-        # Value head (outputs win probability)
-        self.value_conv = nn.Conv2d(32, 16, 1)  # Reduce channels before flattening
-        self.value_fc = nn.Linear(16 * 4 * 4 + 10, 1)  # 4x4 spatial dims
+        # Value head
+        self.value_conv = nn.Conv2d(128, 32, 1)
+        self.value_fc = nn.Linear(32 * 4 * 4 + 10, 1)
 
     def forward(self, board_state, flat_state):
         # Main trunk
         x = F.relu(self.conv1(board_state))
         x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
 
         # Policy head
         policy = self.policy_conv(x)

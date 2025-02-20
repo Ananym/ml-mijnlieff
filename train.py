@@ -145,7 +145,7 @@ def train_network(
     save_interval: int = 10,
     num_checkpoints: int = 3,
     min_temp: float = 0.5,
-    strategic_opponent_ratio: float = 0.3,  # 30% of games against strategic opponent
+    strategic_opponent_ratio: float = 0.7,  # Increased from 0.3 to 0.7
     debug: bool = False,
 ):
     """Main training loop that runs until interrupted"""

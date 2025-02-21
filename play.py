@@ -67,6 +67,10 @@ def get_ai_move():
         return "", 204
 
     frontend_state = request.json
+
+    # Get difficulty from request, default to hardest (0)
+    difficulty = frontend_state.get("difficulty", 0)
+
     game_state = convert_frontend_state_to_game_state(frontend_state)
 
     legal_moves = game_state.get_legal_moves()
@@ -74,11 +78,14 @@ def get_ai_move():
         abort(400, "No legal moves available.")
 
     print(f"Current player: {game_state.current_player}")
+    print(f"Difficulty: {ModelWrapper.DIFFICULTY_SETTINGS[difficulty]['name']}")
     print_full_legal_moves(legal_moves)
 
-    # Get move probabilities from policy network
+    # Get move probabilities from policy network with difficulty
     state_rep = game_state.get_game_state_representation()
-    policy, _ = model.predict(state_rep.board, state_rep.flat_values, legal_moves)
+    policy, _ = model.predict(
+        state_rep.board, state_rep.flat_values, legal_moves, difficulty=difficulty
+    )
 
     # Remove batch dimension and get best move
     policy = policy.squeeze(0)
@@ -96,6 +103,8 @@ def get_ai_move():
                 "x": int(move.x),
                 "y": int(move.y),
                 "pieceType": int(move.piece_type.value) + 1,
+                "difficulty": difficulty,
+                "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
             }
         )
     else:
@@ -107,6 +116,8 @@ def get_ai_move():
                 "x": int(random_move[0]),
                 "y": int(random_move[1]),
                 "pieceType": int(random_move[2] + 1),
+                "difficulty": difficulty,
+                "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
             }
         )
 

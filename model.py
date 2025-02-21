@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from typing import Tuple, Optional
+import random
 
 
 class ResBlock(nn.Module):
@@ -73,6 +75,14 @@ class PolicyValueNet(nn.Module):
 
 
 class ModelWrapper:
+    # Simplify to just top-k selection
+    DIFFICULTY_SETTINGS = {
+        0: {"name": "Grandmaster", "top_k": (1, 1)},  # Always best move
+        1: {"name": "Expert", "top_k": (1, 2)},  # 1-2 best moves
+        2: {"name": "Intermediate", "top_k": (1, 3)},  # Up to 3 worst moves
+        3: {"name": "Beginner", "top_k": (1, 6)},  # Up to 6 worst moves
+    }
+
     def __init__(
         self,
         device="cuda" if torch.cuda.is_available() else "cpu",
@@ -114,8 +124,14 @@ class ModelWrapper:
             param_group["lr"] = new_lr
         print(f"Learning rate set to: {new_lr}")
 
-    def predict(self, board_state, flat_state, legal_moves=None):
-        """Get move probabilities and value estimate"""
+    def predict(
+        self,
+        board_state,
+        flat_state,
+        legal_moves=None,
+        difficulty: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Get move probabilities and value estimate with optional difficulty setting"""
         self.model.eval()
         with torch.no_grad():
             board_state = torch.FloatTensor(board_state).to(self.device)
@@ -123,28 +139,65 @@ class ModelWrapper:
             if len(board_state.shape) == 3:
                 board_state = board_state.unsqueeze(0)
                 flat_state = flat_state.unsqueeze(0)
-            board_state = board_state.permute(
-                0, 3, 1, 2
-            )  # NHWC -> NCHW for convolutions
+            board_state = board_state.permute(0, 3, 1, 2)
 
             policy_logits, value = self.model(board_state, flat_state)
 
-            # Apply legal moves mask if provided
+            # Ensure consistent shapes throughout
+            batch_size = policy_logits.shape[0]
+            policy_flat = policy_logits.view(
+                batch_size, -1
+            )  # Use view instead of reshape
+
+            # Handle legal moves first
             if legal_moves is not None:
                 legal_moves = torch.FloatTensor(legal_moves).to(self.device)
-                policy_logits = policy_logits.masked_fill(
-                    legal_moves == 0, float("-inf")
+                if len(legal_moves.shape) == 3:
+                    legal_moves = legal_moves.unsqueeze(0)
+                legal_moves_flat = legal_moves.view(
+                    batch_size, -1
+                )  # Match policy_flat shape
+
+                # Get legal move indices
+                legal_indices = torch.where(legal_moves_flat[0] > 0)[0]
+                num_legal = len(legal_indices)
+
+                # Apply difficulty settings if specified
+                if difficulty is not None and difficulty in self.DIFFICULTY_SETTINGS:
+                    settings = self.DIFFICULTY_SETTINGS[difficulty]
+                    min_k, max_k = settings["top_k"]
+
+                    # Always use at least 1 move, and no more than available
+                    k = min(max(1, random.randint(1, min(max_k, num_legal))), num_legal)
+
+                    # Get logits for legal moves
+                    legal_logits = policy_flat[0, legal_indices]
+
+                    if difficulty <= 1:  # Grandmaster and Expert: best moves
+                        _, selected_indices = torch.topk(
+                            legal_logits, k=k, largest=True
+                        )
+                    else:  # Intermediate and Beginner: worst moves
+                        _, selected_indices = torch.topk(
+                            -legal_logits, k=k, largest=True
+                        )
+
+                    # Create mask for selected moves
+                    selected_legal_indices = legal_indices[selected_indices]
+                    mask = torch.zeros_like(policy_flat)
+                    mask[0, selected_legal_indices] = 1.0
+
+                    # Apply mask to logits before softmax
+                    policy_flat = policy_flat.masked_fill(mask == 0, float("-inf"))
+
+                # Mask illegal moves
+                policy_flat = policy_flat.masked_fill(
+                    legal_moves_flat == 0, float("-inf")
                 )
 
-            # Convert to probabilities
-            policy = F.softmax(policy_logits.reshape(policy_logits.shape[0], -1), dim=1)
-            policy = policy.reshape(policy_logits.shape)
-
-            # Ensure illegal moves have zero probability
-            if legal_moves is not None:
-                policy = policy * legal_moves
-                # Renormalize if needed
-                policy = policy / (policy.sum() + 1e-8)
+            # Convert to probabilities and normalize
+            policy_flat = F.softmax(policy_flat, dim=1)
+            policy = policy_flat.view(policy_logits.shape)  # Restore original shape
 
             return policy.cpu().numpy(), value.cpu().numpy()
 

@@ -2,6 +2,17 @@
   <div id="app">
     <h1>Mijnlieff</h1>
     <template v-if="!gameStarted">
+      <h2>Select Difficulty:</h2>
+      <div class="difficulty-selector">
+        <button
+          v-for="(settings, level) in difficulties"
+          :key="level"
+          @click="selectDifficulty(Number(level))"
+          :class="{ selected: selectedDifficulty === Number(level) }"
+        >
+          {{ settings.name }}
+        </button>
+      </div>
       <h2>Choose your player:</h2>
       <button @click="startGame(true)">Go First</button>
       <button @click="startGame(false)">Go Second</button>
@@ -36,9 +47,7 @@
           {{ gameState.currentPlayer === Player.ONE ? 'Player One' : 'Player Two' }}
         </div> -->
       </div>
-      <div v-if="!gameOver">
-        Prediction: {{ prediction }}
-      </div>
+      <div v-if="!gameOver">Prediction: {{ prediction }}</div>
       <div v-if="gameOver">
         <h2>Game Over! {{ winnerProclamation }}</h2>
         <p>Human Score: {{ scores.HUMAN }}</p>
@@ -74,6 +83,7 @@ import {
   getDebugStringRepresentation,
   moveToString,
   passTurn,
+  DIFFICULTY_SETTINGS,
 } from './gameLogic';
 
 export default {
@@ -94,6 +104,8 @@ export default {
     const lastAIMove: Ref<Move | null> = ref(null);
     const prediction: Ref<number | null> = ref(null);
     const rulesVisible: Ref<boolean> = ref(false);
+    const selectedDifficulty: Ref<number> = ref(0); // Default to hardest
+    const difficulties = DIFFICULTY_SETTINGS;
 
     const useRandomDummy = false;
 
@@ -112,25 +124,6 @@ export default {
       if (scores.value.AI > scores.value.HUMAN) return 'AI wins!';
       return "It's a tie!";
     });
-
-    // const logRemainingPieces = (player) => {
-    //   const pieces = gameState.value.pieceCounts[player];
-    //   console.log(
-    //     `Player ${player === Player.ONE ? "Human" : "AI"} pieces remaining:`,
-    //     Object.entries(pieces)
-    //       .map(([type, count]) => `${PieceNames[type]}: ${count}`)
-    //       .join(", ")
-    //   );
-    // };
-
-    // const logValidMoves = () => {
-    //   console.log(
-    //     `Valid moves for ${
-    //       gameState.value.currentPlayer === Player.ONE ? "Human" : "AI"
-    //     }:`,
-    //     validMoves.value.length
-    //   );
-    // };
 
     const startGame = (humanFirst: boolean) => {
       gameStarted.value = true;
@@ -256,7 +249,10 @@ export default {
             headers: {
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify(getStateRepresentation(gameState.value)),
+            body: JSON.stringify({
+              ...getStateRepresentation(gameState.value),
+              difficulty: selectedDifficulty.value,
+            }),
           });
 
           if (!response.ok) {
@@ -298,6 +294,10 @@ export default {
       lastAIMove.value = null;
     };
 
+    const selectDifficulty = (level: number) => {
+      selectedDifficulty.value = level;
+    };
+
     return {
       gameStarted,
       gameState,
@@ -318,6 +318,9 @@ export default {
       hideRules,
       winnerProclamation,
       Players,
+      difficulties,
+      selectedDifficulty,
+      selectDifficulty,
     };
   },
 };
@@ -352,5 +355,33 @@ button:disabled {
   display: flex;
   justify-content: center;
   align-items: center;
+}
+
+.difficulty-selector {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.difficulty-selector button {
+  background-color: #f0f0f0;
+  border: 2px solid #ddd;
+  border-radius: 5px;
+  transition: all 0.2s;
+}
+
+.difficulty-selector button.selected {
+  background-color: #4caf50;
+  color: white;
+  border-color: #45a049;
+}
+
+.difficulty-selector button:hover {
+  background-color: #e0e0e0;
+}
+
+.difficulty-selector button.selected:hover {
+  background-color: #45a049;
 }
 </style>

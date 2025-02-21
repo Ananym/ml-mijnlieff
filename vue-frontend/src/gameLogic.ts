@@ -1,10 +1,9 @@
 export class IllegalMoveException extends Error {
   constructor(player: Player, move: Move) {
     super(
-      move !== undefined ?
-      `Player ${player} tried to move to (${move.x}, ${move.y}) with piece type ${move.pieceType}, illegal move!`
-      :
-      `Player ${player} tried to make an undefined move!`
+      move !== undefined
+        ? `Player ${player} tried to move to (${move.x}, ${move.y}) with piece type ${move.pieceType}, illegal move!`
+        : `Player ${player} tried to make an undefined move!`
     );
   }
 }
@@ -138,7 +137,7 @@ export function currentPlayerHasValidMoves(gameState: GameState) {
 }
 
 export function makeMove(gameState: GameState, move: Move): TurnResult {
-  if (!isValidMove(gameState, move) || move===undefined) {
+  if (!isValidMove(gameState, move) || move === undefined) {
     console.log(`Invalid move: ${move}`);
     throw new IllegalMoveException(gameState.currentPlayer, move);
   }
@@ -171,7 +170,6 @@ export function makeMove(gameState: GameState, move: Move): TurnResult {
 }
 
 export function isValidMove(gameState: GameState, move: Move): boolean {
-
   const { x, y, pieceType } = move;
 
   if (gameState.board[x][y].some((piece) => piece !== 0)) {
@@ -233,7 +231,7 @@ export function calculateScores(gameState: GameState): Record<Player, number> {
           { x: 1, y: 0 },
           { x: 0, y: 1 },
           { x: 1, y: 1 },
-          { x:-1, y: 1 },
+          { x: -1, y: 1 },
         ]) {
           const previousCellCoords = { x: x - delta.x, y: y - delta.y };
           if (get_val_or_none(previousCellCoords.x, previousCellCoords.y, player)) {
@@ -306,3 +304,10 @@ export function getDebugStringRepresentation(gameState: GameState) {
 
   return `Current Player: ${gameState.currentPlayer}\nBoard:\n${stringBoardRep}\n`;
 }
+
+export const DIFFICULTY_SETTINGS = {
+  0: { name: 'Grandmaster', temp: 0.1, top_k: [1, 1] },
+  1: { name: 'Expert', temp: 0.5, top_k: [1, 2] },
+  2: { name: 'Intermediate', temp: 1.0, top_k: [1, 3] },
+  3: { name: 'Beginner', temp: 2.0, top_k: [1, 5] },
+} as const;

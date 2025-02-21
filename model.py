@@ -4,58 +4,110 @@ import torch.nn.functional as F
 import numpy as np
 
 
+class ResBlock(nn.Module):
+    """Residual block with two convolutions and a skip connection"""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity
+        return F.relu(out)
+
+
 class PolicyValueNet(nn.Module):
-    """Simple network that directly predicts moves and game outcome"""
+    """Network with residual blocks and balanced capacity"""
 
     def __init__(self):
         super().__init__()
-        # Deeper network with more channels
-        self.conv1 = nn.Conv2d(10, 256, 3, padding=1)
-        self.conv2 = nn.Conv2d(256, 256, 3, padding=1)
-        self.conv3 = nn.Conv2d(256, 256, 3, padding=1)
-        self.conv4 = nn.Conv2d(256, 256, 3, padding=1)
-        self.conv5 = nn.Conv2d(256, 256, 3, padding=1)
+        # Initial convolution with 256 channels
+        self.conv_in = nn.Conv2d(10, 256, 3, padding=1)
+        self.bn_in = nn.BatchNorm2d(256)
+
+        # Middle section with residual blocks at 256 channels
+        self.res_blocks = nn.ModuleList(
+            [ResBlock(256) for _ in range(8)]  # 8 residual blocks at 256 channels
+        )
 
         # Policy head (outputs 4x4x4 move probabilities)
-        self.policy_conv = nn.Conv2d(256, 4, 1)
+        self.policy_conv1 = nn.Conv2d(256, 128, 1)
+        self.policy_bn = nn.BatchNorm2d(128)
+        self.policy_conv2 = nn.Conv2d(128, 4, 1)
 
         # Value head
-        self.value_conv = nn.Conv2d(256, 64, 1)
-        self.value_fc = nn.Linear(64 * 4 * 4 + 10, 256)
-        self.value_out = nn.Linear(256, 1)
+        self.value_conv1 = nn.Conv2d(256, 128, 1)
+        self.value_bn = nn.BatchNorm2d(128)
+        self.value_fc1 = nn.Linear(128 * 4 * 4 + 10, 256)  # Reduced FC layer size
+        self.value_fc2 = nn.Linear(256, 128)
+        self.value_fc3 = nn.Linear(128, 1)
 
     def forward(self, board_state, flat_state):
-        # Main trunk
-        x = F.relu(self.conv1(board_state))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = F.relu(self.conv5(x))
+        # Initial convolution
+        x = F.relu(self.bn_in(self.conv_in(board_state)))
+
+        # Middle section
+        for res_block in self.res_blocks:
+            x = res_block(x)
 
         # Policy head
-        policy = self.policy_conv(x)
+        policy = F.relu(self.policy_bn(self.policy_conv1(x)))
+        policy = self.policy_conv2(policy)
         policy = policy.permute(0, 2, 3, 1)  # NCHW -> NHWC for 4x4x4 output
 
         # Value head
-        value = F.relu(self.value_conv(x))
+        value = F.relu(self.value_bn(self.value_conv1(x)))
         value = value.flatten(1)  # Flatten all dims except batch
         value = torch.cat([value, flat_state], dim=1)
-        value = F.relu(self.value_fc(value))
-        value = torch.tanh(self.value_out(value))
+        value = F.relu(self.value_fc1(value))
+        value = F.relu(self.value_fc2(value))
+        value = torch.tanh(self.value_fc3(value))
 
         return policy, value
 
 
 class ModelWrapper:
-    def __init__(self, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(
+        self,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        fast_mode: bool = False,
+    ):
         self.device = device
         self.model = PolicyValueNet().to(device)
+
+        # Two different learning rate configurations
+        if fast_mode:
+            # Faster learning rate for quick experiments
+            self.lr = 0.0001
+            print("Using fast training mode (lr=0.0001) - good for quick experiments")
+        else:
+            # Slower, more stable learning rate for production training
+            self.lr = 0.000005
+            print("Using stable training mode (lr=0.000005) - good for final training")
+
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
-            lr=0.00002,  # Reduced from 0.0001
+            lr=self.lr,
             weight_decay=1e-4,
             betas=(0.9, 0.999),
         )
+
+    def get_lr(self) -> float:
+        """Return current learning rate"""
+        return self.lr
+
+    def set_lr(self, new_lr: float):
+        """Manually set learning rate"""
+        self.lr = new_lr
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = new_lr
+        print(f"Learning rate set to: {new_lr}")
 
     def predict(self, board_state, flat_state, legal_moves=None):
         """Get move probabilities and value estimate"""

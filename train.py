@@ -10,7 +10,7 @@ from game import (
     TurnResult,
     Move,
 )
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
 import time
 import signal
@@ -145,9 +145,10 @@ def train_network(
     save_interval: int = 10,
     num_checkpoints: int = 3,
     min_temp: float = 0.5,
-    strategic_opponent_ratio: float = 0.5,
+    strategic_opponent_ratio: float = 0.6,  # 50% strategic games
+    random_opponent_ratio: float = 0.1,  # 10% random opponents
     buffer_size: int = 10000,
-    policy_weight: float = 1.0,
+    policy_weight: float = 1.5,  # Increased from 1.0 to encourage decisive play
     num_epochs: int = 40,
     debug: bool = False,
 ):
@@ -158,7 +159,8 @@ def train_network(
     iteration = 0
     training_start = time.time()
     strategic_opponent = StrategicOpponent()
-    latest_model_path = "model_latest.pth"
+    random_opponent = RandomOpponent()
+    latest_model_path = "saved_models/model_latest.pth"
 
     # Base stats template
     stats_template = {
@@ -168,12 +170,99 @@ def train_network(
         "strategic_games_as_p2": 0,
         "self_play_p1_wins": 0,
         "self_play_games": 0,
-        "total_moves": 0,  # Changed from avg_game_length
-        "total_games": 0,  # Changed from moves_tracked
-        "central_moves": 0,  # Moves in the 2x2 center
-        "policy_confidence": 0,  # Average max probability of chosen moves
+        "total_moves": 0,
+        "total_games": 0,
+        "central_moves": 0,
+        "policy_confidence": 0,
         "moves_counted": 0,
     }
+
+    # Stability metrics
+    window_size = 50  # Window for moving averages
+    stability_stats = {
+        "policy_loss_window": [],
+        "value_loss_window": [],
+        "policy_confidence_window": [],
+        "last_policy_loss": 0.0,
+        "last_value_loss": 0.0,
+        "total_variance_policy": 0.0,
+        "total_variance_value": 0.0,
+        "num_variance_samples": 0,
+    }
+
+    def update_stability_metrics(
+        policy_loss: float, value_loss: float, policy_confidence: float
+    ):
+        """Update running stability statistics"""
+        # Update loss windows
+        stability_stats["policy_loss_window"].append(policy_loss)
+        stability_stats["value_loss_window"].append(value_loss)
+        if len(stability_stats["policy_loss_window"]) > window_size:
+            stability_stats["policy_loss_window"].pop(0)
+            stability_stats["value_loss_window"].pop(0)
+
+        # Update policy confidence window
+        stability_stats["policy_confidence_window"].append(policy_confidence)
+        if len(stability_stats["policy_confidence_window"]) > window_size:
+            stability_stats["policy_confidence_window"].pop(0)
+
+        # Calculate loss variance
+        if stability_stats["last_policy_loss"] != 0:  # Skip first sample
+            policy_diff = policy_loss - stability_stats["last_policy_loss"]
+            value_diff = value_loss - stability_stats["last_value_loss"]
+            stability_stats["total_variance_policy"] += policy_diff * policy_diff
+            stability_stats["total_variance_value"] += value_diff * value_diff
+            stability_stats["num_variance_samples"] += 1
+
+        stability_stats["last_policy_loss"] = policy_loss
+        stability_stats["last_value_loss"] = value_loss
+
+    def get_stability_metrics() -> dict:
+        """Calculate current stability metrics"""
+        if stability_stats["num_variance_samples"] == 0:
+            return {
+                "policy_loss_std": 0.0,
+                "value_loss_std": 0.0,
+                "policy_confidence_std": 0.0,
+                "policy_loss_trend": 0.0,
+                "value_loss_trend": 0.0,
+            }
+
+        # Calculate loss variance
+        policy_variance = (
+            stability_stats["total_variance_policy"]
+            / stability_stats["num_variance_samples"]
+        )
+        value_variance = (
+            stability_stats["total_variance_value"]
+            / stability_stats["num_variance_samples"]
+        )
+
+        # Calculate policy confidence stability
+        confidence_window = stability_stats["policy_confidence_window"]
+        confidence_std = np.std(confidence_window) if confidence_window else 0.0
+
+        # Calculate loss trends (negative means improving)
+        policy_window = stability_stats["policy_loss_window"]
+        value_window = stability_stats["value_loss_window"]
+        policy_trend = (
+            (np.mean(policy_window[-10:]) - np.mean(policy_window[:10]))
+            if len(policy_window) >= 20
+            else 0.0
+        )
+        value_trend = (
+            (np.mean(value_window[-10:]) - np.mean(value_window[:10]))
+            if len(value_window) >= 20
+            else 0.0
+        )
+
+        return {
+            "policy_loss_std": np.sqrt(policy_variance),
+            "value_loss_std": np.sqrt(value_variance),
+            "policy_confidence_std": confidence_std,
+            "policy_loss_trend": policy_trend,
+            "value_loss_trend": value_trend,
+        }
 
     # Keep track of last N checkpoints
     checkpoint_files = []
@@ -181,13 +270,24 @@ def train_network(
     def get_temperature(
         move_count: int, total_moves: int = 12, is_strategic: bool = False
     ) -> float:
-        """Unified temperature schedule with lower temps for strategic games"""
-        # Start cooler (1.2) for strategic games, normal (2.0) for self-play
-        max_temp = 1.2 if is_strategic else 2.0
+        """Unified temperature schedule with higher initial temps to encourage exploration"""
+        # Start hotter (1.5 strategic, 2.5 self-play) to encourage exploration
+        max_temp = 1.5 if is_strategic else 2.5
         base_temp = max(min_temp, max_temp - (1.5 * move_count / total_moves))
         # Less randomness for strategic games
         rand_factor = 0.2 if is_strategic else 0.4
         return base_temp * (0.8 + rand_factor * random.random())
+
+    def get_adjusted_value(
+        winner: Optional[Player], move_count: int, is_model_turn: bool
+    ) -> float:
+        """Calculate value target with strong preference for wins over draws"""
+        if winner is None:
+            # Draws are much less valuable (0.2 instead of 0.5)
+            return 0.2
+        else:
+            # Wins/losses are still 1.0/0.0
+            return 1.0 if (winner == Player.ONE) == is_model_turn else 0.0
 
     # Setup interrupt handling
     interrupt_received = False
@@ -206,6 +306,7 @@ def train_network(
     print(f"Episodes per iteration: {num_episodes}")
     print(f"Temperature range: {min_temp:.1f} - 2.0")
     print(f"Strategic opponent ratio: {strategic_opponent_ratio:.1%}")
+    print(f"Random opponent ratio: {random_opponent_ratio:.1%}")
     print(f"Batch size: {batch_size}")
     print(f"Replay buffer size: {buffer_size}")
     print(f"Policy weight: {policy_weight:.1f}")
@@ -226,9 +327,10 @@ def train_network(
                 leave=False,
             )
 
-            # Determine number of strategic opponent games
+            # Determine number of opponent games
             strategic_games = int(num_episodes * strategic_opponent_ratio)
-            selfplay_games = num_episodes - strategic_games
+            random_games = int(num_episodes * random_opponent_ratio)
+            selfplay_games = num_episodes - strategic_games - random_games
 
             # Self-play games
             for episode in range(selfplay_games):
@@ -295,13 +397,9 @@ def train_network(
                         # Game is over, get the winner
                         winner = game.get_winner()
 
-                        # Set value targets based on game outcome
+                        # Set value targets with length penalty
                         for example in examples:
-                            if winner is None:
-                                example.value = 0.5  # Draw
-                            else:
-                                # 1 for P1 win, 0 for P2 win from P1's perspective
-                                example.value = 1.0 if winner == Player.ONE else 0.0
+                            example.value = get_adjusted_value(winner, move_count, True)
                         break
 
                 replay_buffer.extend(examples)
@@ -321,6 +419,103 @@ def train_network(
                         iter_stats["self_play_p1_wins"] += 1
                     iter_stats["total_moves"] += move_count
                     iter_stats["total_games"] += 1
+
+            # Random opponent games
+            for episode in range(random_games):
+                game = GameState()
+                examples = []
+                move_count = 0
+
+                # Randomly decide if model plays as Player 1 or 2
+                model_is_player_one = random.random() < 0.5
+
+                while True:
+                    legal_moves = game.get_legal_moves()
+                    if not np.any(legal_moves):
+                        game.pass_turn()
+                        continue
+
+                    is_model_turn = (
+                        game.current_player == Player.ONE
+                    ) == model_is_player_one
+                    state_rep = game.get_game_state_representation()
+
+                    if is_model_turn:
+                        # Model's turn
+                        policy, _ = model.predict(
+                            state_rep.board, state_rep.flat_values, legal_moves
+                        )
+
+                        policy = policy.squeeze(0)
+                        masked_policy = policy * legal_moves
+                        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+
+                        # Use unified temperature schedule
+                        temperature = get_temperature(move_count, is_strategic=False)
+
+                        if temperature > 0:
+                            policy_flat = masked_policy.flatten()
+                            move_idx = np.random.choice(len(policy_flat), p=policy_flat)
+                            move_coords = np.unravel_index(
+                                move_idx, masked_policy.shape
+                            )
+                        else:
+                            move_coords = np.unravel_index(
+                                masked_policy.argmax(), masked_policy.shape
+                            )
+
+                        move = Move(
+                            move_coords[0], move_coords[1], PieceType(move_coords[2])
+                        )
+
+                        # Store training example for model's move
+                        policy_target = np.zeros_like(masked_policy)
+                        policy_target[move_coords] = 1.0
+                        examples.append(
+                            TrainingExample(
+                                state_rep=state_rep, policy=policy_target, value=0.0
+                            )
+                        )
+                    else:
+                        # Random opponent's turn
+                        move = random_opponent.get_move(game)
+                        if move is None:
+                            game.pass_turn()
+                            continue
+
+                    result = game.make_move(move)
+                    move_count += 1
+
+                    if result == TurnResult.GAME_OVER:
+                        winner = game.get_winner()
+                        # Set value targets based on game outcome with length penalty
+                        for example in examples:
+                            example.value = get_adjusted_value(
+                                winner,
+                                move_count,
+                                (winner == Player.ONE) == model_is_player_one,
+                            )
+                        break
+
+                replay_buffer.extend(examples)
+                episode_pbar.update(1)
+                episode_pbar.set_postfix(
+                    {"buffer_size": len(replay_buffer), "type": "random"}
+                )
+
+                # Track stats for random opponent games
+                if result == TurnResult.GAME_OVER:
+                    iter_stats["total_moves"] += move_count
+                    iter_stats["total_games"] += 1
+
+                # Track model's moves
+                if is_model_turn:
+                    max_prob = masked_policy.max()
+                    iter_stats["policy_confidence"] += max_prob
+                    iter_stats["moves_counted"] += 1
+
+                    if 1 <= move.x <= 2 and 1 <= move.y <= 2:
+                        iter_stats["central_moves"] += 1
 
             # Strategic opponent games
             for episode in range(strategic_games):
@@ -401,16 +596,20 @@ def train_network(
 
                     if result == TurnResult.GAME_OVER:
                         winner = game.get_winner()
-                        # Set value targets based on game outcome
+                        # Set value targets based on game outcome with length penalty
                         for example in examples:
                             if winner is None:
-                                example.value = 0.5
+                                example.value = get_adjusted_value(
+                                    None, move_count, is_model_turn
+                                )
                             else:
                                 # If strategic opponent won, their moves should be valued highly
                                 is_strategic_move = (
                                     winner == Player.ONE
                                 ) != model_is_player_one
-                                example.value = 1.0 if is_strategic_move else 0.0
+                                example.value = get_adjusted_value(
+                                    winner, move_count, is_strategic_move
+                                )
                         break
 
                 replay_buffer.extend(examples)
@@ -498,10 +697,20 @@ def train_network(
                     }
                 )
 
-            # Print epoch summary
+            # Calculate average losses for this epoch
             avg_total = epoch_losses["total"] / num_epochs
             avg_policy = epoch_losses["policy"] / num_epochs
             avg_value = epoch_losses["value"] / num_epochs
+
+            # Update stability metrics after calculating averages
+            update_stability_metrics(
+                avg_policy,
+                avg_value,
+                iter_stats["policy_confidence"] / max(1, iter_stats["moves_counted"]),
+            )
+            stability_metrics = get_stability_metrics()
+
+            # Print epoch summary with stability metrics
             elapsed_time = time.time() - training_start
             hours = elapsed_time // 3600
             minutes = (elapsed_time % 3600) // 60
@@ -509,6 +718,10 @@ def train_network(
             tqdm.write(
                 f"\nIteration {iteration} - Time: {int(hours)}h {int(minutes)}m"
                 f"\nAvg Losses: Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}"
+                f"\nStability Metrics:"
+                f"\n  Loss Std Dev: Policy={stability_metrics['policy_loss_std']:.4f}, Value={stability_metrics['value_loss_std']:.4f}"
+                f"\n  Policy Confidence Std Dev: {stability_metrics['policy_confidence_std']:.4f}"
+                f"\n  Loss Trends: Policy={stability_metrics['policy_loss_trend']:.4f}, Value={stability_metrics['value_loss_trend']:.4f}"
             )
 
             # Update stats display
@@ -537,7 +750,7 @@ def train_network(
 
             # Periodic checkpoint saving
             if iteration % save_interval == 0:
-                save_path = f"model_iter_{iteration}.pth"
+                save_path = f"saved_models/model_iter_{iteration}.pth"
                 model.save(save_path)
                 checkpoint_files.append(save_path)
 
@@ -560,7 +773,7 @@ def train_network(
         minutes = (elapsed_time % 3600) // 60
 
         # Always save final model state
-        final_path = f"model_iter_final.pth"
+        final_path = f"saved_models/model_iter_final.pth"
         model.save(final_path)
         model.save(latest_model_path)  # Update latest as well
         print(f"\nFinal model saved as: {final_path}")
@@ -720,7 +933,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--load_model",
         type=str,
-        default="model_latest.pth",
+        default="saved_models/model_latest.pth",
         help="Path to model to load",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
@@ -729,12 +942,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Start with a fresh model, ignoring existing checkpoints",
     )
+    parser.add_argument(
+        "--stable_lr",
+        action="store_true",
+        help="Use stable (slower) learning rate instead of fast mode",
+    )
 
     args = parser.parse_args()
 
     # Initialize model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ModelWrapper(device)
+    model = ModelWrapper(
+        device, fast_mode=not args.stable_lr
+    )  # Default to fast mode unless --stable_lr is set
 
     if not args.fresh and args.load_model and os.path.exists(args.load_model):
         model.load(args.load_model)

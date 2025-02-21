@@ -3,12 +3,8 @@ from flask_cors import CORS
 import numpy as np
 import torch
 from game import GameState, Move, Player, PieceType, print_full_legal_moves
-
-# from agent import FutureStateWithOutcomePrediction, RLAgent
 import random
-
-from mcts import MCTS
-from model import DualNetworkWrapper
+from model import ModelWrapper
 
 app = Flask(__name__)
 CORS(
@@ -19,9 +15,8 @@ CORS(
 )
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-network_wrapper = DualNetworkWrapper(device)
-network_wrapper.load("agent_20241111_155803.pth")
-mcts_player = MCTS(network_wrapper, num_simulations=400)
+model = ModelWrapper(device)
+model.load("saved_models/model_latest.pth")
 
 
 def convert_frontend_state_to_game_state(frontend_state):
@@ -69,47 +64,43 @@ def convert_frontend_state_to_game_state(frontend_state):
 @app.route("/api/get_ai_move", methods=["POST", "OPTIONS"])
 def get_ai_move():
     if request.method == "OPTIONS":
-        # Respond to preflight request
         return "", 204
 
     frontend_state = request.json
     game_state = convert_frontend_state_to_game_state(frontend_state)
 
-    legal_moves_grid = game_state.get_legal_moves()
-    if np.all(legal_moves_grid == 0):
+    legal_moves = game_state.get_legal_moves()
+    if np.all(legal_moves == 0):
         abort(400, "No legal moves available.")
 
     print(f"Current player: {game_state.current_player}")
-    print_full_legal_moves(legal_moves_grid)
+    print_full_legal_moves(legal_moves)
 
-    # next_state: FutureStateWithOutcomePrediction = agent.select_move(
-    #     game_state.get_possible_next_states(),
-    #     game_state.current_player == Player.ONE,
-    #     0,
-    # )
+    # Get move probabilities from policy network
+    state_rep = game_state.get_game_state_representation()
+    policy, _ = model.predict(state_rep.board, state_rep.flat_values, legal_moves)
 
-    move = mcts_player.get_best_move(game_state)
+    # Remove batch dimension and get best move
+    policy = policy.squeeze(0)
+    move_coords = np.unravel_index(policy.argmax(), policy.shape)
+    move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
 
     if move:
-        relevent_piece_counts = game_state.piece_counts[game_state.current_player]
-        if relevent_piece_counts[move.piece_type] == 0:
+        relevant_piece_counts = game_state.piece_counts[game_state.current_player]
+        if relevant_piece_counts[move.piece_type] == 0:
             abort(500, "Invalid move: piece type has no remaining pieces.")
 
         print(f"AI picked move: {move}")
-
-        json_move = jsonify(
+        return jsonify(
             {
                 "x": int(move.x),
                 "y": int(move.y),
                 "pieceType": int(move.piece_type.value) + 1,
-                # "prediction": float(next_state.predicted_outcome),
             }
         )
-
-        return json_move
     else:
         print("Model didn't pick a move - using random move")
-        legal_moves = np.array(np.where(legal_moves_grid == 1)).T
+        legal_moves = np.array(np.where(legal_moves == 1)).T
         random_move = random.choice(legal_moves)
         return jsonify(
             {

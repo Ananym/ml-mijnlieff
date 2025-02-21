@@ -270,23 +270,21 @@ def train_network(
     def get_temperature(
         move_count: int, total_moves: int = 12, is_strategic: bool = False
     ) -> float:
-        """Unified temperature schedule with higher initial temps to encourage exploration"""
-        # Start hotter (1.5 strategic, 2.5 self-play) to encourage exploration
-        max_temp = 1.5 if is_strategic else 2.5
-        base_temp = max(min_temp, max_temp - (1.5 * move_count / total_moves))
-        # Less randomness for strategic games
-        rand_factor = 0.2 if is_strategic else 0.4
-        return base_temp * (0.8 + rand_factor * random.random())
+        """Higher temperature for opening moves to encourage exploration"""
+        if move_count < 2:  # First move
+            return 3.0  # Much higher temperature for first move
+        elif move_count < 4:  # Early game
+            return 2.0  # Still elevated for early moves
+        else:  # Mid-late game
+            return max(min_temp, 1.0)
 
     def get_adjusted_value(
         winner: Optional[Player], move_count: int, is_model_turn: bool
     ) -> float:
-        """Calculate value target with strong preference for wins over draws"""
+        """Simple value function with draw adjustment"""
         if winner is None:
-            # Draws are much less valuable (0.2 instead of 0.5)
-            return 0.2
+            return 0.2  # Draws are less valuable
         else:
-            # Wins/losses are still 1.0/0.0
             return 1.0 if (winner == Player.ONE) == is_model_turn else 0.0
 
     # Setup interrupt handling
@@ -603,13 +601,20 @@ def train_network(
                                     None, move_count, is_model_turn
                                 )
                             else:
-                                # If strategic opponent won, their moves should be valued highly
-                                is_strategic_move = (
+                                # Only learn from strategic opponent's winning moves
+                                is_strategic_win = (
                                     winner == Player.ONE
                                 ) != model_is_player_one
-                                example.value = get_adjusted_value(
-                                    winner, move_count, is_strategic_move
-                                )
+                                if is_strategic_win and not is_model_turn:
+                                    # Learn from winning strategic moves
+                                    example.value = get_adjusted_value(
+                                        winner, move_count, False
+                                    )
+                                else:
+                                    # Learn from model's moves only when it wins
+                                    example.value = get_adjusted_value(
+                                        winner, move_count, True
+                                    )
                         break
 
                 replay_buffer.extend(examples)

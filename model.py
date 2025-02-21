@@ -98,6 +98,11 @@ class ModelWrapper:
             betas=(0.9, 0.999),
         )
 
+        # Add learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=10, verbose=True
+        )
+
     def get_lr(self) -> float:
         """Return current learning rate"""
         return self.lr
@@ -174,15 +179,21 @@ class ModelWrapper:
             policy_logits.reshape(policy_logits.shape[0], -1), dim=1
         )
         policy_pred = policy_pred.reshape(policy_logits.shape)
-        policy_loss = -torch.mean(
-            torch.sum(target_policies * torch.log(policy_pred + 1e-8), dim=(1, 2, 3))
-        )
 
-        # Value loss (MSE)
+        # Increase policy weight for opening moves
+        move_counts = (board_states != 0).sum(axis=(1, 2, 3))
+        opening_moves_mask = (move_counts < 2).float()  # Focus on first move
+        policy_weights = policy_weight * (1 + opening_moves_mask)
+
+        # Calculate losses
+        policy_loss = -torch.mean(
+            policy_weights
+            * torch.sum(target_policies * torch.log(policy_pred + 1e-8), dim=(1, 2, 3))
+        )
         value_loss = F.mse_loss(value_pred.squeeze(), target_values)
 
-        # Total loss with weighted policy loss
-        total_loss = policy_weight * policy_loss + value_loss
+        # Total loss with stronger policy emphasis
+        total_loss = 2.0 * policy_loss + value_loss  # Fixed 2:1 ratio
 
         total_loss.backward()
         self.optimizer.step()

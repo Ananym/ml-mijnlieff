@@ -187,6 +187,8 @@ export default {
       if (gameState.value === null) {
         return;
       }
+      // Clear the prediction when human makes a move
+      prediction.value = null;
       let turnResult;
       const move = { x, y, pieceType: selectedPieceType.value };
       try {
@@ -259,7 +261,7 @@ export default {
             throw new Error(`HTTP error! status: ${response.status}`);
           }
           const data = await response.json();
-          prediction.value = data.prediction;
+          prediction.value = Number(data.aiWinProbability.toPrecision(3));
           move = data;
         }
 
@@ -292,6 +294,7 @@ export default {
       scores.value = { HUMAN: 0, AI: 0 };
       isAIThinking.value = false;
       lastAIMove.value = null;
+      prediction.value = null;
     };
 
     const selectDifficulty = (level: number) => {

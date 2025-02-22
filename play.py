@@ -78,25 +78,18 @@ def get_ai_move_logic(frontend_state):
     move_coords = np.unravel_index(policy.argmax(), policy.shape)
     move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
 
-    if not move:
-        print("Model didn't pick a move - using random move")
-        legal_moves = np.array(np.where(legal_moves == 1)).T
-        random_move = random.choice(legal_moves)
-        move = Move(random_move[0], random_move[1], PieceType(random_move[2]))
-
     relevant_piece_counts = game_state.piece_counts[game_state.current_player]
     if relevant_piece_counts[move.piece_type] == 0:
         raise ValueError("Invalid move: piece type has no remaining pieces.")
 
     print(f"AI picked move: {move}")
 
-    # Apply the move to get the next state
-    next_state = game_state.copy()
-    next_state.apply_move(move)
+    # Apply the move directly to get the next state
+    game_state.make_move(move)
 
     # Get opponent's perspective value from the new state
-    next_state_rep = next_state.get_game_state_representation()
-    next_legal_moves = next_state.get_legal_moves()
+    next_state_rep = game_state.get_game_state_representation()
+    next_legal_moves = game_state.get_legal_moves()
     _, opponent_value = model.predict(
         next_state_rep.board,
         next_state_rep.flat_values,
@@ -111,7 +104,5 @@ def get_ai_move_logic(frontend_state):
         "x": int(move.x),
         "y": int(move.y),
         "pieceType": int(move.piece_type.value) + 1,
-        "difficulty": difficulty,
-        "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
         "aiWinProbability": ai_win_probability,
     }

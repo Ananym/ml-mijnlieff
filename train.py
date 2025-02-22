@@ -922,7 +922,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train and evaluate the model")
-    parser.add_argument("--mode", choices=["train", "eval"], default="train")
+    parser.add_argument(
+        "--mode",
+        choices=["train", "eval", "crunch"],
+        default="train",
+        help="Mode to run in: train (training), eval (evaluation), or crunch (optimize for deployment)",
+    )
     parser.add_argument(
         "--episodes", type=int, default=100, help="Episodes per iteration"
     )
@@ -941,6 +946,12 @@ if __name__ == "__main__":
         default="saved_models/model_latest.pth",
         help="Path to model to load",
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="optimized_models",
+        help="Directory to save optimized models when using crunch mode",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     parser.add_argument(
         "--fresh",
@@ -955,11 +966,16 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Initialize model
+    # Initialize model with appropriate mode
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = ModelWrapper(
-        device, fast_mode=not args.stable_lr
-    )  # Default to fast mode unless --stable_lr is set
+        device,
+        mode=(
+            "crunch"
+            if args.mode == "crunch"
+            else "stable" if args.stable_lr else "fast"
+        ),
+    )
 
     if not args.fresh and args.load_model and os.path.exists(args.load_model):
         model.load(args.load_model)
@@ -979,5 +995,12 @@ if __name__ == "__main__":
             num_checkpoints=args.num_checkpoints,
             debug=args.debug,
         )
-    else:
+    elif args.mode == "eval":
         evaluate_model(model)
+    elif args.mode == "crunch":
+        if not os.path.exists(args.load_model):
+            parser.error(
+                "--load_model must point to an existing model file when using crunch mode"
+            )
+        os.makedirs(args.output_dir, exist_ok=True)
+        model.crunch(args.load_model, args.output_dir)

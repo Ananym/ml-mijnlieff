@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
 import random
+from torch.quantization import quantize_dynamic
+import torch.quantization
+import os
 
 
 class ResBlock(nn.Module):
@@ -86,20 +89,36 @@ class ModelWrapper:
     def __init__(
         self,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        fast_mode: bool = False,
+        mode: str = "stable",
     ):
+        """Initialize the model wrapper.
+
+        Args:
+            device: Device to run the model on ('cuda' or 'cpu')
+            mode: One of:
+                - 'fast': Faster learning rate for quick experiments
+                - 'stable': Slower, more stable learning rate for final training
+                - 'crunch': Load and optimize model for deployment (no training)
+        """
         self.device = device
         self.model = PolicyValueNet().to(device)
+        self.mode = mode.lower()
 
-        # Two different learning rate configurations
-        if fast_mode:
-            # Faster learning rate for quick experiments
+        if self.mode == "crunch":
+            print("Using crunch mode - for model optimization and deployment")
+            return
+
+        # Configure learning rate based on mode
+        if self.mode == "fast":
             self.lr = 0.0001
             print("Using fast training mode (lr=0.0001) - good for quick experiments")
-        else:
-            # Slower, more stable learning rate for production training
+        elif self.mode == "stable":
             self.lr = 0.000005
             print("Using stable training mode (lr=0.000005) - good for final training")
+        else:
+            raise ValueError(
+                f"Unknown mode: {mode}. Must be one of: fast, stable, crunch"
+            )
 
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -211,6 +230,11 @@ class ModelWrapper:
         policy_weight: float = 2.0,
     ):
         """Train on a batch of examples"""
+        if self.mode == "crunch":
+            raise ValueError(
+                "Cannot train in crunch mode - use fast or stable mode for training"
+            )
+
         self.model.train()
         board_states = (
             torch.FloatTensor(board_states).to(self.device).permute(0, 3, 1, 2)
@@ -263,6 +287,72 @@ class ModelWrapper:
         )
 
     def load(self, path):
+        """Load a model from path, automatically detecting if it's quantized.
+
+        Args:
+            path: Path to either a regular or quantized model checkpoint
+        """
         checkpoint = torch.load(path)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Check if this is a quantized model (just the state dict) or regular checkpoint
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            # Regular checkpoint with optimizer state
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            if hasattr(
+                self, "optimizer"
+            ):  # Only load optimizer if we're not in crunch mode
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        else:
+            # Quantized model - need to quantize the model first
+            print("Detected quantized model, preparing architecture...")
+            self.model = quantize_dynamic(
+                self.model,
+                {torch.nn.Linear, torch.nn.Conv2d, torch.nn.BatchNorm2d},
+                dtype=torch.qint8,
+            )
+            self.model.load_state_dict(checkpoint)
+
+    def crunch(self, input_path: str, output_dir: str):
+        """Optimize model for minimal file size while keeping PyTorch compatibility.
+
+        Args:
+            input_path: Path to input PyTorch model
+            output_dir: Directory to save optimized model
+        """
+        print(f"Loading model from {input_path}")
+        self.load(input_path)
+        self.model.eval()
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Quantize the model to reduce size
+        print("Quantizing model...")
+        quantized_model = quantize_dynamic(
+            self.model,
+            {
+                torch.nn.Linear,
+                torch.nn.Conv2d,
+                torch.nn.BatchNorm2d,
+            },  # Quantize more layer types
+            dtype=torch.qint8,
+        )
+
+        # Save in a more compressed format
+        output_path = os.path.join(output_dir, "model_compressed.pth")
+        torch.save(
+            quantized_model.state_dict(),
+            output_path,
+            _use_new_zipfile_serialization=True,  # Use more efficient storage format
+        )
+
+        # Print size comparison
+        original_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
+        compressed_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+        reduction = (1 - compressed_size / original_size) * 100
+
+        print(f"\nSize comparison:")
+        print(f"Original model:    {original_size:.1f} MB")
+        print(f"Compressed model:  {compressed_size:.1f} MB")
+        print(f"Size reduction:    {reduction:.1f}%")
+        print(f"\nOptimized model saved to: {output_path}")

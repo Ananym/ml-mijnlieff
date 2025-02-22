@@ -3,10 +3,12 @@ import torch
 from game import GameState, Move, Player, PieceType, print_full_legal_moves
 import random
 from model import ModelWrapper
+import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ModelWrapper(device)
-model.load("saved_models/model_latest.pth")
+model_path = os.getenv("TICTACDO_MODEL_PATH", "saved_models/model_latest.pth")
+model.load(model_path)
 
 
 def convert_frontend_state_to_game_state(frontend_state):

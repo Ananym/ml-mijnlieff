@@ -246,7 +246,7 @@ export default {
           const randomIndex = Math.floor(Math.random() * validMoves.length);
           move = validMoves[randomIndex];
         } else {
-          const response = await fetch('http://localhost:5000/api/get_ai_move', {
+          const response = await fetch(`${import.meta.env.VITE_API_ENDPOINT}/api/get_ai_move`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',

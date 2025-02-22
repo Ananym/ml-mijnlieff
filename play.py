@@ -1,18 +1,8 @@
-from flask import Flask, request, jsonify, abort
-from flask_cors import CORS
 import numpy as np
 import torch
 from game import GameState, Move, Player, PieceType, print_full_legal_moves
 import random
 from model import ModelWrapper
-
-app = Flask(__name__)
-CORS(
-    app,
-    resources={
-        r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}
-    },
-)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ModelWrapper(device)
@@ -61,13 +51,7 @@ def convert_frontend_state_to_game_state(frontend_state):
     return game_state
 
 
-@app.route("/api/get_ai_move", methods=["POST", "OPTIONS"])
-def get_ai_move():
-    if request.method == "OPTIONS":
-        return "", 204
-
-    frontend_state = request.json
-
+def get_ai_move_logic(frontend_state):
     # Get difficulty from request, default to hardest (0)
     difficulty = frontend_state.get("difficulty", 0)
 
@@ -75,7 +59,7 @@ def get_ai_move():
 
     legal_moves = game_state.get_legal_moves()
     if np.all(legal_moves == 0):
-        abort(400, "No legal moves available.")
+        raise ValueError("No legal moves available.")
 
     print(f"Current player: {game_state.current_player}")
     print(f"Difficulty: {ModelWrapper.DIFFICULTY_SETTINGS[difficulty]['name']}")
@@ -95,32 +79,24 @@ def get_ai_move():
     if move:
         relevant_piece_counts = game_state.piece_counts[game_state.current_player]
         if relevant_piece_counts[move.piece_type] == 0:
-            abort(500, "Invalid move: piece type has no remaining pieces.")
+            raise ValueError("Invalid move: piece type has no remaining pieces.")
 
         print(f"AI picked move: {move}")
-        return jsonify(
-            {
-                "x": int(move.x),
-                "y": int(move.y),
-                "pieceType": int(move.piece_type.value) + 1,
-                "difficulty": difficulty,
-                "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
-            }
-        )
+        return {
+            "x": int(move.x),
+            "y": int(move.y),
+            "pieceType": int(move.piece_type.value) + 1,
+            "difficulty": difficulty,
+            "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
+        }
     else:
         print("Model didn't pick a move - using random move")
         legal_moves = np.array(np.where(legal_moves == 1)).T
         random_move = random.choice(legal_moves)
-        return jsonify(
-            {
-                "x": int(random_move[0]),
-                "y": int(random_move[1]),
-                "pieceType": int(random_move[2] + 1),
-                "difficulty": difficulty,
-                "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
-            }
-        )
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
+        return {
+            "x": int(random_move[0]),
+            "y": int(random_move[1]),
+            "pieceType": int(random_move[2] + 1),
+            "difficulty": difficulty,
+            "difficultyName": ModelWrapper.DIFFICULTY_SETTINGS[difficulty]["name"],
+        }

@@ -1,12 +1,11 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
 import random
-from torch.quantization import quantize_dynamic
-import torch.quantization
-import os
+import torch.package
 
 
 class ResBlock(nn.Module):
@@ -88,20 +87,12 @@ class ModelWrapper:
 
     def __init__(
         self,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=None,
         mode: str = "stable",
     ):
-        """Initialize the model wrapper.
-
-        Args:
-            device: Device to run the model on ('cuda' or 'cpu')
-            mode: One of:
-                - 'fast': Faster learning rate for quick experiments
-                - 'stable': Slower, more stable learning rate for final training
-                - 'crunch': Load and optimize model for deployment (no training)
-        """
-        self.device = device
-        self.model = PolicyValueNet().to(device)
+        # Only use CPU if forced or if no device specified
+        self.device = "cpu" if os.getenv("FORCE_CPU") or not device else device
+        self.model = PolicyValueNet().to(self.device)
         self.mode = mode.lower()
 
         if self.mode == "crunch":
@@ -127,21 +118,9 @@ class ModelWrapper:
             betas=(0.9, 0.999),
         )
 
-        # Add learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.5, patience=10, verbose=True
         )
-
-    def get_lr(self) -> float:
-        """Return current learning rate"""
-        return self.lr
-
-    def set_lr(self, new_lr: float):
-        """Manually set learning rate"""
-        self.lr = new_lr
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = new_lr
-        print(f"Learning rate set to: {new_lr}")
 
     def predict(
         self,
@@ -186,8 +165,21 @@ class ModelWrapper:
                     settings = self.DIFFICULTY_SETTINGS[difficulty]
                     min_k, max_k = settings["top_k"]
 
-                    # Always use at least 1 move, and no more than available
-                    k = min(max(1, random.randint(1, min(max_k, num_legal))), num_legal)
+                    # If there's only one legal move, just use that
+                    if num_legal == 1:
+                        k = 1
+                    else:
+                        # Ensure min_k and max_k are valid
+                        max_k = min(
+                            max_k, num_legal
+                        )  # Don't exceed number of legal moves
+                        min_k = min(min_k, max_k)  # Don't let min exceed max
+
+                        # If min_k equals max_k, just use that value
+                        if min_k == max_k:
+                            k = min_k
+                        else:
+                            k = random.randint(min_k, max_k)
 
                     # Get logits for legal moves
                     legal_logits = policy_flat[0, legal_indices]
@@ -220,63 +212,6 @@ class ModelWrapper:
 
             return policy.cpu().numpy(), value.cpu().numpy()
 
-    def train_step(
-        self,
-        board_states,
-        flat_states,
-        target_policies,
-        target_values,
-        legal_moves=None,
-        policy_weight: float = 2.0,
-    ):
-        """Train on a batch of examples"""
-        if self.mode == "crunch":
-            raise ValueError(
-                "Cannot train in crunch mode - use fast or stable mode for training"
-            )
-
-        self.model.train()
-        board_states = (
-            torch.FloatTensor(board_states).to(self.device).permute(0, 3, 1, 2)
-        )
-        flat_states = torch.FloatTensor(flat_states).to(self.device)
-        target_policies = torch.FloatTensor(target_policies).to(self.device)
-        target_values = torch.FloatTensor(target_values).to(self.device)
-
-        self.optimizer.zero_grad()
-        policy_logits, value_pred = self.model(board_states, flat_states)
-
-        # Apply legal moves mask if provided
-        if legal_moves is not None:
-            legal_moves = torch.FloatTensor(legal_moves).to(self.device)
-            policy_logits = policy_logits.masked_fill(legal_moves == 0, float("-inf"))
-
-        # Policy loss (cross entropy over legal moves)
-        policy_pred = F.softmax(
-            policy_logits.reshape(policy_logits.shape[0], -1), dim=1
-        )
-        policy_pred = policy_pred.reshape(policy_logits.shape)
-
-        # Increase policy weight for opening moves
-        move_counts = (board_states != 0).sum(axis=(1, 2, 3))
-        opening_moves_mask = (move_counts < 2).float()  # Focus on first move
-        policy_weights = policy_weight * (1 + opening_moves_mask)
-
-        # Calculate losses
-        policy_loss = -torch.mean(
-            policy_weights
-            * torch.sum(target_policies * torch.log(policy_pred + 1e-8), dim=(1, 2, 3))
-        )
-        value_loss = F.mse_loss(value_pred.squeeze(), target_values)
-
-        # Total loss with stronger policy emphasis
-        total_loss = 2.0 * policy_loss + value_loss  # Fixed 2:1 ratio
-
-        total_loss.backward()
-        self.optimizer.step()
-
-        return total_loss.item(), policy_loss.item(), value_loss.item()
-
     def save(self, path):
         torch.save(
             {
@@ -287,72 +222,40 @@ class ModelWrapper:
         )
 
     def load(self, path):
-        """Load a model from path, automatically detecting if it's quantized.
+        """Load a model from path, automatically detecting if it's a package or state dict.
 
         Args:
-            path: Path to either a regular or quantized model checkpoint
+            path: Path to either a regular checkpoint or package
         """
-        checkpoint = torch.load(path)
+        if path.endswith(".pt"):  # Package format
+            print("Loading from torch package...")
+            importer = torch.package.PackageImporter(path)
+            self.model = importer.load_pickle("model", "model.pkl")
+        else:  # Regular checkpoint
+            checkpoint = torch.load(path)
 
-        # Check if this is a quantized model (just the state dict) or regular checkpoint
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            # Regular checkpoint with optimizer state
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            if hasattr(
-                self, "optimizer"
-            ):  # Only load optimizer if we're not in crunch mode
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        else:
-            # Quantized model - need to quantize the model first
-            print("Detected quantized model, preparing architecture...")
-            self.model = quantize_dynamic(
-                self.model,
-                {torch.nn.Linear, torch.nn.Conv2d, torch.nn.BatchNorm2d},
-                dtype=torch.qint8,
+            # Check if this is a quantized model by looking for quantization parameters
+            is_quantized = (
+                any("_packed_params" in key for key in checkpoint.keys())
+                if isinstance(checkpoint, dict)
+                else False
             )
-            self.model.load_state_dict(checkpoint)
 
-    def crunch(self, input_path: str, output_dir: str):
-        """Optimize model for minimal file size while keeping PyTorch compatibility.
+            if is_quantized:
+                print("Loading quantized model...")
+                from torch.quantization import quantize_dynamic
 
-        Args:
-            input_path: Path to input PyTorch model
-            output_dir: Directory to save optimized model
-        """
-        print(f"Loading model from {input_path}")
-        self.load(input_path)
-        self.model.eval()
+                self.model = quantize_dynamic(
+                    self.model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
+                )
 
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+            if "model_state_dict" in checkpoint:
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+                if hasattr(self, "optimizer"):
+                    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            else:
+                self.model.load_state_dict(checkpoint)
 
-        # Quantize the model to reduce size
-        print("Quantizing model...")
-        quantized_model = quantize_dynamic(
-            self.model,
-            {
-                torch.nn.Linear,
-                torch.nn.Conv2d,
-                torch.nn.BatchNorm2d,
-            },  # Quantize more layer types
-            dtype=torch.qint8,
-        )
-
-        # Save in a more compressed format
-        output_path = os.path.join(output_dir, "model_compressed.pth")
-        torch.save(
-            quantized_model.state_dict(),
-            output_path,
-            _use_new_zipfile_serialization=True,  # Use more efficient storage format
-        )
-
-        # Print size comparison
-        original_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
-        compressed_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
-        reduction = (1 - compressed_size / original_size) * 100
-
-        print(f"\nSize comparison:")
-        print(f"Original model:    {original_size:.1f} MB")
-        print(f"Compressed model:  {compressed_size:.1f} MB")
-        print(f"Size reduction:    {reduction:.1f}%")
-        print(f"\nOptimized model saved to: {output_path}")
+            print(
+                f"Model loaded successfully, device: {next(self.model.parameters()).device}"
+            )

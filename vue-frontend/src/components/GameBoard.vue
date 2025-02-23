@@ -14,7 +14,13 @@
         }"
         @click="makeMove(columnIndex, rowIndex)"
       >
-        <svg v-if="cell[0] !== 0 || cell[1] !== 0" width="40" height="40" viewBox="0 0 40 40">
+        <svg
+          v-if="cell[0] !== 0 || cell[1] !== 0"
+          width="40"
+          height="40"
+          viewBox="0 0 40 40"
+          class="board-piece"
+        >
           <component :is="getPieceIcon(columnIndex, rowIndex)" />
         </svg>
         <!-- <div style="font-size: 16px;">{{ columnIndex}},{{ rowIndex }} </div> -->
@@ -153,6 +159,7 @@ export default {
   justify-content: center;
   align-items: center;
   cursor: pointer;
+  background-color: white;
 }
 
 .human-player {
@@ -173,5 +180,36 @@ export default {
 
 .last-ai-move {
   box-shadow: inset 0 0 10px #ff0000;
+}
+
+@media (prefers-color-scheme: dark) {
+  .board-cell {
+    background-color: white;
+    border-color: black;
+  }
+
+  .game-board {
+    border-color: black;
+  }
+
+  .board-piece {
+    color: black;
+  }
+
+  .human-player {
+    background-color: #8080ff;
+  }
+
+  .ai-player {
+    background-color: #ff8080;
+  }
+
+  .valid-move {
+    background-color: #80ff80;
+  }
+
+  .ai-valid-move {
+    background-color: #ffff80;
+  }
 }
 </style>

@@ -166,18 +166,18 @@ export default {
   cursor: pointer;
   padding: 5px;
   border-radius: 5px;
-  transition: background-color 0.3s;
+  transition: all 0.3s;
   width: 100%;
   border: 2px solid transparent;
+  color: var(--text-color);
 }
 
 .piece-row:hover:not(.disabled) {
-  background-color: #f0f0f0;
+  background-color: var(--button-hover-bg);
 }
 
 .piece-row.selected:not(.disabled) {
-  /* background-color: #e0e0e0; */
-  border: 2px solid #007bff;
+  border: 2px solid var(--link-color);
 }
 
 .piece-row.disabled {
@@ -193,11 +193,8 @@ export default {
   align-items: center;
   border: 2px solid transparent;
   border-radius: 5px;
+  color: var(--text-color);
 }
-
-/* .selected .piece-icon {
-    border-color: #007bff;
-  } */
 
 .count-container {
   display: flex;
@@ -209,15 +206,24 @@ export default {
   padding: 2px 6px;
   border-radius: 3px;
   margin: 0 2px;
+  color: black;
 }
 
 .human {
   background-color: #ccccff;
-  /* color: white; */
 }
 
 .ai {
   background-color: #ffcccc;
-  /* color: white; */
+}
+
+@media (prefers-color-scheme: dark) {
+  .human {
+    background-color: #8080ff;
+  }
+
+  .ai {
+    background-color: #ff8080;
+  }
 }
 </style>

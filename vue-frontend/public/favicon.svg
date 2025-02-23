@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    path {
+      stroke: #333333;
+    }
+    @media (prefers-color-scheme: dark) {
+      path {
+        stroke: #e0e0e0;
+      }
+    }
+  </style>
+  <g>
+    <path
+      d="M5 5 L35 35 M35 5 L5 35"
+      stroke-width="2"
+      fill="none"
+    />
+  </g>
+</svg> 

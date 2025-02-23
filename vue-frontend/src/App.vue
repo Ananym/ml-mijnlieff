@@ -1,16 +1,22 @@
 <template>
   <div id="app">
-    <h1>Mijnlieff</h1>
+    <h1>ML Mijnlieff</h1>
     <template v-if="!gameStarted">
+      <p class="intro-text">Play against an ML-powered opponent</p>
+      <p class="designer-credit">
+        Game designed by
+        <a href="https://www.hopwoodgames.com/mijnlieff-game-page" target="_blank">Andy Hopwood</a>
+      </p>
+      <button @click="showRules">Show Rules</button>
       <h2>Select Difficulty:</h2>
       <div class="difficulty-selector">
         <button
-          v-for="(settings, level) in difficulties"
-          :key="level"
-          @click="selectDifficulty(Number(level))"
-          :class="{ selected: selectedDifficulty === Number(level) }"
+          v-for="diff in sortedDifficulties"
+          :key="diff.level"
+          @click="selectDifficulty(diff.level)"
+          :class="{ selected: selectedDifficulty === diff.level }"
         >
-          {{ settings.name }}
+          {{ diff.name }}
         </button>
       </div>
       <h2>Choose your player:</h2>
@@ -108,6 +114,12 @@ export default {
     const difficulties = DIFFICULTY_SETTINGS;
 
     const useRandomDummy = false;
+
+    const sortedDifficulties = computed(() => {
+      return Object.entries(difficulties)
+        .map(([level, settings]) => ({ level: Number(level), ...settings }))
+        .sort((a, b) => b.level - a.level);
+    });
 
     const showRules = () => {
       rulesVisible.value = true;
@@ -324,16 +336,84 @@ export default {
       difficulties,
       selectedDifficulty,
       selectDifficulty,
+      sortedDifficulties,
     };
   },
 };
 </script>
 
-<style scoped>
+<style>
+:root {
+  --bg-color: #ffffff;
+  --text-color: #333333;
+  --link-color: #4caf50;
+  --link-hover-color: #45a049;
+  --button-bg: #f0f0f0;
+  --button-border: #ddd;
+  --button-hover-bg: #e0e0e0;
+  --button-selected-bg: #4caf50;
+  --button-selected-color: white;
+  --button-selected-border: #45a049;
+  --button-selected-hover: #45a049;
+  --button-disabled-opacity: 0.6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-color: #242424;
+    --text-color: #e0e0e0;
+    --link-color: #6abf6e;
+    --link-hover-color: #7ccf80;
+    --button-bg: #2d2d2d;
+    --button-border: #404040;
+    --button-hover-bg: #3d3d3d;
+    --button-selected-bg: #4caf50;
+    --button-selected-color: #ffffff;
+    --button-selected-border: #45a049;
+    --button-selected-hover: #45a049;
+    --button-disabled-opacity: 0.4;
+  }
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-color);
+}
+
 #app {
   font-family: Arial, sans-serif;
   text-align: center;
-  padding: 0px;
+  padding: 0;
+  color: var(--text-color);
+  min-height: 100vh;
+  background-color: transparent;
+}
+
+.intro-text {
+  font-size: 1.2em;
+  margin: 10px 0;
+  color: var(--text-color);
+}
+
+.designer-credit {
+  margin: 10px 0 20px;
+  font-style: italic;
+}
+
+.designer-credit a {
+  color: var(--link-color);
+  text-decoration: none;
+}
+
+.designer-credit a:hover {
+  color: var(--link-hover-color);
+  text-decoration: underline;
+}
+
+.start-screen-controls {
+  margin-top: 20px;
 }
 
 .game-container {
@@ -347,11 +427,20 @@ button {
   padding: 10px 20px;
   font-size: 16px;
   cursor: pointer;
+  background-color: var(--button-bg);
+  border: 2px solid var(--button-border);
+  color: var(--text-color);
+  border-radius: 5px;
+  transition: all 0.2s;
+}
+
+button:hover:not(:disabled) {
+  background-color: var(--button-hover-bg);
 }
 
 button:disabled {
   cursor: not-allowed;
-  opacity: 0.6;
+  opacity: var(--button-disabled-opacity);
 }
 
 .game-controls {
@@ -368,23 +457,23 @@ button:disabled {
 }
 
 .difficulty-selector button {
-  background-color: #f0f0f0;
-  border: 2px solid #ddd;
+  background-color: var(--button-bg);
+  border: 2px solid var(--button-border);
   border-radius: 5px;
   transition: all 0.2s;
 }
 
 .difficulty-selector button.selected {
-  background-color: #4caf50;
-  color: white;
-  border-color: #45a049;
+  background-color: var(--button-selected-bg);
+  color: var(--button-selected-color);
+  border-color: var(--button-selected-border);
 }
 
 .difficulty-selector button:hover {
-  background-color: #e0e0e0;
+  background-color: var(--button-hover-bg);
 }
 
 .difficulty-selector button.selected:hover {
-  background-color: #45a049;
+  background-color: var(--button-selected-hover);
 }
 </style>

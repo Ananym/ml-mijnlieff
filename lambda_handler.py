@@ -4,6 +4,7 @@ import os
 
 print("Initializing Lambda container...")
 
+
 # Initialize model at module level
 print(
     f"Loading model from {os.getenv('TICTACDO_MODEL_PATH', 'models/model_latest.pth')}"
@@ -17,25 +18,15 @@ def create_response(status_code, body):
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",  # Configure this appropriately for production
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
         },
         "body": json.dumps(body) if body else "",
     }
 
 
 def handler(event, context):
-    print(f"Received event: {json.dumps(event, indent=2)}")
-
-    # Handle CORS preflight requests
-    if event.get("requestContext", {}).get("http", {}).get("method") == "OPTIONS":
-        return create_response(204, None)
-
     try:
         # Parse the request body
         body = json.loads(event.get("body", "{}"))
-        print(f"Parsed request body: {json.dumps(body, indent=2)}")
 
         # Get AI move using the same logic as the Flask app
         move_result = get_ai_move_logic(body)

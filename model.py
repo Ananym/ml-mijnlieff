@@ -6,6 +6,7 @@ import numpy as np
 from typing import Tuple, Optional
 import random
 import torch.package
+import time  # Add time import
 
 
 class ResBlock(nn.Module):
@@ -90,9 +91,13 @@ class ModelWrapper:
         device=None,
         mode: str = "stable",
     ):
+        t0 = time.time()
         # Only use CPU if forced or if no device specified
         self.device = "cpu" if os.getenv("FORCE_CPU") or not device else device
         self.model = PolicyValueNet().to(self.device)
+        t1 = time.time()
+        print(f"Model creation and device setup: {t1 - t0:.2f}s")
+
         self.mode = mode.lower()
 
         if self.mode == "crunch":
@@ -227,12 +232,18 @@ class ModelWrapper:
         Args:
             path: Path to either a regular checkpoint or package
         """
+        start_time = time.time()
+
         if path.endswith(".pt"):  # Package format
             print("Loading from torch package...")
+            load_start = time.time()
             importer = torch.package.PackageImporter(path)
             self.model = importer.load_pickle("model", "model.pkl")
+            print(f"Package loading took {time.time() - load_start:.2f} seconds")
         else:  # Regular checkpoint
+            load_start = time.time()
             checkpoint = torch.load(path)
+            print(f"Model loading took {time.time() - load_start:.2f} seconds")
 
             # Check if this is a quantized model by looking for quantization parameters
             is_quantized = (
@@ -243,19 +254,26 @@ class ModelWrapper:
 
             if is_quantized:
                 print("Loading quantized model...")
+                quant_start = time.time()
                 from torch.quantization import quantize_dynamic
 
                 self.model = quantize_dynamic(
                     self.model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
                 )
+                print(f"Quantization took {time.time() - quant_start:.2f} seconds")
 
+            state_dict_start = time.time()
             if "model_state_dict" in checkpoint:
                 self.model.load_state_dict(checkpoint["model_state_dict"])
                 if hasattr(self, "optimizer"):
                     self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             else:
                 self.model.load_state_dict(checkpoint)
+            print(
+                f"State dict loading took {time.time() - state_dict_start:.2f} seconds"
+            )
 
             print(
                 f"Model loaded successfully, device: {next(self.model.parameters()).device}"
             )
+            print(f"Total loading time: {time.time() - start_time:.2f} seconds")

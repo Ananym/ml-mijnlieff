@@ -1,6 +1,12 @@
 import os
 import numpy as np
+import time
+
+start_time = time.time()
 import torch
+
+print(f"Torch import took {time.time() - start_time:.2f} seconds")
+
 from game import GameState, Move, Player, PieceType, print_full_legal_moves
 import random
 from model import ModelWrapper

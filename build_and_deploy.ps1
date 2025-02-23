@@ -12,7 +12,7 @@ param(
     [string]$s3Path = "mjinlieff",
 
     [Parameter(Mandatory=$false)]
-    [string]$apiEndpoint = "https://api.mijnlieff.com",
+    [string]$apiEndpoint = "https://bzj3p2a25gzljma7pryszunxie0dzlzg.lambda-url.eu-west-2.on.aws",
 
     [Parameter(Mandatory=$false)]
     [switch]$skipDocker = $false,

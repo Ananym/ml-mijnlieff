@@ -25,6 +25,13 @@ def create_response(status_code, body):
 
 def handler(event, context):
     try:
+        # Handle ping request
+        if (
+            event.get("requestContext", {}).get("http", {}).get("method") == "GET"
+            and event.get("rawPath") == "/ping"
+        ):
+            return create_response(204, None)
+
         # Parse the request body
         body = json.loads(event.get("body", "{}"))
 

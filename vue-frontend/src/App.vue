@@ -7,6 +7,7 @@
         Game designed by
         <a href="https://www.hopwoodgames.com/mijnlieff-game-page" target="_blank">Andy Hopwood</a>
       </p>
+      <div v-if="apiError" class="api-error">{{ apiError }}</div>
       <button @click="showRules">Show Rules</button>
       <h2>Select Difficulty:</h2>
       <div class="difficulty-selector">
@@ -53,7 +54,7 @@
           {{ gameState.currentPlayer === Player.ONE ? 'Player One' : 'Player Two' }}
         </div> -->
       </div>
-      <div v-if="!gameOver">Prediction: {{ prediction }}</div>
+      <div v-if="prediction !== null && !gameOver">AI victory prediction: {{ prediction }}</div>
       <div v-if="gameOver">
         <h2>Game Over! {{ winnerProclamation }}</h2>
         <p>Human Score: {{ scores.HUMAN }}</p>
@@ -112,6 +113,7 @@ export default {
     const rulesVisible: Ref<boolean> = ref(false);
     const selectedDifficulty: Ref<number> = ref(0); // Default to hardest
     const difficulties = DIFFICULTY_SETTINGS;
+    const apiError: Ref<string | null> = ref(null);
 
     const useRandomDummy = false;
 
@@ -137,7 +139,25 @@ export default {
       return "It's a tie!";
     });
 
-    const startGame = (humanFirst: boolean) => {
+    const pingApi = async () => {
+      try {
+        const response = await fetch(`${import.meta.env.VITE_API_ENDPOINT}/ping`, {
+          method: 'GET',
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        apiError.value = null;
+      } catch (error) {
+        apiError.value = 'AI service unavailable. Please try again later.';
+        console.error('API ping failed:', error);
+      }
+    };
+
+    const startGame = async (humanFirst: boolean) => {
+      // Start ping check but don't wait for it
+      pingApi();
+
       gameStarted.value = true;
       isHumanFirst.value = humanFirst;
       const aiPlayer = humanFirst ? Players.TWO : Players.ONE;
@@ -313,6 +333,9 @@ export default {
       selectedDifficulty.value = level;
     };
 
+    // Start ping check on mount but don't block
+    pingApi();
+
     return {
       gameStarted,
       gameState,
@@ -337,6 +360,7 @@ export default {
       selectedDifficulty,
       selectDifficulty,
       sortedDifficulties,
+      apiError,
     };
   },
 };
@@ -475,5 +499,13 @@ button:disabled {
 
 .difficulty-selector button.selected:hover {
   background-color: var(--button-selected-hover);
+}
+
+.api-error {
+  color: #ff4444;
+  margin: 10px 0;
+  padding: 10px;
+  background-color: rgba(255, 68, 68, 0.1);
+  border-radius: 5px;
 }
 </style>

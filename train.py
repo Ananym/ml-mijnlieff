@@ -142,11 +142,11 @@ def train_network(
     model: ModelWrapper,
     num_episodes: int = 100,
     batch_size: int = 256,
-    save_interval: int = 10,
+    save_interval: int = 50,
     num_checkpoints: int = 3,
     min_temp: float = 0.5,
-    strategic_opponent_ratio: float = 0.6,  # 50% strategic games
-    random_opponent_ratio: float = 0.1,  # 10% random opponents
+    strategic_opponent_ratio: float = 0.3,  # 30% strategic games
+    random_opponent_ratio: float = 0.2,  # 20% random opponents
     buffer_size: int = 10000,
     policy_weight: float = 1.5,  # Increased from 1.0 to encourage decisive play
     num_epochs: int = 40,
@@ -154,7 +154,11 @@ def train_network(
 ):
     """Main training loop that runs until interrupted"""
     replay_buffer = []
-    running_loss = {"total": 0, "policy": 0, "value": 0}
+    running_loss = {
+        "total": 1e-8,
+        "policy": 1e-8,
+        "value": 1e-8,
+    }  # Initialize with small values
     running_count = 0
     iteration = 0
     training_start = time.time()

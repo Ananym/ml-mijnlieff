@@ -91,29 +91,17 @@ def get_ai_move_logic(frontend_state):
         state_rep.board, state_rep.flat_values, legal_moves, difficulty=difficulty
     )
 
-    print(
-        f"Initial policy type: {type(policy)}, shape: {policy.shape if hasattr(policy, 'shape') else 'no shape'}"
-    )
-
     # Remove batch dimension and get best move
     policy = policy.squeeze(0)
-    print(
-        f"After squeeze type: {type(policy)}, shape: {policy.shape if hasattr(policy, 'shape') else 'no shape'}"
-    )
 
     # Convert policy to numpy array if it's a tensor
     if isinstance(policy, torch.Tensor):
         policy = policy.detach().cpu().numpy()
-    print(
-        f"After numpy conversion type: {type(policy)}, shape: {policy.shape if hasattr(policy, 'shape') else 'no shape'}"
-    )
 
     # Find the best move coordinates
     try:
         flat_index = int(policy.argmax())
-        print(f"Argmax result: {flat_index}, type: {type(flat_index)}")
         move_coords = np.unravel_index(flat_index, policy.shape)
-        print(f"Move coords: {move_coords}, type: {type(move_coords)}")
         move = Move(
             int(move_coords[0]), int(move_coords[1]), PieceType(int(move_coords[2]))
         )

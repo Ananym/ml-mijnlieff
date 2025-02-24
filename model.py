@@ -148,9 +148,7 @@ class ModelWrapper:
 
             # Ensure consistent shapes throughout
             batch_size = policy_logits.shape[0]
-            policy_flat = policy_logits.view(
-                batch_size, -1
-            )  # Use view instead of reshape
+            policy_flat = policy_logits.view(batch_size, -1)
 
             # Handle legal moves first
             if legal_moves is not None:
@@ -216,6 +214,62 @@ class ModelWrapper:
             policy = policy_flat.view(policy_logits.shape)  # Restore original shape
 
             return policy.cpu().numpy(), value.cpu().numpy()
+
+    def train_step(
+        self,
+        board_inputs: np.ndarray,
+        flat_inputs: np.ndarray,
+        policy_targets: np.ndarray,
+        value_targets: np.ndarray,
+        policy_weight: float = 1.0,
+    ) -> Tuple[float, float, float]:
+        """Perform a single training step on a batch of data.
+
+        Args:
+            board_inputs: Batch of board states (N, H, W, C)
+            flat_inputs: Batch of flat state values (N, F)
+            policy_targets: Batch of policy targets (N, H, W, 4)
+            value_targets: Batch of value targets (N,)
+            policy_weight: Weight for policy loss relative to value loss
+
+        Returns:
+            Tuple of (total_loss, policy_loss, value_loss)
+        """
+        self.model.train()
+
+        # Convert inputs to tensors and move to device
+        board_inputs = torch.FloatTensor(board_inputs).to(self.device)
+        flat_inputs = torch.FloatTensor(flat_inputs).to(self.device)
+        policy_targets = torch.FloatTensor(policy_targets).to(self.device)
+        value_targets = torch.FloatTensor(value_targets).to(self.device)
+
+        # Ensure correct shapes
+        board_inputs = board_inputs.permute(0, 3, 1, 2)  # NHWC -> NCHW
+
+        # Forward pass
+        policy_logits, value_pred = self.model(board_inputs, flat_inputs)
+
+        # Calculate policy loss (cross entropy on move probabilities)
+        policy_loss = F.cross_entropy(
+            policy_logits.view(-1, policy_logits.size(-1)),
+            policy_targets.view(-1, policy_targets.size(-1)),
+        )
+
+        # Calculate value loss (MSE on game outcome predictions)
+        value_loss = F.mse_loss(value_pred.squeeze(-1), value_targets)
+
+        # Combine losses with weighting
+        total_loss = policy_weight * policy_loss + value_loss
+
+        # Optimization step
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        # Update learning rate
+        self.scheduler.step(total_loss)
+
+        return (total_loss.item(), policy_loss.item(), value_loss.item())
 
     def save(self, path):
         torch.save(

@@ -25,9 +25,10 @@ debugPrint = False
 
 @dataclass
 class TrainingExample:
-    state_rep: GameState
+    state_rep: GameStateRepresentation
     policy: np.ndarray  # One-hot encoded actual move made
-    value: float  # Game outcome
+    value: float  # Game outcome from current player's perspective
+    current_player: Player  # Store which player made the move
 
 
 def self_play_game(
@@ -116,6 +117,7 @@ def self_play_game(
                 state_rep=state_rep,
                 policy=policy_target,
                 value=0.0,  # Will be filled in later
+                current_player=game.current_player,
             )
         )
 
@@ -129,11 +131,9 @@ def self_play_game(
 
             # Set value targets based on game outcome
             for example in examples:
-                if winner is None:
-                    example.value = 0.5  # Draw
-                else:
-                    # 1 for P1 win, 0 for P2 win from P1's perspective
-                    example.value = 1.0 if winner == Player.ONE else 0.0
+                example.value = get_adjusted_value(
+                    game, winner, move_count, game.current_player
+                )
 
             return examples
 
@@ -145,10 +145,10 @@ def train_network(
     save_interval: int = 50,
     num_checkpoints: int = 3,
     min_temp: float = 0.5,
-    strategic_opponent_ratio: float = 0.3,  # 30% strategic games
-    random_opponent_ratio: float = 0.2,  # 20% random opponents
+    strategic_opponent_ratio: float = 0.5,  # 30% strategic games
+    random_opponent_ratio: float = 0.1,  # 20% random opponents
     buffer_size: int = 10000,
-    policy_weight: float = 1.5,  # Increased from 1.0 to encourage decisive play
+    policy_weight: float = 0.5,  # Reduced from 1.5 to stabilize training
     num_epochs: int = 40,
     debug: bool = False,
 ):
@@ -271,25 +271,39 @@ def train_network(
     # Keep track of last N checkpoints
     checkpoint_files = []
 
-    def get_temperature(
-        move_count: int, total_moves: int = 12, is_strategic: bool = False
-    ) -> float:
-        """Higher temperature for opening moves to encourage exploration"""
-        if move_count < 2:  # First move
-            return 3.0  # Much higher temperature for first move
-        elif move_count < 4:  # Early game
-            return 2.0  # Still elevated for early moves
-        else:  # Mid-late game
-            return max(min_temp, 1.0)
+    def get_temperature(move_count: int) -> float:
+        """Higher temperature early, lower later"""
+        if move_count <= 2:
+            return 2.0  # Very high in opening
+        elif move_count <= 6:
+            return 1.0  # Still exploring in early-mid game
+        elif move_count <= 10:
+            return 0.5  # Getting more focused in mid-late game
+        else:
+            return 0.1  # Almost deterministic in endgame
 
     def get_adjusted_value(
-        winner: Optional[Player], move_count: int, is_model_turn: bool
+        game: GameState,
+        winner: Optional[Player],
+        move_count: int,
+        current_player: Player,
     ) -> float:
-        """Simple value function with draw adjustment"""
-        if winner is None:
-            return 0.2  # Draws are less valuable
-        else:
-            return 1.0 if (winner == Player.ONE) == is_model_turn else 0.0
+        """Get value target from current player's perspective based on score difference"""
+        # calculate scores for both players
+        score_one = game._calculate_score(Player.ONE)
+        score_two = game._calculate_score(Player.TWO)
+
+        # get score difference from current player's perspective
+        score_diff = (
+            score_one - score_two
+            if current_player == Player.ONE
+            else score_two - score_one
+        )
+
+        # normalize to [-1, 1] range, using 5 as max expected difference
+        normalized_score = max(-1.0, min(1.0, score_diff / 5.0))
+
+        return normalized_score
 
     # Setup interrupt handling
     interrupt_received = False
@@ -388,6 +402,7 @@ def train_network(
                             state_rep=state_rep,
                             policy=policy_target,
                             value=0.0,  # Will be filled in later
+                            current_player=game.current_player,
                         )
                     )
 
@@ -399,9 +414,11 @@ def train_network(
                         # Game is over, get the winner
                         winner = game.get_winner()
 
-                        # Set value targets with length penalty
+                        # Set value targets based on game outcome
                         for example in examples:
-                            example.value = get_adjusted_value(winner, move_count, True)
+                            example.value = get_adjusted_value(
+                                game, winner, move_count, game.current_player
+                            )
                         break
 
                 replay_buffer.extend(examples)
@@ -453,7 +470,7 @@ def train_network(
                         masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
 
                         # Use unified temperature schedule
-                        temperature = get_temperature(move_count, is_strategic=False)
+                        temperature = get_temperature(move_count)
 
                         if temperature > 0:
                             policy_flat = masked_policy.flatten()
@@ -475,7 +492,10 @@ def train_network(
                         policy_target[move_coords] = 1.0
                         examples.append(
                             TrainingExample(
-                                state_rep=state_rep, policy=policy_target, value=0.0
+                                state_rep=state_rep,
+                                policy=policy_target,
+                                value=0.0,
+                                current_player=game.current_player,
                             )
                         )
                     else:
@@ -493,9 +513,7 @@ def train_network(
                         # Set value targets based on game outcome with length penalty
                         for example in examples:
                             example.value = get_adjusted_value(
-                                winner,
-                                move_count,
-                                (winner == Player.ONE) == model_is_player_one,
+                                game, winner, move_count, game.current_player
                             )
                         break
 
@@ -552,7 +570,7 @@ def train_network(
                         masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
 
                         # Use unified temperature schedule
-                        temperature = get_temperature(move_count, is_strategic=True)
+                        temperature = get_temperature(move_count)
 
                         if temperature > 0:
                             policy_flat = masked_policy.flatten()
@@ -574,7 +592,10 @@ def train_network(
                         policy_target[move_coords] = 1.0
                         examples.append(
                             TrainingExample(
-                                state_rep=state_rep, policy=policy_target, value=0.0
+                                state_rep=state_rep,
+                                policy=policy_target,
+                                value=0.0,
+                                current_player=game.current_player,
                             )
                         )
                     else:
@@ -589,7 +610,10 @@ def train_network(
                         policy_target[move.x, move.y, move.piece_type.value] = 1.0
                         examples.append(
                             TrainingExample(
-                                state_rep=state_rep, policy=policy_target, value=0.0
+                                state_rep=state_rep,
+                                policy=policy_target,
+                                value=0.0,
+                                current_player=game.current_player,
                             )
                         )
 
@@ -602,7 +626,7 @@ def train_network(
                         for example in examples:
                             if winner is None:
                                 example.value = get_adjusted_value(
-                                    None, move_count, is_model_turn
+                                    game, None, move_count, game.current_player
                                 )
                             else:
                                 # Only learn from strategic opponent's winning moves
@@ -612,12 +636,12 @@ def train_network(
                                 if is_strategic_win and not is_model_turn:
                                     # Learn from winning strategic moves
                                     example.value = get_adjusted_value(
-                                        winner, move_count, False
+                                        game, winner, move_count, game.current_player
                                     )
                                 else:
                                     # Learn from model's moves only when it wins
                                     example.value = get_adjusted_value(
-                                        winner, move_count, True
+                                        game, winner, move_count, game.current_player
                                     )
                         break
 
@@ -660,25 +684,77 @@ def train_network(
             epoch_losses = {"total": 0, "policy": 0, "value": 0}
 
             for _ in train_pbar:
-                # Sample batch
-                batch = random.sample(
-                    replay_buffer, min(batch_size, len(replay_buffer))
-                )
+                # Balance by both player AND outcome
+                p1_wins = [
+                    ex
+                    for ex in replay_buffer
+                    if ex.current_player == Player.ONE and ex.value > 0.5
+                ]
+                p1_losses = [
+                    ex
+                    for ex in replay_buffer
+                    if ex.current_player == Player.ONE and ex.value < 0.5
+                ]
+                p2_wins = [
+                    ex
+                    for ex in replay_buffer
+                    if ex.current_player == Player.TWO and ex.value > 0.5
+                ]
+                p2_losses = [
+                    ex
+                    for ex in replay_buffer
+                    if ex.current_player == Player.TWO and ex.value < 0.5
+                ]
 
-                # Prepare training data
-                board_inputs = np.array([ex.state_rep.board for ex in batch])
-                flat_inputs = np.array([ex.state_rep.flat_values for ex in batch])
-                policy_targets = np.array([ex.policy for ex in batch])
-                value_targets = np.array([ex.value for ex in batch])
-
-                # Train network with weighted losses
-                total_loss, policy_loss, value_loss = model.train_step(
-                    board_inputs,
-                    flat_inputs,
-                    policy_targets,
-                    value_targets,
-                    policy_weight=policy_weight,  # Pass weight to train_step
+                # Sample equally from each category
+                samples_per_category = min(
+                    len(p1_wins),
+                    len(p1_losses),
+                    len(p2_wins),
+                    len(p2_losses),
+                    batch_size // 4,
                 )
+                if samples_per_category == 0:  # Fallback if any category is empty
+                    batch = random.sample(
+                        replay_buffer, min(batch_size, len(replay_buffer))
+                    )
+                else:
+                    batch = []
+                    for category in [p1_wins, p1_losses, p2_wins, p2_losses]:
+                        if category:  # If category has examples
+                            batch.extend(
+                                random.sample(
+                                    category, min(samples_per_category, len(category))
+                                )
+                            )
+
+                    # Fill remaining slots randomly if needed
+                    remaining = batch_size - len(batch)
+                    if remaining > 0:
+                        batch.extend(
+                            random.sample(
+                                replay_buffer, min(remaining, len(replay_buffer))
+                            )
+                        )
+
+                    # Prepare training data
+                    board_inputs = np.array([ex.state_rep.board for ex in batch])
+                    flat_inputs = np.array([ex.state_rep.flat_values for ex in batch])
+                    policy_targets = np.array([ex.policy for ex in batch])
+                    value_targets = np.array([ex.value for ex in batch])
+
+                    try:
+                        # Train network with weighted losses
+                        total_loss, policy_loss, value_loss = model.train_step(
+                            board_inputs,
+                            flat_inputs,
+                            policy_targets,
+                            value_targets,
+                            policy_weight=policy_weight,  # Pass weight to train_step
+                        )
+                    except Exception as e:
+                        print(f"Error during training step: {e}")
+                        continue
 
                 # Update running averages
                 running_count += 1
@@ -775,6 +851,10 @@ def train_network(
 
                 tqdm.write(f"Saved checkpoint: {save_path}")
 
+    except Exception as e:
+        print(f"\nUnexpected error during training: {e}")
+    except KeyboardInterrupt:
+        print("\nInterrupt received, saving final model...")
     finally:
         # Calculate final elapsed time
         elapsed_time = time.time() - training_start

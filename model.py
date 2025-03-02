@@ -250,10 +250,15 @@ class ModelWrapper:
         policy_logits, value_pred = self.model(board_inputs, flat_inputs)
 
         # Calculate policy loss (cross entropy on move probabilities)
-        policy_loss = F.cross_entropy(
-            policy_logits.view(-1, policy_logits.size(-1)),
-            policy_targets.view(-1, policy_targets.size(-1)),
-        )
+        batch_size = policy_logits.shape[0]
+        policy_logits_flat = policy_logits.reshape(
+            batch_size, -1
+        )  # Flatten to (batch_size, 64)
+        policy_targets_flat = policy_targets.reshape(batch_size, -1)  # Same shape
+        policy_indices = torch.argmax(
+            policy_targets_flat, dim=1
+        )  # Get indices of 1s in one-hot vectors
+        policy_loss = F.cross_entropy(policy_logits_flat, policy_indices)
 
         # Calculate value loss (MSE on game outcome predictions)
         value_loss = F.mse_loss(value_pred.squeeze(-1), value_targets)
@@ -331,3 +336,15 @@ class ModelWrapper:
                 f"Model loaded successfully, device: {next(self.model.parameters()).device}"
             )
             print(f"Total loading time: {time.time() - start_time:.2f} seconds")
+
+    def reset_optimizer(self, new_lr: float = 0.001):
+        """Reset optimizer with new learning rate to escape local minimum"""
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=new_lr,
+            weight_decay=1e-4,
+            betas=(0.9, 0.999),
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode="min", factor=0.5, patience=10, verbose=True
+        )

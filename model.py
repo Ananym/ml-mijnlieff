@@ -6,7 +6,7 @@ import numpy as np
 from typing import Tuple, Optional
 import random
 import torch.package
-import time  # Add time import
+import time
 
 
 class ResBlock(nn.Module):
@@ -28,36 +28,42 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    """Network with residual blocks and balanced capacity"""
+    """Network with residual blocks and optimized capacity for 4x4 grid game"""
 
     def __init__(self):
         super().__init__()
-        # Initial convolution with 256 channels
-        self.conv_in = nn.Conv2d(10, 256, 3, padding=1)
-        self.bn_in = nn.BatchNorm2d(256)
+        # More appropriate channel size for 4x4 grid game
+        # reduced from 256 → 64 channels
+        channels = 64
 
-        # Middle section with residual blocks at 256 channels
-        self.res_blocks = nn.ModuleList(
-            [ResBlock(256) for _ in range(8)]  # 8 residual blocks at 256 channels
-        )
+        # Initial convolution
+        self.conv_in = nn.Conv2d(10, channels, 3, padding=1)
+        self.bn_in = nn.BatchNorm2d(channels)
+
+        # Reduced from 8 → 3 residual blocks
+        self.res_blocks = nn.ModuleList([ResBlock(channels) for _ in range(3)])
 
         # Policy head (outputs 4x4x4 move probabilities)
-        self.policy_conv1 = nn.Conv2d(256, 128, 1)
-        self.policy_bn = nn.BatchNorm2d(128)
-        self.policy_conv2 = nn.Conv2d(128, 4, 1)
+        # Reduced intermediate channels from 128 → 32
+        self.policy_conv1 = nn.Conv2d(channels, 32, 1)
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_conv2 = nn.Conv2d(32, 4, 1)
 
-        # Value head
-        self.value_conv1 = nn.Conv2d(256, 128, 1)
-        self.value_bn = nn.BatchNorm2d(128)
-        self.value_fc1 = nn.Linear(128 * 4 * 4 + 10, 256)  # Reduced FC layer size
-        self.value_fc2 = nn.Linear(256, 128)
-        self.value_fc3 = nn.Linear(128, 1)
+        # Value head - simplified architecture
+        self.value_conv1 = nn.Conv2d(channels, 32, 1)
+        self.value_bn = nn.BatchNorm2d(32)
+        # Added explicit flattening dimension calculation for clarity
+        self.value_flatten_size = 32 * 4 * 4
+        # Reduced FC layers from 256/128 → 128/64
+        self.value_fc1 = nn.Linear(self.value_flatten_size + 10, 128)
+        self.value_fc2 = nn.Linear(128, 64)
+        self.value_fc3 = nn.Linear(64, 1)
 
     def forward(self, board_state, flat_state):
         # Initial convolution
         x = F.relu(self.bn_in(self.conv_in(board_state)))
 
-        # Middle section
+        # Middle section with fewer residual blocks
         for res_block in self.res_blocks:
             x = res_block(x)
 
@@ -104,16 +110,19 @@ class ModelWrapper:
             print("Using crunch mode - for model optimization and deployment")
             return
 
-        # Configure learning rate based on mode
+        # FIXED: Increased learning rates to more reasonable values
         if self.mode == "fast":
-            self.lr = 0.0001
-            print("Using fast training mode (lr=0.0001) - good for quick experiments")
+            self.lr = 0.0005  # Increased from 0.0001
+            print("Using fast training mode (lr=0.0005) - good for quick experiments")
         elif self.mode == "stable":
-            self.lr = 0.000005
-            print("Using stable training mode (lr=0.000005) - good for final training")
+            self.lr = 0.0001  # Significantly increased from 0.000005
+            print("Using stable training mode (lr=0.0001) - good for final training")
+        elif self.mode == "custom_lr":
+            self.lr = 0.00001  # Very low, stable learning rate
+            print(f"Using custom learning rate: {self.lr}")
         else:
             raise ValueError(
-                f"Unknown mode: {mode}. Must be one of: fast, stable, crunch"
+                f"Unknown mode: {mode}. Must be one of: fast, stable, crunch, custom_lr"
             )
 
         self.optimizer = torch.optim.Adam(
@@ -123,8 +132,14 @@ class ModelWrapper:
             betas=(0.9, 0.999),
         )
 
+        # FIXED: Reduced aggressiveness of scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=10, verbose=True
+            self.optimizer,
+            mode="min",
+            factor=0.7,
+            patience=15,
+            verbose=True,
+            min_lr=1e-6,
         )
 
     def predict(
@@ -249,19 +264,38 @@ class ModelWrapper:
         # Forward pass
         policy_logits, value_pred = self.model(board_inputs, flat_inputs)
 
-        # Calculate policy loss (cross entropy on move probabilities)
+        # Calculate policy loss
         batch_size = policy_logits.shape[0]
         policy_logits_flat = policy_logits.reshape(
             batch_size, -1
         )  # Flatten to (batch_size, 64)
         policy_targets_flat = policy_targets.reshape(batch_size, -1)  # Same shape
-        policy_indices = torch.argmax(
-            policy_targets_flat, dim=1
-        )  # Get indices of 1s in one-hot vectors
-        policy_loss = F.cross_entropy(policy_logits_flat, policy_indices)
 
-        # Calculate value loss (MSE on game outcome predictions)
-        value_loss = F.mse_loss(value_pred.squeeze(-1), value_targets)
+        # For MCTS distributions, use KL divergence
+        # For one-hot targets, use cross-entropy
+        has_distribution = (policy_targets_flat.sum(dim=1) > 1.01).any() or (
+            policy_targets_flat.max(dim=1)[0] < 0.99
+        ).any()
+
+        if has_distribution:
+            # Use KL divergence for comparing distributions (MCTS targets)
+            log_policy = F.log_softmax(policy_logits_flat, dim=1)
+            policy_loss = -torch.sum(policy_targets_flat * log_policy) / batch_size
+        else:
+            # Use cross-entropy for one-hot targets (direct prediction)
+            policy_indices = torch.argmax(
+                policy_targets_flat, dim=1
+            )  # Get indices of 1s in one-hot vectors
+            policy_loss = F.cross_entropy(policy_logits_flat, policy_indices)
+
+        # Calculate value loss (MSE on game outcome predictions) with smoothing
+        # Add small label smoothing to value targets to prevent overfitting
+        smoothed_targets = value_targets * 0.9  # Scale the targets slightly toward zero
+        value_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
+
+        # Add small L2 regularization to value head to prevent overconfidence
+        value_l2_reg = 0.0001 * torch.mean(torch.square(value_pred))
+        value_loss = value_loss + value_l2_reg
 
         # Combine losses with weighting
         total_loss = policy_weight * policy_loss + value_loss
@@ -269,10 +303,11 @@ class ModelWrapper:
         # Optimization step
         self.optimizer.zero_grad()
         total_loss.backward()
-        self.optimizer.step()
 
-        # Update learning rate
-        self.scheduler.step(total_loss)
+        # Add gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+        self.optimizer.step()
 
         return (total_loss.item(), policy_loss.item(), value_loss.item())
 
@@ -325,7 +360,20 @@ class ModelWrapper:
             if "model_state_dict" in checkpoint:
                 self.model.load_state_dict(checkpoint["model_state_dict"])
                 if hasattr(self, "optimizer"):
+                    # Load optimizer state but check if learning rate is too low
                     self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+                    # Check if learning rate is too low and reset if needed
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    min_acceptable_lr = 0.00001 if self.mode == "stable" else 0.0001
+
+                    if current_lr < min_acceptable_lr:
+                        new_lr = 0.0001 if self.mode == "stable" else 0.0005
+                        print(
+                            f"WARNING: Loaded learning rate is too low ({current_lr:.8f})"
+                        )
+                        print(f"Resetting learning rate to {new_lr:.8f}")
+                        self.reset_optimizer(new_lr=new_lr)
             else:
                 self.model.load_state_dict(checkpoint)
             print(
@@ -339,12 +387,22 @@ class ModelWrapper:
 
     def reset_optimizer(self, new_lr: float = 0.001):
         """Reset optimizer with new learning rate to escape local minimum"""
+        # FIXED: Much higher learning rate and better defaults
+        print(f"Resetting optimizer with new learning rate: {new_lr}")
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=new_lr,
             weight_decay=1e-4,
             betas=(0.9, 0.999),
         )
+        # FIXED: Less aggressive scheduler with higher min_lr
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=10, verbose=True
+            self.optimizer,
+            mode="min",
+            factor=0.7,
+            patience=15,
+            verbose=True,
+            min_lr=1e-6,
         )
+        # Return current learning rate to confirm it was applied
+        return self.optimizer.param_groups[0]["lr"]

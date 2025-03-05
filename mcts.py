@@ -1,176 +1,403 @@
-import math
 import numpy as np
-from dataclasses import dataclass
-from typing import Dict, Optional, List
-from game import GameState, Move, Player, PieceType
+import math
+from typing import List, Tuple, Dict, Optional
+from game import GameState, Move, PieceType, Player, TurnResult
+
+# Random number generator with fixed seed for reproducibility
+rng = np.random.Generator(np.random.PCG64(seed=42))
 
 
-@dataclass
+def clone_game_state(state: GameState) -> GameState:
+    """Create a new GameState with the same properties without using deepcopy"""
+    new_state = GameState()
+    # Copy board state (2D array)
+    new_state.board = state.board.copy()
+    # Copy terrain
+    new_state.terrain = state.terrain.copy()
+    # Copy current player (enum)
+    new_state.current_player = state.current_player
+    # Copy last move (immutable so direct reference is fine)
+    new_state.last_move = state.last_move
+    # Copy game over state
+    new_state.is_over = state.is_over
+    # Copy winner
+    new_state.winner = state.winner
+
+    # Copy piece counts (nested dict)
+    new_state.piece_counts = {
+        Player.ONE: {pt: state.piece_counts[Player.ONE][pt] for pt in PieceType},
+        Player.TWO: {pt: state.piece_counts[Player.TWO][pt] for pt in PieceType},
+    }
+
+    return new_state
+
+
 class MCTSNode:
-    state: GameState
-    parent: Optional["MCTSNode"]
-    prior_prob: float
+    """Represents a node in the Monte Carlo search tree"""
 
-    def __post_init__(self):
-        self.children: Dict[Move, MCTSNode] = {}
-        self.visit_count = 0
-        self.value_sum = 0.0
-        self.is_expanded = False
+    def __init__(self, game_state: GameState, parent=None, move=None):
+        self.game_state = game_state  # Current game state at this node
+        self.parent = parent  # Parent node
+        self.move = move  # Move that led to this state
+        self.children = []  # Child nodes
+        self.visits = 0  # Number of visits to this node
+        self.value_sum = 0.0  # Sum of values from simulations
+        self.prior = 0.0  # Prior probability from policy network
+        self.expanded = False  # Whether node has been expanded
+        self.predicted_value = None  # Value predicted by neural network
 
-    @property
-    def value(self) -> float:
-        if self.visit_count == 0:
-            return 0.0
-        return self.value_sum / self.visit_count
-
-    def get_ucb_score(self, parent_visit_count: int, c_puct: float = 1.0) -> float:
-        """UCB score calculation following AlphaZero methodology"""
-        if self.visit_count == 0:
-            return float("inf")
-
-        # Q value (exploitation)
-        q_value = self.value
-        # U value (exploration)
-        u_value = (
-            c_puct
-            * self.prior_prob
-            * math.sqrt(parent_visit_count)
-            / (1 + self.visit_count)
-        )
-
-        return q_value + u_value
-
-
-class MCTS:
-    def __init__(self, model, num_simulations: int = 100, c_puct: float = 1.0):
-        self.model = model
-        self.num_simulations = num_simulations
-        self.c_puct = c_puct
-
-    def _expand(self, node: MCTSNode) -> None:
-        """Expand a node using the policy network"""
-        if node.is_expanded:
+    def expand(self, policy):
+        """Expand node by creating children for all legal moves"""
+        # prevent double expansion
+        if self.expanded:
             return
 
-        # Get policy and value predictions from the model
-        state_rep = node.state.get_game_state_representation()
-        policy, _ = self.model.predict(state_rep.board, state_rep.flat_values)
-        policy = policy[0]  # Remove batch dimension
+        legal_moves = self.game_state.get_legal_moves()
+        # For each legal move, create a child node
+        for move_idx in np.argwhere(legal_moves):
+            x, y, piece_type_idx = move_idx
+            move = Move(x, y, PieceType(piece_type_idx))
 
-        # Create child nodes for all legal moves
-        legal_moves = node.state.get_legal_moves()
-        policy_sum = 1e-8
-
-        for move_coords in np.argwhere(legal_moves):
-            x, y, piece_type = move_coords
-            move = Move(x, y, PieceType(piece_type))
-
-            # Create new state
-            new_state = GameState()
-            new_state.board = node.state.board.copy()
-            new_state.terrain = node.state.terrain
-            new_state.current_player = node.state.current_player
-            new_state.piece_counts = {
-                Player.ONE: node.state.piece_counts[Player.ONE].copy(),
-                Player.TWO: node.state.piece_counts[Player.TWO].copy(),
-            }
-
-            # Make move in new state
+            # Create new game state by applying the move
+            new_state = clone_game_state(self.game_state)
             new_state.make_move(move)
 
             # Create child node
-            prior_prob = policy[x, y, piece_type]
-            policy_sum += prior_prob
+            child = MCTSNode(new_state, parent=self, move=move)
 
-            child = MCTSNode(state=new_state, parent=node, prior_prob=prior_prob)
-            node.children[move] = child
+            # Set prior probability from policy network
+            child.prior = policy[x, y, piece_type_idx]
 
-        # Normalize probabilities
-        for child in node.children.values():
-            child.prior_prob /= policy_sum
+            self.children.append(child)
 
-        node.is_expanded = True
+        self.expanded = True
 
-    def _select_child(self, node: MCTSNode) -> tuple[Move, MCTSNode]:
-        """Select the child with the highest UCB score"""
-        best_score = float("-inf")
-        best_move = None
-        best_child = None
+    def select_child(self, c_puct=1.0):
+        """Select child with highest UCB value"""
+        # UCB formula: Q(s,a) + c_puct * P(s,a) * sqrt(sum(N(s,b))) / (1 + N(s,a))
+        # where Q is the mean value, P is prior probability, N is visit count
 
-        for move, child in node.children.items():
-            score = child.get_ucb_score(node.visit_count, self.c_puct)
-            if score > best_score:
-                best_score = score
-                best_move = move
-                best_child = child
+        # If node hasn't been visited, prioritize exploration
+        if self.visits == 0:
+            return rng.choice(self.children)
 
-        return best_move, best_child
+        ucb_values = []
+        for child in self.children:
+            # Exploitation term: average value
+            q_value = 0.0 if child.visits == 0 else child.value_sum / child.visits
 
-    def _simulate(self, node: MCTSNode) -> float:
-        """Get a value estimate from the value network"""
-        state_rep = node.state.get_game_state_representation()
-        _, value = self.model.predict(state_rep.board, state_rep.flat_values)
-        return float(value[0])
+            # Exploration term: prior scaled by visits
+            u_value = c_puct * child.prior * math.sqrt(self.visits) / (1 + child.visits)
 
-    def _backpropagate(self, node: MCTSNode, value: float) -> None:
-        """Update statistics for all nodes up to the root"""
-        current = node
-        while current is not None:
-            current.visit_count += 1
-            current.value_sum += value
-            current = current.parent
-            value = 1.0 - value  # Flip value for opponent
+            ucb_values.append(q_value + u_value)
 
-    def get_action_probs(
-        self, state: GameState, temperature: float = 1.0
-    ) -> np.ndarray:
-        """Run MCTS simulations and return action probabilities"""
-        root = MCTSNode(state=state, parent=None, prior_prob=1.0)
+        # Select child with highest UCB value
+        return self.children[np.argmax(ucb_values)]
+
+    def update(self, value):
+        """Update node statistics after a simulation"""
+        self.visits += 1
+        self.value_sum += value
+
+    def is_terminal(self):
+        """Check if node represents game end state"""
+        return self.game_state.is_over
+
+    def get_value(self):
+        """Get mean value of node"""
+        return 0.0 if self.visits == 0 else self.value_sum / self.visits
+
+
+class MCTS:
+    """Monte Carlo Tree Search implementation with neural network policy guidance"""
+
+    def __init__(self, model, num_simulations=100, c_puct=1.0, bootstrap_weight=0.5):
+        self.model = model  # Neural network model
+        self.num_simulations = num_simulations  # Number of simulations per search
+        self.c_puct = c_puct  # Exploration constant
+        self.temperature = 1.0  # Temperature for move selection
+        self.bootstrap_weight = bootstrap_weight  # Weight for value bootstrapping
+
+    def search(self, game_state: GameState) -> np.ndarray:
+        """Perform MCTS search from given state and return move probabilities"""
+        # Create root node
+        root = MCTSNode(clone_game_state(game_state))
+
+        # Initialize root node's predicted value
+        state_rep = root.game_state.get_game_state_representation()
+        _, value_pred = self.model.predict(state_rep.board, state_rep.flat_values)
+        root.predicted_value = value_pred.squeeze()
+
+        # Add Dirichlet noise to root node for more exploration
+        legal_moves = root.game_state.get_legal_moves()
+        policy, _ = self.model.predict(
+            state_rep.board, state_rep.flat_values, legal_moves
+        )
+        policy = policy.squeeze(0)
+
+        # Create a flattened version of legal moves and policy for easier handling
+        legal_flat = legal_moves.flatten()
+        policy_flat = policy.flatten()
+        legal_indices = np.where(legal_flat > 0)[0]
+
+        # Only add noise if we're at the root and have legal moves
+        if len(legal_indices) > 0:
+            # Create Dirichlet noise for exploration (smaller alpha = more concentrated)
+            noise = np.random.dirichlet([0.3] * len(legal_indices))
+
+            # Mix noise with policy (80% policy, 20% noise)
+            for i, idx in enumerate(legal_indices):
+                policy_flat[idx] = 0.8 * policy_flat[idx] + 0.2 * noise[i]
+
+            # Reshape back to original shape
+            policy = policy_flat.reshape(policy.shape)
 
         # Run simulations
         for _ in range(self.num_simulations):
             node = root
-            search_path = [node]
 
-            # Selection
-            while node.is_expanded and node.children:
-                move, node = self._select_child(node)
-                if node is None:
-                    break
-                search_path.append(node)
+            # SELECTION: traverse tree to find leaf node
+            while node.expanded and not node.is_terminal():
+                node = node.select_child(self.c_puct)
 
-            # Expansion and simulation
-            if not node.is_expanded and not node.state.is_over:
-                self._expand(node)
+            # If node is terminal, use its game outcome for backpropagation
+            if node.is_terminal():
+                # Use correct perspective for value
+                value = self._get_game_value(
+                    node.game_state, node.game_state.current_player
+                )
+            else:
+                # EXPANSION: use policy network to expand node
+                state_rep = node.game_state.get_game_state_representation()
+                legal_moves = node.game_state.get_legal_moves()
 
-            value = self._simulate(node)
-            self._backpropagate(node, value)
+                # Get policy and value from neural network
+                policy, value_pred = self.model.predict(
+                    state_rep.board, state_rep.flat_values, legal_moves
+                )
 
-        # Calculate action probabilities
-        policy = np.zeros((4, 4, 4), dtype=np.float32)
+                # Remove batch dimension
+                policy = policy.squeeze(0)
+                value = value_pred.squeeze()
 
-        if temperature == 0:  # Deterministic
-            visits = {move: child.visit_count for move, child in root.children.items()}
-            if visits:
-                best_move = max(visits.items(), key=lambda x: x[1])[0]
-                policy[best_move.x, best_move.y, best_move.piece_type.value] = 1.0
+                # Store the predicted value for bootstrapping
+                node.predicted_value = value
+
+                # If we're not at a terminal node, expand it
+                node.expand(policy)
+
+                # For non-terminal leaf nodes, use neural network value
+                node.update(value)
+                continue
+
+            # BACKPROPAGATION: update all nodes in path
+            current_node = node
+            current_value = value
+
+            while current_node is not None:
+                current_node.update(current_value)
+                current_node = current_node.parent
+                if current_node is not None:
+                    # Flip value when moving to parent (opponent's perspective)
+                    current_value = -current_value
+
+        # Calculate move probabilities based on visit counts
+        visit_counts = np.zeros((4, 4, 4), dtype=np.float32)
+
+        for child in root.children:
+            if child.move:
+                x, y, piece_type = (
+                    child.move.x,
+                    child.move.y,
+                    child.move.piece_type.value,
+                )
+                visit_counts[x, y, piece_type] = child.visits
+
+        # Apply temperature
+        if self.temperature == 0:
+            # Choose most visited move deterministically
+            best_idx = np.unravel_index(np.argmax(visit_counts), visit_counts.shape)
+            probs = np.zeros_like(visit_counts)
+            probs[best_idx] = 1.0
         else:
-            # Calculate softmax of visit counts
-            visits = np.array([child.visit_count for child in root.children.values()])
-            moves = list(root.children.keys())
+            # Convert visits to probabilities with temperature
+            visit_counts = np.power(visit_counts, 1.0 / self.temperature)
+            sum_visits = np.sum(visit_counts)
+            if sum_visits > 0:
+                probs = visit_counts / sum_visits
+            else:
+                # Fallback to uniform distribution if no visits
+                legal_moves = game_state.get_legal_moves()
+                probs = legal_moves / np.sum(legal_moves)
 
-            if len(visits) > 0:
-                visits = visits ** (1.0 / temperature)
-                visits_sum = visits.sum()
-                if visits_sum > 0:
-                    probs = visits / visits_sum
-                    for move, prob in zip(moves, probs):
-                        policy[move.x, move.y, move.piece_type.value] = prob
+        return probs, root
 
-        return policy
+    def _get_game_value(
+        self, game_state: GameState, perspective_player: Player
+    ) -> float:
+        """Get terminal game value from perspective of the given player"""
+        winner = game_state.get_winner()
 
-    def get_best_move(self, state: GameState) -> Move:
-        """Get the best move according to MCTS simulations"""
-        policy = self.get_action_probs(state, temperature=0)
-        move_coords = np.unravel_index(policy.argmax(), policy.shape)
-        return Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+        if winner is None:  # Draw
+            return 0.0
+
+        # Binary win/loss signal with score bonus
+        if winner == perspective_player:
+            base_value = 1.0  # Win
+        else:
+            base_value = -1.0  # Loss
+
+        # Add small score difference bonus to encourage larger wins
+        score_one = game_state._calculate_score(Player.ONE)
+        score_two = game_state._calculate_score(Player.TWO)
+
+        score_diff = (
+            score_one - score_two
+            if perspective_player == Player.ONE
+            else score_two - score_one
+        )
+
+        # Small bonus based on score difference (max 0.5)
+        score_bonus = 0.1 * max(-0.5, min(0.5, score_diff / 5.0))
+
+        return base_value + score_bonus
+
+    def set_temperature(self, temperature):
+        """Set temperature for move selection"""
+        self.temperature = temperature
+
+
+def mcts_self_play_game(model, mcts_simulations=50, bootstrap_weight=0.5, debug=False):
+    """Play a full game using MCTS for move selection, return training examples with value bootstrapping"""
+    # Initialize game
+    game = GameState()
+    examples = []
+    move_count = 0
+
+    # Initialize MCTS
+    mcts = MCTS(
+        model, num_simulations=mcts_simulations, bootstrap_weight=bootstrap_weight
+    )
+
+    # Track last observed values for bootstrapping
+    last_root_node = None
+
+    while True:
+        # Adjust temperature based on move count
+        if move_count < 10:
+            mcts.set_temperature(1.0)  # Exploration early game
+        else:
+            mcts.set_temperature(0.5)  # More exploitation late game
+
+        # Check if player can make a legal move
+        legal_moves = game.get_legal_moves()
+        if not np.any(legal_moves):
+            # No legal moves, must pass
+            game.pass_turn()
+            continue
+
+        # Get current state representation before making a move
+        state_rep = game.get_game_state_representation()
+
+        # Use MCTS to get improved policy
+        mcts_policy, root_node = mcts.search(game)
+
+        # Store example (value will be filled in later)
+        examples.append(
+            {
+                "state_rep": state_rep,
+                "policy": mcts_policy,
+                "value": 0.0,  # Placeholder, will be filled later
+                "current_player": game.current_player,
+                "move_number": move_count,
+                "root_node": root_node,  # Store the node for bootstrapping
+            }
+        )
+
+        # Sample move from the MCTS policy
+        policy_flat = mcts_policy.flatten()
+        if np.sum(policy_flat) > 0:  # Ensure policy is valid
+            move_idx = rng.choice(len(policy_flat), p=policy_flat / np.sum(policy_flat))
+            move_coords = np.unravel_index(move_idx, mcts_policy.shape)
+            move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+        else:
+            # Fallback to random legal move if policy is invalid
+            legal_positions = np.argwhere(legal_moves)
+            idx = rng.integers(len(legal_positions))
+            move_coords = tuple(legal_positions[idx])
+            move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+
+        # Make the move
+        result = game.make_move(move)
+        move_count += 1
+
+        # Store current root node for next iteration's bootstrapping
+        last_root_node = root_node
+
+        if debug and move_count % 5 == 0:
+            print(f"Move {move_count}, Player {game.current_player.name}")
+
+        # Check if game is over
+        if result == TurnResult.GAME_OVER:
+            # Game is over, get the winner
+            winner = game.get_winner()
+            final_score_p1 = game._calculate_score(Player.ONE)
+            final_score_p2 = game._calculate_score(Player.TWO)
+
+            # Fill in value targets with bootstrapping for all examples
+            for i, example in enumerate(examples):
+                player = example["current_player"]
+
+                # FIXED: Stronger win/loss signal
+                if winner is None:  # Draw
+                    outcome_value = 0.0
+                elif winner == player:  # Win
+                    outcome_value = 1.0
+                else:  # Loss
+                    outcome_value = -1.0
+
+                # Add small score bonus
+                score_diff = (
+                    final_score_p1 - final_score_p2
+                    if player == Player.ONE
+                    else final_score_p2 - final_score_p1
+                )
+                outcome_value += 0.1 * max(-0.5, min(0.5, score_diff / 5.0))
+
+                # Apply bootstrapping if this isn't the last move
+                if i < len(examples) - 1:
+                    next_example = examples[i + 1]
+                    if (
+                        next_example["root_node"]
+                        and next_example["root_node"].predicted_value is not None
+                    ):
+                        # Get opponent's predicted value and flip sign (opponent's perspective)
+                        bootstrap_value = -float(
+                            next_example["root_node"].predicted_value
+                        )
+
+                        # Mix outcome with bootstrapped value
+                        example["value"] = (
+                            (1 - bootstrap_weight)
+                        ) * outcome_value + bootstrap_weight * bootstrap_value
+                    else:
+                        example["value"] = outcome_value
+                else:
+                    # Last move uses pure outcome
+                    example["value"] = outcome_value
+
+                # Remove the root_node to clean up examples before returning
+                del example["root_node"]
+
+            # Clean up and return only necessary data
+            clean_examples = [
+                {
+                    "state_rep": ex["state_rep"],
+                    "policy": ex["policy"],
+                    "value": ex["value"],
+                    "current_player": ex["current_player"],
+                }
+                for ex in examples
+            ]
+
+            return clean_examples

@@ -1,26 +1,35 @@
 import os
-import random
 import numpy as np
 import torch
-from game import (
-    GameState,
-    PieceType,
-    Player,
-    GameStateRepresentation,
-    TurnResult,
-    Move,
-)
+from game import GameState, PieceType, Player, GameStateRepresentation, TurnResult, Move
 from typing import List, Tuple, Optional
-from datetime import datetime, timedelta
 import time
 import signal
 import sys
 from dataclasses import dataclass
 from model import ModelWrapper
-from tqdm import tqdm, trange
+from tqdm import tqdm
 from opponents import RandomOpponent, StrategicOpponent
+from mcts import MCTS, mcts_self_play_game
 
-debugPrint = False
+# Training parameters
+DEFAULT_EPISODES = 100
+DEFAULT_BATCH_SIZE = 512
+DEFAULT_SAVE_INTERVAL = 50
+DEFAULT_NUM_CHECKPOINTS = 3
+DEFAULT_MCTS_SIMS = 100
+DEFAULT_MCTS_RATIO = 0.3
+# Strategic ratio is the percentage of games that use the strategic opponent
+# Strategic opponent is defined using algorithmic heuristics
+DEFAULT_STRATEGIC_RATIO = 0.0
+DEFAULT_RANDOM_RATIO = 0.3
+DEFAULT_BUFFER_SIZE = 2000
+DEFAULT_POLICY_WEIGHT = 1.0  # FIXED: Increased from 0.5 to balance policy and value
+DEFAULT_BOOTSTRAP_WEIGHT = 0.3
+DEFAULT_NUM_EPOCHS = 80
+DEFAULT_LR_PATIENCE = 8
+DEFAULT_STAGNATION_THRESHOLD = 0.01
+DEFAULT_LR_RESET_FACTOR = 5.0
 
 
 @dataclass
@@ -31,134 +40,35 @@ class TrainingExample:
     current_player: Player  # Store which player made the move
 
 
-def self_play_game(
-    model: ModelWrapper, temperature: float = 1.0, debug: bool = False
-) -> List[TrainingExample]:
-    """Play a game using the current policy, return state/action pairs"""
-    game = GameState()
-    examples = []
-    move_count = 0
-
-    while True:
-        # Get legal moves
-        legal_moves = game.get_legal_moves()
-        if not np.any(legal_moves):
-            # No legal moves, must pass
-            game.pass_turn()
-            continue
-
-        # Get move probabilities from policy network
-        state_rep = game.get_game_state_representation()
-        policy, _ = model.predict(state_rep.board, state_rep.flat_values, legal_moves)
-
-        # Remove batch dimension from policy
-        policy = policy.squeeze(0)  # Now shape is (4, 4, 4)
-
-        # Debug prints
-        if debug:
-            print(f"\nMove {move_count + 1}, Player {game.current_player.name}")
-            print(f"Legal moves sum: {legal_moves.sum()}")
-            print(f"Initial policy sum: {policy.sum()}")
-            print(f"Policy shape: {policy.shape}")
-            print(f"Legal moves shape: {legal_moves.shape}")
-
-        # Ensure we only consider legal moves
-        masked_policy = policy * legal_moves  # Mask out illegal moves
-        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)  # Renormalize
-
-        if debug:
-            print(f"Masked policy sum: {masked_policy.sum()}")
-
-        # Verify the move is legal before choosing
-        if not np.any(masked_policy):
-            if debug:
-                print("Warning: No valid moves in masked policy!")
-            # Fallback to random legal move
-            legal_positions = np.argwhere(legal_moves)
-            idx = np.random.randint(len(legal_positions))
-            move_coords = tuple(legal_positions[idx])
-            if debug:
-                print(f"Falling back to random legal move: {move_coords}")
-        else:
-            # Choose move (either greedily or with temperature)
-            if (
-                temperature == 0 or move_count >= 12
-            ):  # Play deterministically in endgame
-                move_coords = tuple(
-                    np.unravel_index(masked_policy.argmax(), masked_policy.shape)
-                )
-            else:
-                # Sample from the probability distribution
-                policy_flat = masked_policy.flatten()
-                move_idx = np.random.choice(len(policy_flat), p=policy_flat)
-                move_coords = tuple(np.unravel_index(move_idx, masked_policy.shape))
-
-        # Double check the move is legal
-        x, y, piece_type = move_coords
-        if not legal_moves[x, y, piece_type]:
-            print(f"ERROR: Selected illegal move {move_coords}!")
-            print("Legal moves shape:", legal_moves.shape)
-            print("Policy shape:", policy.shape)
-            print(
-                "Selected move is legal according to mask:",
-                legal_moves[x, y, piece_type],
-            )
-            raise ValueError(f"Attempted to make illegal move {move_coords}")
-
-        move = Move(x, y, PieceType(piece_type))
-
-        # Create one-hot encoded policy target
-        policy_target = np.zeros_like(masked_policy)
-        policy_target[x, y, piece_type] = 1.0
-
-        # Store the example
-        examples.append(
-            TrainingExample(
-                state_rep=state_rep,
-                policy=policy_target,
-                value=0.0,  # Will be filled in later
-                current_player=game.current_player,
-            )
-        )
-
-        # Make move
-        result = game.make_move(move)
-        move_count += 1
-
-        if result == TurnResult.GAME_OVER:
-            # Game is over, get the winner
-            winner = game.get_winner()
-
-            # Set value targets based on game outcome
-            for example in examples:
-                example.value = get_adjusted_value(
-                    game, winner, move_count, game.current_player
-                )
-
-            return examples
-
-
-def train_network(
+def hybrid_training_loop(
     model: ModelWrapper,
-    num_episodes: int = 100,
-    batch_size: int = 256,
-    save_interval: int = 50,
-    num_checkpoints: int = 3,
-    min_temp: float = 0.5,
-    strategic_opponent_ratio: float = 0.5,  # 30% strategic games
-    random_opponent_ratio: float = 0.1,  # 20% random opponents
-    buffer_size: int = 10000,
-    policy_weight: float = 0.5,  # Reduced from 1.5 to stabilize training
-    num_epochs: int = 40,
+    num_episodes: int = DEFAULT_EPISODES,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    save_interval: int = DEFAULT_SAVE_INTERVAL,
+    num_checkpoints: int = DEFAULT_NUM_CHECKPOINTS,
+    mcts_sim_count: int = DEFAULT_MCTS_SIMS,  # MCTS simulations per move
+    mcts_game_ratio: float = DEFAULT_MCTS_RATIO,  # Percentage of model moves that use MCTS
+    strategic_opponent_ratio: float = DEFAULT_STRATEGIC_RATIO,  # Percentage of strategic games
+    random_opponent_ratio: float = DEFAULT_RANDOM_RATIO,  # Percentage of random opponents
+    buffer_size: int = DEFAULT_BUFFER_SIZE,
+    policy_weight: float = DEFAULT_POLICY_WEIGHT,  # Weight for policy loss
+    bootstrap_weight: float = DEFAULT_BOOTSTRAP_WEIGHT,  # Weight for value bootstrapping
+    num_epochs: int = DEFAULT_NUM_EPOCHS,
+    lr_patience: int = DEFAULT_LR_PATIENCE,  # Patience for learning rate scheduler
+    loss_stagnation_threshold: float = DEFAULT_STAGNATION_THRESHOLD,  # Threshold to detect stuck training
+    lr_reset_factor: float = DEFAULT_LR_RESET_FACTOR,  # Multiply base LR by this when resetting
     debug: bool = False,
 ):
-    """Main training loop that runs until interrupted"""
+    """Training loop that combines MCTS-guided self-play with opponent play and value bootstrapping"""
+    # Initialize random number generator
+    rng = np.random.Generator(np.random.PCG64())
+
     replay_buffer = []
     running_loss = {
         "total": 1e-8,
         "policy": 1e-8,
         "value": 1e-8,
-    }  # Initialize with small values
+    }
     running_count = 0
     iteration = 0
     training_start = time.time()
@@ -166,146 +76,192 @@ def train_network(
     random_opponent = RandomOpponent()
     latest_model_path = "saved_models/model_latest.pth"
 
+    # Learning rate monitoring and control
+    lr_history = []
+    loss_history = []
+    stagnation_counter = 0
+    best_loss = float("inf")
+
     # Base stats template
     stats_template = {
         "strategic_wins_as_p1": 0,
         "strategic_wins_as_p2": 0,
         "strategic_games_as_p1": 0,
         "strategic_games_as_p2": 0,
+        "random_wins_as_p1": 0,
+        "random_wins_as_p2": 0,
+        "random_games_as_p1": 0,
+        "random_games_as_p2": 0,
         "self_play_p1_wins": 0,
         "self_play_games": 0,
+        "mcts_moves": 0,
+        "direct_moves": 0,
         "total_moves": 0,
         "total_games": 0,
-        "central_moves": 0,
-        "policy_confidence": 0,
-        "moves_counted": 0,
+        "win_examples": 0,
+        "loss_examples": 0,
+        "draw_examples": 0,
     }
-
-    # Stability metrics
-    window_size = 50  # Window for moving averages
-    stability_stats = {
-        "policy_loss_window": [],
-        "value_loss_window": [],
-        "policy_confidence_window": [],
-        "last_policy_loss": 0.0,
-        "last_value_loss": 0.0,
-        "total_variance_policy": 0.0,
-        "total_variance_value": 0.0,
-        "num_variance_samples": 0,
-    }
-
-    def update_stability_metrics(
-        policy_loss: float, value_loss: float, policy_confidence: float
-    ):
-        """Update running stability statistics"""
-        # Update loss windows
-        stability_stats["policy_loss_window"].append(policy_loss)
-        stability_stats["value_loss_window"].append(value_loss)
-        if len(stability_stats["policy_loss_window"]) > window_size:
-            stability_stats["policy_loss_window"].pop(0)
-            stability_stats["value_loss_window"].pop(0)
-
-        # Update policy confidence window
-        stability_stats["policy_confidence_window"].append(policy_confidence)
-        if len(stability_stats["policy_confidence_window"]) > window_size:
-            stability_stats["policy_confidence_window"].pop(0)
-
-        # Calculate loss variance
-        if stability_stats["last_policy_loss"] != 0:  # Skip first sample
-            policy_diff = policy_loss - stability_stats["last_policy_loss"]
-            value_diff = value_loss - stability_stats["last_value_loss"]
-            stability_stats["total_variance_policy"] += policy_diff * policy_diff
-            stability_stats["total_variance_value"] += value_diff * value_diff
-            stability_stats["num_variance_samples"] += 1
-
-        stability_stats["last_policy_loss"] = policy_loss
-        stability_stats["last_value_loss"] = value_loss
-
-    def get_stability_metrics() -> dict:
-        """Calculate current stability metrics"""
-        if stability_stats["num_variance_samples"] == 0:
-            return {
-                "policy_loss_std": 0.0,
-                "value_loss_std": 0.0,
-                "policy_confidence_std": 0.0,
-                "policy_loss_trend": 0.0,
-                "value_loss_trend": 0.0,
-            }
-
-        # Calculate loss variance
-        policy_variance = (
-            stability_stats["total_variance_policy"]
-            / stability_stats["num_variance_samples"]
-        )
-        value_variance = (
-            stability_stats["total_variance_value"]
-            / stability_stats["num_variance_samples"]
-        )
-
-        # Calculate policy confidence stability
-        confidence_window = stability_stats["policy_confidence_window"]
-        confidence_std = np.std(confidence_window) if confidence_window else 0.0
-
-        # Calculate loss trends (negative means improving)
-        policy_window = stability_stats["policy_loss_window"]
-        value_window = stability_stats["value_loss_window"]
-        policy_trend = (
-            (np.mean(policy_window[-10:]) - np.mean(policy_window[:10]))
-            if len(policy_window) >= 20
-            else 0.0
-        )
-        value_trend = (
-            (np.mean(value_window[-10:]) - np.mean(value_window[:10]))
-            if len(value_window) >= 20
-            else 0.0
-        )
-
-        return {
-            "policy_loss_std": np.sqrt(policy_variance),
-            "value_loss_std": np.sqrt(value_variance),
-            "policy_confidence_std": confidence_std,
-            "policy_loss_trend": policy_trend,
-            "value_loss_trend": value_trend,
-        }
 
     # Keep track of last N checkpoints
     checkpoint_files = []
 
-    def get_temperature(move_count: int) -> float:
-        """Higher temperature early, lower later"""
-        if move_count <= 2:
-            return 2.0  # Very high in opening
-        elif move_count <= 6:
-            return 1.0  # Still exploring in early-mid game
-        elif move_count <= 10:
-            return 0.5  # Getting more focused in mid-late game
+    # Too complex for now, simplifying
+    # def get_adjusted_value(
+    #     game: GameState,
+    #     winner: Optional[Player],
+    #     move_count: int,
+    #     current_player: Player,
+    # ) -> float:
+    #     """Get value target from current player's perspective based on score difference"""
+    #     # Base win/loss/draw signal
+    #     if winner is None:  # Draw
+    #         return 0.0
+    #     elif winner == current_player:  # Win
+    #         base_value = 1.0
+    #     else:  # Loss
+    #         base_value = -1.0
+
+    #     # Add small score bonus
+    #     score_one = game._calculate_score(Player.ONE)
+    #     score_two = game._calculate_score(Player.TWO)
+
+    #     score_diff = (
+    #         score_one - score_two
+    #         if current_player == Player.ONE
+    #         else score_two - score_one
+    #     )
+
+    #     # Small bonus based on score difference (max 0.5)
+    #     score_bonus = 0.1 * max(-0.5, min(0.5, score_diff / 5.0))
+
+    #     return base_value + score_bonus
+
+    def get_adjusted_value(game, winner, move_count, current_player):
+        # Simplify to clear win/loss/draw signals without the score bonus
+        if winner is None:  # Draw
+            return 0.0
+        elif winner == current_player:  # Win
+            return 1.0
+        else:  # Loss
+            return -1.0
+
+    # Helper function to get model's move, either via MCTS or direct policy
+    def get_model_move_for_play(game, use_mcts=False, temperature=1.0):
+        """Get a move from the model for gameplay (returns the move and one-hot policy)"""
+        legal_moves = game.get_legal_moves()
+        state_rep = game.get_game_state_representation()
+
+        if use_mcts:
+            # Use MCTS for move selection
+            mcts = MCTS(
+                model, num_simulations=mcts_sim_count, bootstrap_weight=bootstrap_weight
+            )
+            mcts.set_temperature(temperature)
+            mcts_policy, root_node = mcts.search(game)
+            policy = mcts_policy
+            # Store root node for potential use in bootstrapping
+            root_value = root_node.predicted_value
         else:
-            return 0.1  # Almost deterministic in endgame
+            # Use direct policy from neural network
+            policy, value_pred = model.predict(
+                state_rep.board, state_rep.flat_values, legal_moves
+            )
+            policy = policy.squeeze(0)
+            root_value = value_pred.squeeze(0)[0]
 
-    def get_adjusted_value(
-        game: GameState,
-        winner: Optional[Player],
-        move_count: int,
-        current_player: Player,
-    ) -> float:
-        """Get value target from current player's perspective based on score difference"""
-        # calculate scores for both players
-        score_one = game._calculate_score(Player.ONE)
-        score_two = game._calculate_score(Player.TWO)
+        # Apply mask for legal moves
+        masked_policy = policy * legal_moves
+        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
 
-        # get score difference from current player's perspective
-        score_diff = (
-            score_one - score_two
-            if current_player == Player.ONE
-            else score_two - score_one
-        )
+        # Select move based on temperature
+        if temperature > 0:
+            # Sample from the probability distribution
+            policy_flat = masked_policy.flatten()
+            move_idx = rng.choice(len(policy_flat), p=policy_flat)
+            move_coords = np.unravel_index(move_idx, masked_policy.shape)
+        else:
+            # Choose move deterministically
+            move_coords = np.unravel_index(masked_policy.argmax(), masked_policy.shape)
 
-        # normalize to [-1, 1] range, using 5 as max expected difference
-        normalized_score = max(-1.0, min(1.0, score_diff / 5.0))
+        move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
 
-        return normalized_score
+        # Create one-hot encoded policy target (for gameplay only)
+        policy_target = np.zeros_like(masked_policy)
+        policy_target[move_coords] = 1.0
 
-    # Setup interrupt handling
+        return move, policy_target, root_value, state_rep
+
+    def get_model_move_with_policy(game, use_mcts=False, temperature=1.0):
+        """Get a move from the model along with the training policy target
+        (full MCTS distribution if MCTS was used, otherwise one-hot)"""
+        legal_moves = game.get_legal_moves()
+        state_rep = game.get_game_state_representation()
+
+        if use_mcts:
+            # Use MCTS for move selection
+            mcts = MCTS(
+                model,
+                num_simulations=mcts_sim_count,
+                bootstrap_weight=bootstrap_weight,
+                c_puct=1.0,
+            )
+            mcts.set_temperature(temperature)
+            mcts_policy, root_node = mcts.search(game)
+            policy = mcts_policy
+
+            # Use full MCTS distribution as policy target when MCTS is used (AlphaZero style)
+            policy_target = mcts_policy.copy()
+
+            # Store root node for potential use in bootstrapping
+            root_value = root_node.predicted_value
+        else:
+            # Use direct policy from neural network
+            policy, value_pred = model.predict(
+                state_rep.board, state_rep.flat_values, legal_moves
+            )
+            policy = policy.squeeze(0)
+            root_value = value_pred.squeeze(0)[0]
+
+            # Apply mask for legal moves
+            masked_policy = policy * legal_moves
+            masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+
+            # Select move based on temperature
+            if temperature > 0:
+                # Sample from the probability distribution
+                policy_flat = masked_policy.flatten()
+                move_idx = rng.choice(len(policy_flat), p=policy_flat)
+                move_coords = np.unravel_index(move_idx, masked_policy.shape)
+            else:
+                # Choose move deterministically
+                move_coords = np.unravel_index(
+                    masked_policy.argmax(), masked_policy.shape
+                )
+
+            # For direct policy, use one-hot encoding as the target
+            policy_target = np.zeros_like(masked_policy)
+            policy_target[move_coords] = 1.0
+
+        # Apply mask for legal moves to the final policy
+        masked_policy = policy * legal_moves
+        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+
+        # Select move based on temperature
+        if temperature > 0:
+            # Sample from the probability distribution
+            policy_flat = masked_policy.flatten()
+            move_idx = rng.choice(len(policy_flat), p=policy_flat)
+            move_coords = np.unravel_index(move_idx, masked_policy.shape)
+        else:
+            # Choose move deterministically
+            move_coords = np.unravel_index(masked_policy.argmax(), masked_policy.shape)
+
+        move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+
+        return move, policy_target, root_value, state_rep
+
+    # Set up signal handler for graceful interruption
     interrupt_received = False
 
     def handle_interrupt(signum, frame):
@@ -318,93 +274,115 @@ def train_network(
 
     signal.signal(signal.SIGINT, handle_interrupt)
 
-    print(f"Starting infinite training loop")
-    print(f"Episodes per iteration: {num_episodes}")
-    print(f"Temperature range: {min_temp:.1f} - 2.0")
-    print(f"Strategic opponent ratio: {strategic_opponent_ratio:.1%}")
-    print(f"Random opponent ratio: {random_opponent_ratio:.1%}")
-    print(f"Batch size: {batch_size}")
-    print(f"Replay buffer size: {buffer_size}")
-    print(f"Policy weight: {policy_weight:.1f}")
-    print(f"Press Ctrl+C to stop training gracefully")
+    print("Starting hybrid training loop with value bootstrapping")
+    print("Episodes per iteration:", num_episodes)
+    print("MCTS simulations per move:", mcts_sim_count)
+    print("MCTS move ratio: {:.1%}".format(mcts_game_ratio))
+    print("Strategic opponent ratio: {:.1%}".format(strategic_opponent_ratio))
+    print("Random opponent ratio: {:.1%}".format(random_opponent_ratio))
+    print(
+        "Self-play ratio: {:.1%}".format(
+            1.0 - strategic_opponent_ratio - random_opponent_ratio
+        )
+    )
+    print("Using AlphaZero-style MCTS policy targets for better learning")
+    print("Value bootstrapping weight: {:.2f}".format(bootstrap_weight))
+    print("Batch size:", batch_size)
+    print("Replay buffer size:", buffer_size)
+    print("Policy weight: {:.1f}".format(policy_weight))
+    print("Press Ctrl+C to stop training gracefully")
 
     try:
-        while not interrupt_received:
+        while not interrupt_received:  # Run until interrupted
             iteration += 1
             iteration_start = time.time()
 
             # Reset iteration stats
             iter_stats = stats_template.copy()
 
-            # Self-play phase
+            # Temporary buffer for this iteration to check outcome balance
+            iter_examples = []
+
+            # Create progress bar for all games
             episode_pbar = tqdm(
                 range(num_episodes),
-                desc=f"Self-Play Games (Iter {iteration})",
+                desc=f"Games (Iter {iteration})",
                 leave=False,
             )
 
-            # Determine number of opponent games
-            strategic_games = int(num_episodes * strategic_opponent_ratio)
-            random_games = int(num_episodes * random_opponent_ratio)
-            selfplay_games = num_episodes - strategic_games - random_games
+            # Generate games with various opponents
+            for _ in range(num_episodes):
+                # First, decide the opponent type
+                game_type_roll = rng.random()
 
-            # Self-play games
-            for episode in range(selfplay_games):
+                if game_type_roll < random_opponent_ratio:
+                    # Random opponent
+                    opponent_type = "random"
+                    opponent = random_opponent
+                    # Decide if model plays as P1 or P2
+                    model_plays_p1 = rng.random() < 0.5
+                elif game_type_roll < random_opponent_ratio + strategic_opponent_ratio:
+                    # Strategic opponent
+                    opponent_type = "strategic"
+                    opponent = strategic_opponent
+                    # Decide if model plays as P1 or P2
+                    model_plays_p1 = rng.random() < 0.5
+                else:
+                    # Self-play game
+                    opponent_type = "self-play"
+                    model_plays_p1 = True  # Doesn't matter for self-play
+
+                # Initialize game
                 game = GameState()
                 examples = []
                 move_count = 0
 
+                # Play the game
                 while True:
                     legal_moves = game.get_legal_moves()
                     if not np.any(legal_moves):
                         game.pass_turn()
                         continue
 
-                    # Get move probabilities from policy network
-                    state_rep = game.get_game_state_representation()
-                    policy, _ = model.predict(
-                        state_rep.board, state_rep.flat_values, legal_moves
-                    )
+                    if (
+                        opponent_type == "self-play"
+                        or (game.current_player == Player.ONE) == model_plays_p1
+                    ):
+                        # Model's turn
+                        # Decide whether to use MCTS for this move
+                        use_mcts = rng.random() < mcts_game_ratio
+                        if use_mcts:
+                            iter_stats["mcts_moves"] += 1
+                        else:
+                            iter_stats["direct_moves"] += 1
 
-                    # Remove batch dimension from policy
-                    policy = policy.squeeze(0)  # Now shape is (4, 4, 4)
+                        # Use temperature based on move count
+                        # temperature = 1.0 if move_count < 10 else 0.5
+                        # Use a higher, fixed temperature for more moves
+                        temperature = 1.2
 
-                    # Ensure we only consider legal moves
-                    masked_policy = policy * legal_moves  # Mask out illegal moves
-                    masked_policy = masked_policy / (
-                        masked_policy.sum() + 1e-8
-                    )  # Renormalize
+                        # Get model's move with AlphaZero-style policy (full MCTS distribution when MCTS is used)
+                        move, policy_target, value_pred, state_rep = (
+                            get_model_move_with_policy(
+                                game, use_mcts=use_mcts, temperature=temperature
+                            )
+                        )
 
-                    # Use unified temperature schedule
-                    temperature = get_temperature(move_count)
-
-                    if temperature > 0:
-                        # Sample from the probability distribution
-                        policy_flat = masked_policy.flatten()
-                        move_idx = np.random.choice(len(policy_flat), p=policy_flat)
-                        move_coords = np.unravel_index(move_idx, masked_policy.shape)
+                        # Store the example with value prediction
+                        examples.append(
+                            TrainingExample(
+                                state_rep=state_rep,
+                                policy=policy_target,
+                                value=0.0,  # Will be filled in later
+                                current_player=game.current_player,
+                            )
+                        )
                     else:
-                        move_coords = np.unravel_index(
-                            masked_policy.argmax(), masked_policy.shape
-                        )
-
-                    move = Move(
-                        move_coords[0], move_coords[1], PieceType(move_coords[2])
-                    )
-
-                    # Create one-hot encoded policy target
-                    policy_target = np.zeros_like(masked_policy)
-                    policy_target[move_coords] = 1.0
-
-                    # Store the example
-                    examples.append(
-                        TrainingExample(
-                            state_rep=state_rep,
-                            policy=policy_target,
-                            value=0.0,  # Will be filled in later
-                            current_player=game.current_player,
-                        )
-                    )
+                        # Opponent's turn
+                        move = opponent.get_move(game)
+                        if move is None:
+                            game.pass_turn()
+                            continue
 
                     # Make move
                     result = game.make_move(move)
@@ -414,347 +392,193 @@ def train_network(
                         # Game is over, get the winner
                         winner = game.get_winner()
 
-                        # Set value targets based on game outcome
-                        for example in examples:
-                            example.value = get_adjusted_value(
-                                game, winner, move_count, game.current_player
+                        # Set value targets based on game outcome and bootstrapping
+                        for i, example in enumerate(examples):
+                            # Get the final outcome value
+                            outcome_value = get_adjusted_value(
+                                game, winner, move_count, example.current_player
                             )
-                        break
 
-                replay_buffer.extend(examples)
+                            # Apply bootstrapping for all but the last move
+                            if i < len(examples) - 1:
+                                # The next player made a move, so get their perspective's value prediction
+                                next_example = examples[i + 1]
+                                next_state_rep = next_example.state_rep
+
+                                # Get a fresh value prediction for the next state
+                                _, next_value = model.predict(
+                                    next_state_rep.board, next_state_rep.flat_values
+                                )
+
+                                # Negate since it's from opponent's perspective
+                                bootstrap_value = -float(next_value[0][0])
+
+                                # Mix the outcome with bootstrapped value
+                                example.value = (
+                                    (1 - bootstrap_weight) * outcome_value
+                                    + bootstrap_weight * bootstrap_value
+                                )
+                            else:
+                                # Last move uses pure outcome
+                                example.value = outcome_value
+
+                            # Track win/loss/draw examples in stats
+                            if (
+                                outcome_value > 0.2
+                            ):  # Counting as a win (allowing for score bonus)
+                                iter_stats["win_examples"] += 1
+                            elif outcome_value < -0.2:  # Counting as a loss
+                                iter_stats["loss_examples"] += 1
+                            else:  # Draw or very close game
+                                iter_stats["draw_examples"] += 1
+
+                        # Update game statistics
+                        iter_stats["total_games"] += 1
+                        iter_stats["total_moves"] += move_count
+
+                        if opponent_type == "self-play":
+                            iter_stats["self_play_games"] += 1
+                            if winner == Player.ONE:
+                                iter_stats["self_play_p1_wins"] += 1
+                        elif opponent_type == "strategic":
+                            if model_plays_p1:
+                                iter_stats["strategic_games_as_p1"] += 1
+                                if winner == Player.ONE:
+                                    iter_stats["strategic_wins_as_p1"] += 1
+                            else:
+                                iter_stats["strategic_games_as_p2"] += 1
+                                if winner == Player.TWO:
+                                    iter_stats["strategic_wins_as_p2"] += 1
+                        elif opponent_type == "random":
+                            if model_plays_p1:
+                                iter_stats["random_games_as_p1"] += 1
+                                if winner == Player.ONE:
+                                    iter_stats["random_wins_as_p1"] += 1
+                            else:
+                                iter_stats["random_games_as_p2"] += 1
+                                if winner == Player.TWO:
+                                    iter_stats["random_wins_as_p2"] += 1
+
+                        break  # Game over
+
+                # Add examples to this iteration's buffer
+                iter_examples.extend(examples)
+
+                # Replay buffer statistics
+                mcts_examples = 0
+                direct_examples = 0
+                for example in examples:  # Check just these examples
+                    # If policy is one-hot encoded, it's from direct policy, otherwise from MCTS
+                    if np.sum(example.policy) == 1.0 and np.max(example.policy) == 1.0:
+                        direct_examples += 1
+                    else:
+                        mcts_examples += 1
+
+                # Update progress bar
                 episode_pbar.update(1)
                 episode_pbar.set_postfix(
                     {
-                        "buffer_size": len(replay_buffer),
-                        "temp": f"{temperature:.2f}",
-                        "type": "self-play",
+                        "wins": iter_stats["win_examples"],
+                        "losses": iter_stats["loss_examples"],
+                        "type": opponent_type,
+                        "mcts_ratio": f"{iter_stats['mcts_moves'] / (iter_stats['mcts_moves'] + iter_stats['direct_moves'] + 1e-8):.2f}",
                     }
                 )
 
-                # In self-play games, after game over:
-                if result == TurnResult.GAME_OVER:
-                    iter_stats["self_play_games"] += 1
-                    if winner == Player.ONE:
-                        iter_stats["self_play_p1_wins"] += 1
-                    iter_stats["total_moves"] += move_count
-                    iter_stats["total_games"] += 1
+            # Balance the examples based on outcome (wins/losses) before adding to buffer
+            win_examples = [ex for ex in iter_examples if ex.value > 0.2]
+            loss_examples = [ex for ex in iter_examples if ex.value < -0.2]
+            draw_examples = [ex for ex in iter_examples if -0.2 <= ex.value <= 0.2]
 
-            # Random opponent games
-            for episode in range(random_games):
-                game = GameState()
-                examples = []
-                move_count = 0
+            # If we have an imbalance, resample to balance
+            max_count = max(
+                len(win_examples), len(loss_examples), 1
+            )  # At least 1 to avoid div by 0
+            balanced_examples = []
 
-                # Randomly decide if model plays as Player 1 or 2
-                model_is_player_one = random.random() < 0.5
+            # Add all draw examples
+            balanced_examples.extend(draw_examples)
 
-                while True:
-                    legal_moves = game.get_legal_moves()
-                    if not np.any(legal_moves):
-                        game.pass_turn()
-                        continue
+            # For win examples, duplicate up to max_count if needed
+            if win_examples:
+                if (
+                    len(win_examples) < max_count / 2
+                ):  # If less than half of max, duplicate
+                    duplicate_factor = int(max_count / len(win_examples))
+                    balanced_examples.extend(win_examples * duplicate_factor)
+                else:
+                    balanced_examples.extend(win_examples)
 
-                    is_model_turn = (
-                        game.current_player == Player.ONE
-                    ) == model_is_player_one
-                    state_rep = game.get_game_state_representation()
+            # For loss examples, duplicate up to max_count if needed
+            if loss_examples:
+                if (
+                    len(loss_examples) < max_count / 2
+                ):  # If less than half of max, duplicate
+                    duplicate_factor = int(max_count / len(loss_examples))
+                    balanced_examples.extend(loss_examples * duplicate_factor)
+                else:
+                    balanced_examples.extend(loss_examples)
 
-                    if is_model_turn:
-                        # Model's turn
-                        policy, _ = model.predict(
-                            state_rep.board, state_rep.flat_values, legal_moves
-                        )
+            # Add balanced examples to replay buffer
+            replay_buffer.extend(balanced_examples)
 
-                        policy = policy.squeeze(0)
-                        masked_policy = policy * legal_moves
-                        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+            # Log balance statistics
+            tqdm.write(
+                f"Examples this iteration - Wins: {len(win_examples)}, Losses: {len(loss_examples)}, Draws: {len(draw_examples)}"
+            )
+            tqdm.write(
+                f"After balancing - Total examples: {len(balanced_examples)}, Buffer size: {len(replay_buffer)}"
+            )
 
-                        # Use unified temperature schedule
-                        temperature = get_temperature(move_count)
+            # Trim replay buffer if needed
+            if len(replay_buffer) > buffer_size:
+                # Simple random sampling without forcing extreme distributions
+                indices = rng.choice(
+                    len(replay_buffer), size=buffer_size, replace=False
+                )
+                replay_buffer = [replay_buffer[i] for i in indices]
 
-                        if temperature > 0:
-                            policy_flat = masked_policy.flatten()
-                            move_idx = np.random.choice(len(policy_flat), p=policy_flat)
-                            move_coords = np.unravel_index(
-                                move_idx, masked_policy.shape
-                            )
-                        else:
-                            move_coords = np.unravel_index(
-                                masked_policy.argmax(), masked_policy.shape
-                            )
-
-                        move = Move(
-                            move_coords[0], move_coords[1], PieceType(move_coords[2])
-                        )
-
-                        # Store training example for model's move
-                        policy_target = np.zeros_like(masked_policy)
-                        policy_target[move_coords] = 1.0
-                        examples.append(
-                            TrainingExample(
-                                state_rep=state_rep,
-                                policy=policy_target,
-                                value=0.0,
-                                current_player=game.current_player,
-                            )
-                        )
-                    else:
-                        # Random opponent's turn
-                        move = random_opponent.get_move(game)
-                        if move is None:
-                            game.pass_turn()
-                            continue
-
-                    result = game.make_move(move)
-                    move_count += 1
-
-                    if result == TurnResult.GAME_OVER:
-                        winner = game.get_winner()
-                        # Set value targets based on game outcome with length penalty
-                        for example in examples:
-                            example.value = get_adjusted_value(
-                                game, winner, move_count, game.current_player
-                            )
-                        break
-
-                replay_buffer.extend(examples)
-                episode_pbar.update(1)
-                episode_pbar.set_postfix(
-                    {"buffer_size": len(replay_buffer), "type": "random"}
+                # Log the natural distribution
+                buffer_wins = len([ex for ex in replay_buffer if ex.value > 0.2])
+                buffer_losses = len([ex for ex in replay_buffer if ex.value < -0.2])
+                buffer_draws = len(
+                    [ex for ex in replay_buffer if -0.2 <= ex.value <= 0.2]
                 )
 
-                # Track stats for random opponent games
-                if result == TurnResult.GAME_OVER:
-                    iter_stats["total_moves"] += move_count
-                    iter_stats["total_games"] += 1
-
-                # Track model's moves
-                if is_model_turn:
-                    max_prob = masked_policy.max()
-                    iter_stats["policy_confidence"] += max_prob
-                    iter_stats["moves_counted"] += 1
-
-                    if 1 <= move.x <= 2 and 1 <= move.y <= 2:
-                        iter_stats["central_moves"] += 1
-
-            # Strategic opponent games
-            for episode in range(strategic_games):
-                game = GameState()
-                examples = []
-                move_count = 0
-
-                # Randomly decide if model plays as Player 1 or 2
-                model_is_player_one = random.random() < 0.5
-
-                while True:
-                    legal_moves = game.get_legal_moves()
-                    if not np.any(legal_moves):
-                        game.pass_turn()
-                        continue
-
-                    is_model_turn = (
-                        game.current_player == Player.ONE
-                    ) == model_is_player_one
-                    state_rep = (
-                        game.get_game_state_representation()
-                    )  # Get state before any moves
-
-                    if is_model_turn:
-                        # Model's turn
-                        policy, _ = model.predict(
-                            state_rep.board, state_rep.flat_values, legal_moves
-                        )
-
-                        policy = policy.squeeze(0)
-                        masked_policy = policy * legal_moves
-                        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
-
-                        # Use unified temperature schedule
-                        temperature = get_temperature(move_count)
-
-                        if temperature > 0:
-                            policy_flat = masked_policy.flatten()
-                            move_idx = np.random.choice(len(policy_flat), p=policy_flat)
-                            move_coords = np.unravel_index(
-                                move_idx, masked_policy.shape
-                            )
-                        else:
-                            move_coords = np.unravel_index(
-                                masked_policy.argmax(), masked_policy.shape
-                            )
-
-                        move = Move(
-                            move_coords[0], move_coords[1], PieceType(move_coords[2])
-                        )
-
-                        # Store training example for model's move
-                        policy_target = np.zeros_like(masked_policy)
-                        policy_target[move_coords] = 1.0
-                        examples.append(
-                            TrainingExample(
-                                state_rep=state_rep,
-                                policy=policy_target,
-                                value=0.0,
-                                current_player=game.current_player,
-                            )
-                        )
-                    else:
-                        # Strategic opponent's turn - now we store these moves as learning examples
-                        move = strategic_opponent.get_move(game)
-                        if move is None:
-                            game.pass_turn()
-                            continue
-
-                        # Store the strategic opponent's move as a training example
-                        policy_target = np.zeros_like(legal_moves, dtype=np.float32)
-                        policy_target[move.x, move.y, move.piece_type.value] = 1.0
-                        examples.append(
-                            TrainingExample(
-                                state_rep=state_rep,
-                                policy=policy_target,
-                                value=0.0,
-                                current_player=game.current_player,
-                            )
-                        )
-
-                    result = game.make_move(move)
-                    move_count += 1
-
-                    if result == TurnResult.GAME_OVER:
-                        winner = game.get_winner()
-                        # Set value targets based on game outcome with length penalty
-                        for example in examples:
-                            if winner is None:
-                                example.value = get_adjusted_value(
-                                    game, None, move_count, game.current_player
-                                )
-                            else:
-                                # Only learn from strategic opponent's winning moves
-                                is_strategic_win = (
-                                    winner == Player.ONE
-                                ) != model_is_player_one
-                                if is_strategic_win and not is_model_turn:
-                                    # Learn from winning strategic moves
-                                    example.value = get_adjusted_value(
-                                        game, winner, move_count, game.current_player
-                                    )
-                                else:
-                                    # Learn from model's moves only when it wins
-                                    example.value = get_adjusted_value(
-                                        game, winner, move_count, game.current_player
-                                    )
-                        break
-
-                replay_buffer.extend(examples)
-                episode_pbar.update(1)
-                episode_pbar.set_postfix(
-                    {"buffer_size": len(replay_buffer), "type": "strategic"}
+                tqdm.write(
+                    f"Trimmed buffer - Natural distribution - Wins: {buffer_wins} ({100 * buffer_wins / len(replay_buffer):.1f}%), "
+                    f"Losses: {buffer_losses} ({100 * buffer_losses / len(replay_buffer):.1f}%), "
+                    f"Draws: {buffer_draws} ({100 * buffer_draws / len(replay_buffer):.1f}%), "
+                    f"Total: {len(replay_buffer)}"
                 )
-
-                # In strategic opponent games, after game over:
-                if result == TurnResult.GAME_OVER:
-                    if model_is_player_one:
-                        iter_stats["strategic_games_as_p1"] += 1
-                        if winner == Player.ONE:
-                            iter_stats["strategic_wins_as_p1"] += 1
-                    else:
-                        iter_stats["strategic_games_as_p2"] += 1
-                        if winner == Player.TWO:
-                            iter_stats["strategic_wins_as_p2"] += 1
-                    iter_stats["total_moves"] += move_count
-                    iter_stats["total_games"] += 1
-
-                # When making any move (both self-play and strategic):
-                # Track policy confidence and central moves
-                if is_model_turn:  # Only track model's moves
-                    max_prob = masked_policy.max()
-                    iter_stats["policy_confidence"] += max_prob
-                    iter_stats["moves_counted"] += 1
-
-                    # Check if move was in center
-                    if 1 <= move.x <= 2 and 1 <= move.y <= 2:
-                        iter_stats["central_moves"] += 1
-
-                # Keep buffer size in check
-                if len(replay_buffer) > buffer_size:
-                    replay_buffer = replay_buffer[-buffer_size:]
 
             # Training phase
             train_pbar = tqdm(range(num_epochs), desc="Training Epochs", leave=False)
             epoch_losses = {"total": 0, "policy": 0, "value": 0}
 
             for _ in train_pbar:
-                # Balance by both player AND outcome
-                p1_wins = [
-                    ex
-                    for ex in replay_buffer
-                    if ex.current_player == Player.ONE and ex.value > 0.5
-                ]
-                p1_losses = [
-                    ex
-                    for ex in replay_buffer
-                    if ex.current_player == Player.ONE and ex.value < 0.5
-                ]
-                p2_wins = [
-                    ex
-                    for ex in replay_buffer
-                    if ex.current_player == Player.TWO and ex.value > 0.5
-                ]
-                p2_losses = [
-                    ex
-                    for ex in replay_buffer
-                    if ex.current_player == Player.TWO and ex.value < 0.5
-                ]
-
-                # Sample equally from each category
-                samples_per_category = min(
-                    len(p1_wins),
-                    len(p1_losses),
-                    len(p2_wins),
-                    len(p2_losses),
-                    batch_size // 4,
+                # Balanced sampling from replay buffer
+                indices = rng.choice(
+                    len(replay_buffer),
+                    size=min(batch_size, len(replay_buffer)),
+                    replace=False,
                 )
-                if samples_per_category == 0:  # Fallback if any category is empty
-                    batch = random.sample(
-                        replay_buffer, min(batch_size, len(replay_buffer))
-                    )
-                else:
-                    batch = []
-                    for category in [p1_wins, p1_losses, p2_wins, p2_losses]:
-                        if category:  # If category has examples
-                            batch.extend(
-                                random.sample(
-                                    category, min(samples_per_category, len(category))
-                                )
-                            )
+                batch = [replay_buffer[i] for i in indices]
 
-                    # Fill remaining slots randomly if needed
-                    remaining = batch_size - len(batch)
-                    if remaining > 0:
-                        batch.extend(
-                            random.sample(
-                                replay_buffer, min(remaining, len(replay_buffer))
-                            )
-                        )
+                # Prepare training data
+                board_inputs = np.array([ex.state_rep.board for ex in batch])
+                flat_inputs = np.array([ex.state_rep.flat_values for ex in batch])
+                policy_targets = np.array([ex.policy for ex in batch])
+                value_targets = np.array([ex.value for ex in batch])
 
-                    # Prepare training data
-                    board_inputs = np.array([ex.state_rep.board for ex in batch])
-                    flat_inputs = np.array([ex.state_rep.flat_values for ex in batch])
-                    policy_targets = np.array([ex.policy for ex in batch])
-                    value_targets = np.array([ex.value for ex in batch])
-
-                    try:
-                        # Train network with weighted losses
-                        total_loss, policy_loss, value_loss = model.train_step(
-                            board_inputs,
-                            flat_inputs,
-                            policy_targets,
-                            value_targets,
-                            policy_weight=policy_weight,  # Pass weight to train_step
-                        )
-                    except Exception as e:
-                        print(f"Error during training step: {e}")
-                        continue
+                # Train network with weighted losses
+                total_loss, policy_loss, value_loss = model.train_step(
+                    board_inputs,
+                    flat_inputs,
+                    policy_targets,
+                    value_targets,
+                    policy_weight=policy_weight,
+                )
 
                 # Update running averages
                 running_count += 1
@@ -775,10 +599,9 @@ def train_network(
 
                 train_pbar.set_postfix(
                     {
-                        "running_total": f"{running_loss['total']:.4f}",
-                        "running_policy": f"{running_loss['policy']:.4f}",
-                        "running_value": f"{running_loss['value']:.4f}",
-                        "ratio": f"{running_loss['policy']/running_loss['value']:.2f}",
+                        "running_total": "{:.4f}".format(running_loss["total"]),
+                        "running_policy": "{:.4f}".format(running_loss["policy"]),
+                        "running_value": "{:.4f}".format(running_loss["value"]),
                     }
                 )
 
@@ -787,47 +610,136 @@ def train_network(
             avg_policy = epoch_losses["policy"] / num_epochs
             avg_value = epoch_losses["value"] / num_epochs
 
-            # Update stability metrics after calculating averages
-            update_stability_metrics(
-                avg_policy,
-                avg_value,
-                iter_stats["policy_confidence"] / max(1, iter_stats["moves_counted"]),
-            )
-            stability_metrics = get_stability_metrics()
+            # FIXED: Step the scheduler once per iteration, not per batch
+            model.scheduler.step(avg_total)
 
-            # Print epoch summary with stability metrics
+            # Update loss and learning rate history for monitoring
+            loss_history.append(avg_total)
+            current_lr = model.optimizer.param_groups[0]["lr"]
+            lr_history.append(current_lr)
+
+            # Check for loss stagnation and implement reactive learning rate control
+            if len(loss_history) >= 3:
+                # If loss is improving, update best loss
+                if avg_total < best_loss:
+                    best_loss = avg_total
+                    stagnation_counter = 0
+                else:
+                    # Calculate recent loss trend
+                    recent_losses = loss_history[-3:]
+                    loss_diff = abs(recent_losses[0] - recent_losses[-1])
+
+                    # If loss is stagnating (not improving by threshold)
+                    if loss_diff < loss_stagnation_threshold:
+                        stagnation_counter += 1
+                    else:
+                        stagnation_counter = 0
+
+                # If we've been stuck for a while, reset learning rate to higher value
+                if stagnation_counter >= 5:  # 5 iterations of stagnation
+                    # Get base learning rate based on model mode
+                    base_lr = (
+                        0.0005 if model.mode == "fast" else 0.0001
+                    )  # FIXED: Higher base LRs
+                    new_lr = base_lr * lr_reset_factor
+
+                    # Reset optimizer with higher learning rate to escape local minimum
+                    tqdm.write(
+                        "\nLoss stagnation detected! Resetting learning rate: {:.8f} → {:.8f}".format(
+                            current_lr, new_lr
+                        )
+                    )
+                    # FIXED: Store the actual new LR to confirm it was applied
+                    actual_new_lr = model.reset_optimizer(new_lr=new_lr)
+                    tqdm.write(f"New learning rate confirmed: {actual_new_lr:.8f}")
+
+                    stagnation_counter = 0
+
+            # Print training statistics
             elapsed_time = time.time() - training_start
             hours = elapsed_time // 3600
             minutes = (elapsed_time % 3600) // 60
 
-            tqdm.write(
-                f"\nIteration {iteration} - Time: {int(hours)}h {int(minutes)}m"
-                f"\nAvg Losses: Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}"
-                f"\nStability Metrics:"
-                f"\n  Loss Std Dev: Policy={stability_metrics['policy_loss_std']:.4f}, Value={stability_metrics['value_loss_std']:.4f}"
-                f"\n  Policy Confidence Std Dev: {stability_metrics['policy_confidence_std']:.4f}"
-                f"\n  Loss Trends: Policy={stability_metrics['policy_loss_trend']:.4f}, Value={stability_metrics['value_loss_trend']:.4f}"
+            # Prepare win rate statistics
+            strategic_p1_rate = (
+                100
+                * iter_stats["strategic_wins_as_p1"]
+                / max(1, iter_stats["strategic_games_as_p1"])
+            )
+            strategic_p2_rate = (
+                100
+                * iter_stats["strategic_wins_as_p2"]
+                / max(1, iter_stats["strategic_games_as_p2"])
+            )
+            random_p1_rate = (
+                100
+                * iter_stats["random_wins_as_p1"]
+                / max(1, iter_stats["random_games_as_p1"])
+            )
+            random_p2_rate = (
+                100
+                * iter_stats["random_wins_as_p2"]
+                / max(1, iter_stats["random_games_as_p2"])
+            )
+            selfplay_p1_rate = (
+                100
+                * iter_stats["self_play_p1_wins"]
+                / max(1, iter_stats["self_play_games"])
+            )
+            mcts_rate = (
+                100
+                * iter_stats["mcts_moves"]
+                / max(1, iter_stats["mcts_moves"] + iter_stats["direct_moves"])
             )
 
-            # Update stats display
-            tqdm.write(
-                f"\nIteration {iteration} Statistics:"
-                f"\n  Time: {int(hours)}h {int(minutes)}m"
-                f"\n  Losses - Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}"
-                f"\n  Strategic Performance:"
-                f"\n    As P1: {iter_stats['strategic_wins_as_p1']}/{iter_stats['strategic_games_as_p1']} "
-                f"({100 * iter_stats['strategic_wins_as_p1'] / max(1, iter_stats['strategic_games_as_p1']):.1f}%)"
-                f"\n    As P2: {iter_stats['strategic_wins_as_p2']}/{iter_stats['strategic_games_as_p2']} "
-                f"({100 * iter_stats['strategic_wins_as_p2'] / max(1, iter_stats['strategic_games_as_p2']):.1f}%)"
-                f"\n  Self-play P1 Win Rate: {100 * iter_stats['self_play_p1_wins'] / max(1, iter_stats['self_play_games']):.1f}%"
-                f"\n  Model Behavior:"
-                f"\n    Avg Game Length: {iter_stats['total_moves'] / max(1, iter_stats['total_games']):.1f} moves"
-                f"\n    Central Move Rate: {100 * iter_stats['central_moves'] / max(1, iter_stats['moves_counted']):.1f}%"
-                f"\n    Avg Policy Confidence: {iter_stats['policy_confidence'] / max(1, iter_stats['moves_counted']):.3f}"
-            )
+            # Get win/loss/draw balance in buffer
+            buffer_wins = len([ex for ex in replay_buffer if ex.value > 0.2])
+            buffer_losses = len([ex for ex in replay_buffer if ex.value < -0.2])
+            buffer_draws = len([ex for ex in replay_buffer if -0.2 <= ex.value <= 0.2])
 
             tqdm.write(
-                f"Iteration completed in {time.time() - iteration_start:.1f} seconds\n"
+                f"\nIteration {iteration} - Time: {int(hours)}h {int(minutes)}m\n"
+                "Avg Losses: Total: {:.4f}, Policy: {:.4f}, Value: {:.4f}\n".format(
+                    avg_total, avg_policy, avg_value
+                )
+                + "Learning Rate: {:.8f} (Mode: {})\n".format(current_lr, model.mode)
+                + "Self-play P1 Win Rate: {:.1f}%\n".format(selfplay_p1_rate)
+                + "Strategic Performance:\n"
+                + "  As P1: {}/{} ({:.1f}%)\n".format(
+                    iter_stats["strategic_wins_as_p1"],
+                    iter_stats["strategic_games_as_p1"],
+                    strategic_p1_rate,
+                )
+                + "  As P2: {}/{} ({:.1f}%)\n".format(
+                    iter_stats["strategic_wins_as_p2"],
+                    iter_stats["strategic_games_as_p2"],
+                    strategic_p2_rate,
+                )
+                + "Random Performance:\n"
+                + "  As P1: {}/{} ({:.1f}%)\n".format(
+                    iter_stats["random_wins_as_p1"],
+                    iter_stats["random_games_as_p1"],
+                    random_p1_rate,
+                )
+                + "  As P2: {}/{} ({:.1f}%)\n".format(
+                    iter_stats["random_wins_as_p2"],
+                    iter_stats["random_games_as_p2"],
+                    random_p2_rate,
+                )
+                + "MCTS usage: {}/{} moves ({:.1f}%)\n".format(
+                    iter_stats["mcts_moves"],
+                    iter_stats["mcts_moves"] + iter_stats["direct_moves"],
+                    mcts_rate,
+                )
+                + "Replay Buffer Balance: Wins: {} ({:.1f}%), Losses: {} ({:.1f}%), Draws: {} ({:.1f}%)\n".format(
+                    buffer_wins,
+                    100 * buffer_wins / len(replay_buffer),
+                    buffer_losses,
+                    100 * buffer_losses / len(replay_buffer),
+                    buffer_draws,
+                    100 * buffer_draws / len(replay_buffer),
+                )
+                + "Bootstrap Weight: {:.2f}".format(bootstrap_weight)
             )
 
             # Save latest model after every iteration
@@ -851,153 +763,262 @@ def train_network(
 
                 tqdm.write(f"Saved checkpoint: {save_path}")
 
-    except Exception as e:
-        print(f"\nUnexpected error during training: {e}")
     except KeyboardInterrupt:
-        print("\nInterrupt received, saving final model...")
+        print("\nTraining interrupted, saving final model...")
+        model.save(f"saved_models/model_iter_final.pth")
+        print("Final model saved.")
     finally:
         # Calculate final elapsed time
         elapsed_time = time.time() - training_start
         hours = elapsed_time // 3600
         minutes = (elapsed_time % 3600) // 60
 
-        # Always save final model state
-        final_path = f"saved_models/model_iter_final.pth"
-        model.save(final_path)
-        model.save(latest_model_path)  # Update latest as well
-        print(f"\nFinal model saved as: {final_path}")
-        print(f"Latest model saved as: {latest_model_path}")
-
-        # Enhanced final summary
         print("\nTraining Summary:")
         print(f"Total training time: {int(hours)}h {int(minutes)}m")
         print(f"Iterations completed: {iteration}")
-        print(f"Final Model State:")
-        print(f"  Loss Metrics:")
-        print(f"    Total: {running_loss['total']:.4f}")
-        print(f"    Policy: {running_loss['policy']:.4f}")
-        print(f"    Value: {running_loss['value']:.4f}")
         print(
-            f"  Policy/Value Ratio: {running_loss['policy']/running_loss['value']:.2f}"
+            "Final Loss: Total={:.4f}, Policy={:.4f}, Value={:.4f}".format(
+                running_loss["total"], running_loss["policy"], running_loss["value"]
+            )
         )
-        print(f"  Parameters: {sum(p.numel() for p in model.model.parameters()):,}")
-        print(f"\nCheckpoints saved: {', '.join(checkpoint_files)}")
+        print(
+            "Final Learning Rate: {:.8f}".format(model.optimizer.param_groups[0]["lr"])
+        )
+        print("Model saved at: saved_models/model_iter_final.pth")
 
 
-def evaluate_model(model: ModelWrapper, num_games: int = 100):
-    """Evaluate model by playing against different opponents"""
-    opponents = {"random": RandomOpponent(), "strategic": StrategicOpponent()}
+def evaluate_model(
+    model: ModelWrapper,
+    num_games: int = 100,
+    mcts_sims: int = 20,
+    use_mcts: bool = False,
+    deterministic: bool = True,
+    debug: bool = False,
+):
+    """
+    Evaluate model against different opponents and report win rates.
 
+    Args:
+        model: The model to evaluate
+        num_games: Number of games to play against each opponent
+        mcts_sims: Number of MCTS simulations per move (if use_mcts=True)
+        use_mcts: Whether to use MCTS for model moves
+        deterministic: If True, use deterministic policy (argmax), else sample
+        debug: Print additional debug information
+    """
+    # Initialize opponents
+    random_opponent = RandomOpponent()
+    strategic_opponent = StrategicOpponent()
+
+    # Random number generator for move sampling
+    rng = np.random.Generator(np.random.PCG64())
+
+    # Initialize statistics
     results = {
-        "as_p1": {opp: {"wins": 0, "losses": 0, "draws": 0} for opp in opponents},
-        "as_p2": {opp: {"wins": 0, "losses": 0, "draws": 0} for opp in opponents},
+        "random": {
+            "model_as_p1": {"wins": 0, "draws": 0, "losses": 0},
+            "model_as_p2": {"wins": 0, "draws": 0, "losses": 0},
+        },
+        "strategic": {
+            "model_as_p1": {"wins": 0, "draws": 0, "losses": 0},
+            "model_as_p2": {"wins": 0, "draws": 0, "losses": 0},
+        },
+        "self_play": {"p1_wins": 0, "draws": 0, "p2_wins": 0},
     }
 
-    # Test model as both Player 1 and Player 2 against each opponent
-    for opponent_name, opponent in opponents.items():
-        # Model as Player 1
-        for game_idx in tqdm(range(num_games), desc=f"Model (P1) vs {opponent_name}"):
-            game = GameState()
-            while True:
-                if game.current_player == Player.ONE:
-                    # Model's turn
-                    legal_moves = game.get_legal_moves()
-                    if not np.any(legal_moves):
-                        game.pass_turn()
-                        continue
+    def get_model_move(game: GameState, use_temperature: bool = False):
+        """Helper function to get model's move"""
+        legal_moves = game.get_legal_moves()
+        state_rep = game.get_game_state_representation()
 
-                    state_rep = game.get_game_state_representation()
-                    policy, _ = model.predict(
-                        state_rep.board, state_rep.flat_values, legal_moves
-                    )
+        # If using MCTS, run search to get improved policy
+        if use_mcts:
+            mcts = MCTS(model, num_simulations=mcts_sims)
+            mcts_policy, _ = mcts.search(game)
+            policy = mcts_policy
+        else:
+            # Get policy directly from model
+            policy, _ = model.predict(
+                state_rep.board, state_rep.flat_values, legal_moves
+            )
+            policy = policy.squeeze(0)
 
-                    # Apply legal moves mask
-                    policy = policy.squeeze(0)
-                    masked_policy = policy * legal_moves
-                    masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+        # Apply legal move mask
+        masked_policy = policy * legal_moves
+        masked_policy = masked_policy / (np.sum(masked_policy) + 1e-8)
 
-                    # Choose best legal move
-                    move_coords = np.unravel_index(
-                        masked_policy.argmax(), masked_policy.shape
-                    )
-                    move = Move(
-                        move_coords[0], move_coords[1], PieceType(move_coords[2])
-                    )
-                else:
-                    # Opponent's turn
-                    move = opponent.get_move(game)
-                    if move is None:
-                        game.pass_turn()
-                        continue
+        # Choose move based on policy
+        if deterministic and not use_temperature:
+            # Choose best move deterministically
+            move_coords = np.unravel_index(
+                np.argmax(masked_policy), masked_policy.shape
+            )
+        else:
+            # Sample from policy distribution
+            policy_flat = masked_policy.flatten()
+            move_idx = rng.choice(len(policy_flat), p=policy_flat)
+            move_coords = np.unravel_index(move_idx, masked_policy.shape)
 
-                result = game.make_move(move)
-                if result == TurnResult.GAME_OVER:
-                    winner = game.get_winner()
-                    if winner == Player.ONE:
-                        results["as_p1"][opponent_name]["wins"] += 1
-                    elif winner == Player.TWO:
-                        results["as_p1"][opponent_name]["losses"] += 1
-                    else:
-                        results["as_p1"][opponent_name]["draws"] += 1
-                    break
+        return Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
 
-        # Model as Player 2
-        for game_idx in tqdm(range(num_games), desc=f"Model (P2) vs {opponent_name}"):
-            game = GameState()
-            while True:
-                if game.current_player == Player.TWO:
-                    # Model's turn
-                    legal_moves = game.get_legal_moves()
-                    if not np.any(legal_moves):
-                        game.pass_turn()
-                        continue
+    print(f"\n{'=' * 50}")
+    print(f"Starting model evaluation ({num_games} games per opponent)")
+    print(
+        f"MCTS: {'Enabled' if use_mcts else 'Disabled'}, Simulations: {mcts_sims if use_mcts else 'N/A'}"
+    )
+    print(f"Move selection: {'Deterministic' if deterministic else 'Sampling'}")
+    print(f"{'=' * 50}\n")
 
-                    state_rep = game.get_game_state_representation()
-                    policy, _ = model.predict(
-                        state_rep.board, state_rep.flat_values, legal_moves
-                    )
+    # 1. Play against random opponent
+    print(f"Evaluating against Random opponent...")
+    for game_idx in tqdm(range(num_games * 2), desc="Random opponent"):
+        # Alternate between playing as P1 and P2
+        model_plays_p1 = game_idx < num_games
 
-                    # Apply legal moves mask
-                    policy = policy.squeeze(0)
-                    masked_policy = policy * legal_moves
-                    masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
+        key = "model_as_p1" if model_plays_p1 else "model_as_p2"
+        game = GameState()
+        move_count = 0
 
-                    # Choose best legal move
-                    move_coords = np.unravel_index(
-                        masked_policy.argmax(), masked_policy.shape
-                    )
-                    move = Move(
-                        move_coords[0], move_coords[1], PieceType(move_coords[2])
-                    )
-                else:
-                    # Opponent's turn
-                    move = opponent.get_move(game)
-                    if move is None:
-                        game.pass_turn()
-                        continue
+        while not game.is_over:
+            is_model_turn = (game.current_player == Player.ONE) == model_plays_p1
 
-                result = game.make_move(move)
-                if result == TurnResult.GAME_OVER:
-                    winner = game.get_winner()
-                    if winner == Player.TWO:
-                        results["as_p2"][opponent_name]["wins"] += 1
-                    elif winner == Player.ONE:
-                        results["as_p2"][opponent_name]["losses"] += 1
-                    else:
-                        results["as_p2"][opponent_name]["draws"] += 1
-                    break
+            if is_model_turn:
+                # Model's turn
+                move = get_model_move(game, use_temperature=(move_count < 5))
+            else:
+                # Random opponent's turn
+                move = random_opponent.get_move(game)
+                if move is None:
+                    game.pass_turn()
+                    continue
 
-    # Print results
-    print("\nEvaluation Results:")
-    for role in ["as_p1", "as_p2"]:
-        print(f"\nModel playing as {'Player 1' if role == 'as_p1' else 'Player 2'}:")
-        for opp_name in opponents:
-            r = results[role][opp_name]
-            total = r["wins"] + r["losses"] + r["draws"]
-            print(f"\nVs {opp_name} opponent:")
-            print(f"Wins: {r['wins']} ({r['wins']/total*100:.1f}%)")
-            print(f"Losses: {r['losses']} ({r['losses']/total*100:.1f}%)")
-            print(f"Draws: {r['draws']} ({r['draws']/total*100:.1f}%)")
+            game.make_move(move)
+            move_count += 1
+
+        # Record game result
+        winner = game.get_winner()
+        if winner is None:
+            results["random"][key]["draws"] += 1
+        elif (winner == Player.ONE) == model_plays_p1:
+            results["random"][key]["wins"] += 1
+        else:
+            results["random"][key]["losses"] += 1
+
+    # 2. Play against strategic opponent
+    print(f"Evaluating against Strategic opponent...")
+    for game_idx in tqdm(range(num_games * 2), desc="Strategic opponent"):
+        # Alternate between playing as P1 and P2
+        model_plays_p1 = game_idx < num_games
+
+        key = "model_as_p1" if model_plays_p1 else "model_as_p2"
+        game = GameState()
+        move_count = 0
+
+        while not game.is_over:
+            is_model_turn = (game.current_player == Player.ONE) == model_plays_p1
+
+            if is_model_turn:
+                # Model's turn
+                move = get_model_move(game, use_temperature=(move_count < 5))
+            else:
+                # Strategic opponent's turn
+                move = strategic_opponent.get_move(game)
+                if move is None:
+                    game.pass_turn()
+                    continue
+
+            game.make_move(move)
+            move_count += 1
+
+        # Record game result
+        winner = game.get_winner()
+        if winner is None:
+            results["strategic"][key]["draws"] += 1
+        elif (winner == Player.ONE) == model_plays_p1:
+            results["strategic"][key]["wins"] += 1
+        else:
+            results["strategic"][key]["losses"] += 1
+
+    # 3. Self-play (model vs itself)
+    print(f"Evaluating Self-play (model vs itself)...")
+    for game_idx in tqdm(range(num_games), desc="Self-play"):
+        game = GameState()
+        move_count = 0
+
+        while not game.is_over:
+            # Use model for both sides
+            move = get_model_move(game, use_temperature=(move_count < 5))
+
+            game.make_move(move)
+            move_count += 1
+
+        # Record game result
+        winner = game.get_winner()
+        if winner is None:
+            results["self_play"]["draws"] += 1
+        elif winner == Player.ONE:
+            results["self_play"]["p1_wins"] += 1
+        else:
+            results["self_play"]["p2_wins"] += 1
+
+    # Print results in a nice table format
+    print("\n" + "=" * 70)
+    print(f"EVALUATION RESULTS (Games per matchup: {num_games})")
+    print("=" * 70)
+
+    def print_matchup_results(opponent_name, results_dict):
+        p1_wins = results_dict["model_as_p1"]["wins"]
+        p1_draws = results_dict["model_as_p1"]["draws"]
+        p1_losses = results_dict["model_as_p1"]["losses"]
+        p1_winrate = (p1_wins / num_games) * 100
+
+        p2_wins = results_dict["model_as_p2"]["wins"]
+        p2_draws = results_dict["model_as_p2"]["draws"]
+        p2_losses = results_dict["model_as_p2"]["losses"]
+        p2_winrate = (p2_wins / num_games) * 100
+
+        print(f"\n{opponent_name} Opponent:")
+        print(
+            f"  Model as P1: {p1_wins} wins, {p1_draws} draws, {p1_losses} losses ({p1_winrate:.1f}% win rate)"
+        )
+        print(
+            f"  Model as P2: {p2_wins} wins, {p2_draws} draws, {p2_losses} losses ({p2_winrate:.1f}% win rate)"
+        )
+        print(
+            f"  Overall:     {p1_wins + p2_wins} wins, {p1_draws + p2_draws} draws, {p1_losses + p2_losses} losses ({((p1_wins + p2_wins) / (num_games * 2)) * 100:.1f}% win rate)"
+        )
+
+    # Print random opponent results
+    print_matchup_results("Random", results["random"])
+
+    # Print strategic opponent results
+    print_matchup_results("Strategic", results["strategic"])
+
+    # Print self-play results
+    p1_wins = results["self_play"]["p1_wins"]
+    draws = results["self_play"]["draws"]
+    p2_wins = results["self_play"]["p2_wins"]
+    p1_rate = (p1_wins / num_games) * 100
+    p2_rate = (p2_wins / num_games) * 100
+
+    print("\nSelf-Play:")
+    print(
+        f"  P1 Wins: {p1_wins} ({p1_rate:.1f}%), Draws: {draws} ({(draws / num_games) * 100:.1f}%), P2 Wins: {p2_wins} ({p2_rate:.1f}%)"
+    )
+
+    # Print overall summary
+    total_wins = (
+        results["random"]["model_as_p1"]["wins"]
+        + results["random"]["model_as_p2"]["wins"]
+        + results["strategic"]["model_as_p1"]["wins"]
+        + results["strategic"]["model_as_p2"]["wins"]
+    )
+    total_games = num_games * 4  # 2 opponents x 2 sides
+    overall_winrate = (total_wins / total_games) * 100
+
+    print("\nOverall Win Rate vs Opponents:")
+    print(f"  {total_wins}/{total_games} ({overall_winrate:.1f}%)")
+    print("=" * 70 + "\n")
 
     return results
 
@@ -1005,24 +1026,44 @@ def evaluate_model(model: ModelWrapper, num_games: int = 100):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train and evaluate the model")
-    parser.add_argument(
-        "--mode",
-        choices=["train", "eval", "crunch"],
-        default="train",
-        help="Mode to run in: train (training), eval (evaluation), or crunch (optimize for deployment)",
+    parser = argparse.ArgumentParser(
+        description="Train model with MCTS integration and value bootstrapping"
     )
     parser.add_argument(
-        "--episodes", type=int, default=100, help="Episodes per iteration"
+        "--episodes", type=int, default=DEFAULT_EPISODES, help="Episodes per iteration"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=256, help="Training batch size"
+        "--mcts_sims",
+        type=int,
+        default=DEFAULT_MCTS_SIMS,
+        help="Number of MCTS simulations per move",
     )
     parser.add_argument(
-        "--save_interval", type=int, default=10, help="Save every N iterations"
+        "--mcts_ratio",
+        type=float,
+        default=DEFAULT_MCTS_RATIO,
+        help="Ratio of model moves that use MCTS",
     )
     parser.add_argument(
-        "--num_checkpoints", type=int, default=3, help="Number of checkpoints to keep"
+        "--strategic_ratio",
+        type=float,
+        default=DEFAULT_STRATEGIC_RATIO,
+        help="Ratio of games against strategic opponent",
+    )
+    parser.add_argument(
+        "--random_ratio",
+        type=float,
+        default=DEFAULT_RANDOM_RATIO,
+        help="Ratio of games against random opponent",
+    )
+    parser.add_argument(
+        "--bootstrap",
+        type=float,
+        default=DEFAULT_BOOTSTRAP_WEIGHT,
+        help="Weight for value bootstrapping (0-1)",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Training batch size"
     )
     parser.add_argument(
         "--load_model",
@@ -1031,60 +1072,106 @@ if __name__ == "__main__":
         help="Path to model to load",
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="optimized_models",
-        help="Directory to save optimized models when using crunch mode",
+        "--stable_lr",
+        action="store_true",
+        help="Use stable (slower) learning rate instead of fast mode",
+    )
+    parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=DEFAULT_LR_PATIENCE,
+        help="Patience for learning rate scheduler",
+    )
+    parser.add_argument(
+        "--lr_reset_factor",
+        type=float,
+        default=DEFAULT_LR_RESET_FACTOR,
+        help="Factor to increase LR when resetting",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Start with a fresh model, ignoring existing checkpoints",
+        help="Start with a fresh model, ignoring any existing saved model",
     )
     parser.add_argument(
-        "--stable_lr",
+        "--eval",
         action="store_true",
-        help="Use stable (slower) learning rate instead of fast mode",
+        help="Evaluate model instead of training",
+    )
+    parser.add_argument(
+        "--eval_games",
+        type=int,
+        default=100,
+        help="Number of games to play per opponent in evaluation",
+    )
+    parser.add_argument(
+        "--eval_use_mcts",
+        action="store_true",
+        help="Use MCTS for model moves during evaluation",
+    )
+    parser.add_argument(
+        "--eval_sample",
+        action="store_true",
+        help="Sample from policy during evaluation instead of taking argmax",
     )
 
     args = parser.parse_args()
 
     # Initialize model with appropriate mode
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = ModelWrapper(
-        device,
-        mode=(
-            "crunch"
-            if args.mode == "crunch"
-            else "stable" if args.stable_lr else "fast"
-        ),
-    )
+    # model = ModelWrapper(device, mode="stable" if args.stable_lr else "fast")
+    model = ModelWrapper(device, mode="custom_lr")
 
-    if not args.fresh and args.load_model and os.path.exists(args.load_model):
+    # Load existing model unless --fresh is specified
+    if not args.fresh and os.path.exists(args.load_model):
         model.load(args.load_model)
-        print(f"Loaded model from {args.load_model}")
+        print("Loaded model from", args.load_model)
+        if hasattr(model, "optimizer") and model.optimizer is not None:
+            print(
+                "Current learning rate: {:.8f}".format(
+                    model.optimizer.param_groups[0]["lr"]
+                )
+            )
     else:
         if args.fresh:
             print("Starting with fresh model as requested")
         else:
-            print(f"No model found at {args.load_model}, starting fresh")
+            print("No model found at", args.load_model, "starting fresh")
+        if hasattr(model, "optimizer") and model.optimizer is not None:
+            print(
+                "Initial learning rate: {:.8f}".format(
+                    model.optimizer.param_groups[0]["lr"]
+                )
+            )
 
-    if args.mode == "train":
-        train_network(
+    # Evaluation mode
+    if args.eval:
+        print(f"Evaluating model from {args.load_model}")
+        model.model.eval()  # Set model to evaluation mode
+        evaluate_model(
+            model,
+            num_games=args.eval_games,
+            mcts_sims=args.mcts_sims,
+            use_mcts=args.eval_use_mcts,
+            deterministic=not args.eval_sample,
+            debug=args.debug,
+        )
+    else:
+        # Training mode
+        print(
+            f"Training model (starting from {args.load_model if not args.fresh else 'fresh model'})"
+        )
+        hybrid_training_loop(
             model,
             num_episodes=args.episodes,
             batch_size=args.batch_size,
-            save_interval=args.save_interval,
-            num_checkpoints=args.num_checkpoints,
+            mcts_sim_count=args.mcts_sims,
+            mcts_game_ratio=args.mcts_ratio,
+            strategic_opponent_ratio=args.strategic_ratio,
+            random_opponent_ratio=args.random_ratio,
+            bootstrap_weight=args.bootstrap,
+            lr_patience=args.lr_patience,
+            lr_reset_factor=args.lr_reset_factor,
             debug=args.debug,
         )
-    elif args.mode == "eval":
-        evaluate_model(model)
-    elif args.mode == "crunch":
-        if not os.path.exists(args.load_model):
-            parser.error(
-                "--load_model must point to an existing model file when using crunch mode"
-            )
-        os.makedirs(args.output_dir, exist_ok=True)
-        model.crunch(args.load_model, args.output_dir)

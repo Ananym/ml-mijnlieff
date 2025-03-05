@@ -109,48 +109,71 @@ class MCTSNode:
 
 
 class MCTS:
-    """Monte Carlo Tree Search implementation with neural network policy guidance"""
+    """Monte Carlo Tree Search implementation that can work with or without neural network policy guidance"""
 
-    def __init__(self, model, num_simulations=100, c_puct=1.0, bootstrap_weight=0.5):
-        self.model = model  # Neural network model
+    def __init__(
+        self, model=None, num_simulations=100, c_puct=1.0, bootstrap_weight=0.5
+    ):
+        self.model = model  # Neural network model (optional)
         self.num_simulations = num_simulations  # Number of simulations per search
         self.c_puct = c_puct  # Exploration constant
         self.temperature = 1.0  # Temperature for move selection
         self.bootstrap_weight = bootstrap_weight  # Weight for value bootstrapping
+
+    def _rollout(self, state: GameState) -> float:
+        """Perform a random rollout from the given state until game end"""
+        state = clone_game_state(state)
+
+        while not state.is_over:
+            legal_moves = state.get_legal_moves()
+            if not np.any(legal_moves):
+                state.pass_turn()
+                continue
+
+            # Get all legal move positions
+            legal_positions = np.argwhere(legal_moves)
+            # Choose random move
+            idx = rng.integers(len(legal_positions))
+            x, y, piece_type = legal_positions[idx]
+            move = Move(x, y, PieceType(piece_type))
+
+            state.make_move(move)
+
+        # Return game outcome from perspective of original player
+        return self._get_game_value(state, state.current_player)
 
     def search(self, game_state: GameState) -> np.ndarray:
         """Perform MCTS search from given state and return move probabilities"""
         # Create root node
         root = MCTSNode(clone_game_state(game_state))
 
-        # Initialize root node's predicted value
-        state_rep = root.game_state.get_game_state_representation()
-        _, value_pred = self.model.predict(state_rep.board, state_rep.flat_values)
-        root.predicted_value = value_pred.squeeze()
+        # Initialize root node's predicted value if model exists
+        if self.model is not None:
+            state_rep = root.game_state.get_game_state_representation()
+            _, value_pred = self.model.predict(state_rep.board, state_rep.flat_values)
+            root.predicted_value = value_pred.squeeze()
 
-        # Add Dirichlet noise to root node for more exploration
-        legal_moves = root.game_state.get_legal_moves()
-        policy, _ = self.model.predict(
-            state_rep.board, state_rep.flat_values, legal_moves
-        )
-        policy = policy.squeeze(0)
+            # Get policy from model for root node
+            legal_moves = root.game_state.get_legal_moves()
+            policy, _ = self.model.predict(
+                state_rep.board, state_rep.flat_values, legal_moves
+            )
+            policy = policy.squeeze(0)
 
-        # Create a flattened version of legal moves and policy for easier handling
-        legal_flat = legal_moves.flatten()
-        policy_flat = policy.flatten()
-        legal_indices = np.where(legal_flat > 0)[0]
+            # Add Dirichlet noise to root policy for exploration
+            legal_flat = legal_moves.flatten()
+            policy_flat = policy.flatten()
+            legal_indices = np.where(legal_flat > 0)[0]
 
-        # Only add noise if we're at the root and have legal moves
-        if len(legal_indices) > 0:
-            # Create Dirichlet noise for exploration (smaller alpha = more concentrated)
-            noise = np.random.dirichlet([0.3] * len(legal_indices))
-
-            # Mix noise with policy (80% policy, 20% noise)
-            for i, idx in enumerate(legal_indices):
-                policy_flat[idx] = 0.8 * policy_flat[idx] + 0.2 * noise[i]
-
-            # Reshape back to original shape
-            policy = policy_flat.reshape(policy.shape)
+            if len(legal_indices) > 0:
+                noise = np.random.dirichlet([0.3] * len(legal_indices))
+                for i, idx in enumerate(legal_indices):
+                    policy_flat[idx] = 0.8 * policy_flat[idx] + 0.2 * noise[i]
+                policy = policy_flat.reshape(policy.shape)
+        else:
+            # If no model, use uniform policy over legal moves
+            legal_moves = root.game_state.get_legal_moves()
+            policy = legal_moves / (np.sum(legal_moves) + 1e-8)
 
         # Run simulations
         for _ in range(self.num_simulations):
@@ -162,31 +185,29 @@ class MCTS:
 
             # If node is terminal, use its game outcome for backpropagation
             if node.is_terminal():
-                # Use correct perspective for value
-                value = self._get_game_value(
-                    node.game_state, node.game_state.current_player
-                )
+                value = self._get_game_value(node.game_state, game_state.current_player)
             else:
-                # EXPANSION: use policy network to expand node
-                state_rep = node.game_state.get_game_state_representation()
-                legal_moves = node.game_state.get_legal_moves()
+                # EXPANSION: use policy network or uniform policy to expand node
+                if self.model is not None:
+                    # Use model for policy and value
+                    state_rep = node.game_state.get_game_state_representation()
+                    legal_moves = node.game_state.get_legal_moves()
+                    policy, value_pred = self.model.predict(
+                        state_rep.board, state_rep.flat_values, legal_moves
+                    )
+                    policy = policy.squeeze(0)
+                    value = value_pred.squeeze()
+                    node.predicted_value = value
+                else:
+                    # Use uniform policy and rollout for value
+                    legal_moves = node.game_state.get_legal_moves()
+                    policy = legal_moves / (np.sum(legal_moves) + 1e-8)
+                    value = self._rollout(node.game_state)
 
-                # Get policy and value from neural network
-                policy, value_pred = self.model.predict(
-                    state_rep.board, state_rep.flat_values, legal_moves
-                )
-
-                # Remove batch dimension
-                policy = policy.squeeze(0)
-                value = value_pred.squeeze()
-
-                # Store the predicted value for bootstrapping
-                node.predicted_value = value
-
-                # If we're not at a terminal node, expand it
+                # Expand node with chosen policy
                 node.expand(policy)
 
-                # For non-terminal leaf nodes, use neural network value
+                # Update node with obtained value
                 node.update(value)
                 continue
 

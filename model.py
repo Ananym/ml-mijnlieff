@@ -118,7 +118,7 @@ class ModelWrapper:
             self.lr = 0.0001  # Significantly increased from 0.000005
             print("Using stable training mode (lr=0.0001) - good for final training")
         elif self.mode == "custom_lr":
-            self.lr = 0.00001  # Very low, stable learning rate
+            self.lr = 0.0001  # Very low, stable learning rate
             print(f"Using custom learning rate: {self.lr}")
         else:
             raise ValueError(

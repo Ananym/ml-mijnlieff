@@ -21,7 +21,7 @@ DEFAULT_MCTS_SIMS = 100
 DEFAULT_MCTS_RATIO = 0.3
 # Strategic ratio is the percentage of games that use the strategic opponent
 # Strategic opponent is defined using algorithmic heuristics
-DEFAULT_STRATEGIC_RATIO = 0.0
+DEFAULT_STRATEGIC_RATIO = 0.4
 DEFAULT_RANDOM_RATIO = 0.3
 DEFAULT_BUFFER_SIZE = 2000
 DEFAULT_POLICY_WEIGHT = 1.0  # FIXED: Increased from 0.5 to balance policy and value
@@ -106,37 +106,6 @@ def hybrid_training_loop(
     # Keep track of last N checkpoints
     checkpoint_files = []
 
-    # Too complex for now, simplifying
-    # def get_adjusted_value(
-    #     game: GameState,
-    #     winner: Optional[Player],
-    #     move_count: int,
-    #     current_player: Player,
-    # ) -> float:
-    #     """Get value target from current player's perspective based on score difference"""
-    #     # Base win/loss/draw signal
-    #     if winner is None:  # Draw
-    #         return 0.0
-    #     elif winner == current_player:  # Win
-    #         base_value = 1.0
-    #     else:  # Loss
-    #         base_value = -1.0
-
-    #     # Add small score bonus
-    #     score_one = game._calculate_score(Player.ONE)
-    #     score_two = game._calculate_score(Player.TWO)
-
-    #     score_diff = (
-    #         score_one - score_two
-    #         if current_player == Player.ONE
-    #         else score_two - score_one
-    #     )
-
-    #     # Small bonus based on score difference (max 0.5)
-    #     score_bonus = 0.1 * max(-0.5, min(0.5, score_diff / 5.0))
-
-    #     return base_value + score_bonus
-
     def get_adjusted_value(game, winner, move_count, current_player):
         # Simplify to clear win/loss/draw signals without the score bonus
         if winner is None:  # Draw
@@ -146,6 +115,22 @@ def hybrid_training_loop(
         else:  # Loss
             return -1.0
 
+    def create_opponent_example(game, move, opponent_type):
+        """Create a training example from an opponent's move"""
+        state_rep = game.get_game_state_representation()
+        legal_moves = game.get_legal_moves()
+
+        # Create one-hot encoded policy for the opponent's move
+        policy_target = np.zeros_like(legal_moves)
+        policy_target[move.x, move.y, move.piece_type.value] = 1.0
+
+        return TrainingExample(
+            state_rep=state_rep,
+            policy=policy_target,
+            value=0.0,  # Will be filled in later
+            current_player=game.current_player,
+        )
+
     # Helper function to get model's move, either via MCTS or direct policy
     def get_model_move_for_play(game, use_mcts=False, temperature=1.0):
         """Get a move from the model for gameplay (returns the move and one-hot policy)"""
@@ -153,15 +138,13 @@ def hybrid_training_loop(
         state_rep = game.get_game_state_representation()
 
         if use_mcts:
-            # Use MCTS for move selection
-            mcts = MCTS(
-                model, num_simulations=mcts_sim_count, bootstrap_weight=bootstrap_weight
-            )
+            # Use pure rollout MCTS for move selection (no model)
+            mcts = MCTS(num_simulations=mcts_sim_count)
             mcts.set_temperature(temperature)
             mcts_policy, root_node = mcts.search(game)
             policy = mcts_policy
-            # Store root node for potential use in bootstrapping
-            root_value = root_node.predicted_value
+            # No predicted value in pure rollout mode
+            root_value = 0.0
         else:
             # Use direct policy from neural network
             policy, value_pred = model.predict(
@@ -199,22 +182,20 @@ def hybrid_training_loop(
         state_rep = game.get_game_state_representation()
 
         if use_mcts:
-            # Use MCTS for move selection
+            # Use pure rollout MCTS for move selection (no model)
             mcts = MCTS(
-                model,
                 num_simulations=mcts_sim_count,
-                bootstrap_weight=bootstrap_weight,
                 c_puct=1.0,
             )
             mcts.set_temperature(temperature)
             mcts_policy, root_node = mcts.search(game)
             policy = mcts_policy
 
-            # Use full MCTS distribution as policy target when MCTS is used (AlphaZero style)
+            # Use full MCTS distribution as policy target when MCTS is used
             policy_target = mcts_policy.copy()
 
-            # Store root node for potential use in bootstrapping
-            root_value = root_node.predicted_value
+            # No predicted value in pure rollout mode
+            root_value = 0.0
         else:
             # Use direct policy from neural network
             policy, value_pred = model.predict(
@@ -383,6 +364,14 @@ def hybrid_training_loop(
                         if move is None:
                             game.pass_turn()
                             continue
+
+                        # Only store examples from strategic opponent (random moves aren't useful to learn from)
+                        if opponent_type == "strategic":
+                            # Create and store example from opponent's move
+                            opponent_example = create_opponent_example(
+                                game, move, opponent_type
+                            )
+                            examples.append(opponent_example)
 
                     # Make move
                     result = game.make_move(move)
@@ -833,7 +822,7 @@ def evaluate_model(
 
         # If using MCTS, run search to get improved policy
         if use_mcts:
-            mcts = MCTS(model, num_simulations=mcts_sims)
+            mcts = MCTS(num_simulations=mcts_sims)  # Pure rollout mode
             mcts_policy, _ = mcts.search(game)
             policy = mcts_policy
         else:

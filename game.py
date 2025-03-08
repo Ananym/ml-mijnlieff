@@ -71,14 +71,8 @@ class GameState:
         self.terrain: NDArray[np.int8] = np.zeros((4, 4, 4), dtype=np.int8)
         self.current_player = Player.ONE
         self.piece_counts: Dict[Player, Dict[PieceType, int]] = {
-            Player.ONE: {
-                pt: 2
-                for pt in PieceType
-            },
-            Player.TWO: {
-                pt: 2
-                for pt in PieceType
-            },
+            Player.ONE: {pt: 2 for pt in PieceType},
+            Player.TWO: {pt: 2 for pt in PieceType},
         }
         self.last_move: Optional[Move] = None
         self.is_over = False
@@ -97,12 +91,15 @@ class GameState:
         if self.verbose_output:
             self.print_move_info(move)
 
-        self_has_pieces = any(self.piece_counts[self.current_player][pt] > 0
-                              for pt in PieceType)
-        self.current_player = (Player.ONE if self.current_player == Player.TWO
-                               else Player.TWO)
-        opp_has_pieces = any(self.piece_counts[self.current_player][pt] > 0
-                             for pt in PieceType)
+        self_has_pieces = any(
+            self.piece_counts[self.current_player][pt] > 0 for pt in PieceType
+        )
+        self.current_player = (
+            Player.ONE if self.current_player == Player.TWO else Player.TWO
+        )
+        opp_has_pieces = any(
+            self.piece_counts[self.current_player][pt] > 0 for pt in PieceType
+        )
         opp_legal_moves = self.get_legal_moves()
         opp_must_pass = False
         if np.all(opp_legal_moves[:, :, :] == 0):
@@ -137,9 +134,9 @@ class GameState:
 
         piece_is_on_board = (0 <= x < 4) and (0 <= y < 4)
         piece_is_available = (
-            self.piece_counts[self.current_player][PieceType(piece_type)] > 0)
-        cell_is_not_empty = (self.board[x, y, 0] == 0) and (self.board[x, y, 1]
-                                                            == 0)
+            self.piece_counts[self.current_player][PieceType(piece_type)] > 0
+        )
+        cell_is_not_empty = (self.board[x, y, 0] == 0) and (self.board[x, y, 1] == 0)
 
         validAndEmpty = piece_is_on_board and piece_is_available and cell_is_not_empty
 
@@ -169,15 +166,16 @@ class GameState:
 
     def check_game_over(self) -> bool:
         return all(
-            count == 0
-            for count in self.piece_counts[self.current_player].values())
+            count == 0 for count in self.piece_counts[self.current_player].values()
+        )
 
     def pass_turn(self):
         self.last_move = None
         if self.verbose_output:
             print("Passing the turn of " + self.current_player.name)
-        self.current_player = (Player.ONE if self.current_player == Player.TWO
-                               else Player.TWO)
+        self.current_player = (
+            Player.ONE if self.current_player == Player.TWO else Player.TWO
+        )
 
     def get_winner(self) -> Optional[Player]:
         score_one = self._calculate_score(Player.ONE)
@@ -203,8 +201,7 @@ class GameState:
         for x in range(0, 4):
             for y in range(0, 4):
                 for delta in ((1, 0), (0, 1), (1, 1), (-1, 1)):
-                    if get_value_or_none(board,
-                                         (x - delta[0], y - delta[1])) == 1:
+                    if get_value_or_none(board, (x - delta[0], y - delta[1])) == 1:
                         # previous cell in line is occupied, so this is part of an existing line, skip
                         continue
                     lineLength = 0
@@ -249,10 +246,9 @@ class GameState:
         legal_moves = np.zeros((4, 4, 4), dtype=np.int64)
 
         # Check piece availability for each type
-        available_pieces = np.array([
-            self.piece_counts[self.current_player][PieceType(i)] > 0
-            for i in range(4)
-        ])
+        available_pieces = np.array(
+            [self.piece_counts[self.current_player][PieceType(i)] > 0 for i in range(4)]
+        )
 
         # If no pieces are available, return all zeros
         if not np.any(available_pieces):
@@ -278,21 +274,20 @@ class GameState:
                 self.last_move.piece_type,
             )
 
-            x_coords, y_coords = np.meshgrid(np.arange(4),
-                                             np.arange(4),
-                                             indexing="ij")
+            x_coords, y_coords = np.meshgrid(np.arange(4), np.arange(4), indexing="ij")
 
             if last_piece_type == PieceType.DIAG:
-                valid_cells = np.abs(x_coords - last_x) == np.abs(y_coords -
-                                                                  last_y)
+                valid_cells = np.abs(x_coords - last_x) == np.abs(y_coords - last_y)
             elif last_piece_type == PieceType.ORTHO:
                 valid_cells = (x_coords == last_x) | (y_coords == last_y)
             elif last_piece_type == PieceType.NEAR:
-                valid_cells = (np.abs(x_coords - last_x)
-                               <= 1) & (np.abs(y_coords - last_y) <= 1)
+                valid_cells = (np.abs(x_coords - last_x) <= 1) & (
+                    np.abs(y_coords - last_y) <= 1
+                )
             elif last_piece_type == PieceType.FAR:
-                valid_cells = (np.abs(x_coords - last_x)
-                               >= 2) | (np.abs(y_coords - last_y) >= 2)
+                valid_cells = (np.abs(x_coords - last_x) >= 2) | (
+                    np.abs(y_coords - last_y) >= 2
+                )
 
             for piece_type in range(4):
                 if available_pieces[piece_type]:
@@ -311,8 +306,9 @@ class GameState:
 
         move_representation = np.zeros((4, 4, 4))
         if self.last_move is not None:
-            move_representation[(self.last_move.x, self.last_move.y,
-                                 self.last_move.piece_type.value)] = 1
+            move_representation[
+                (self.last_move.x, self.last_move.y, self.last_move.piece_type.value)
+            ] = 1
 
         representation[:, :, 2:6] = move_representation
         representation[:, :, 6:10] = self.terrain
@@ -320,18 +316,20 @@ class GameState:
         return representation
 
     def get_pieces_state_representation(self) -> np.ndarray:
-        return np.array([
-            1 if self.current_player == Player.ONE else 0,
-            1 if self.current_player == Player.TWO else 0,
-            self.piece_counts[Player.ONE][PieceType.DIAG],
-            self.piece_counts[Player.ONE][PieceType.ORTHO],
-            self.piece_counts[Player.ONE][PieceType.NEAR],
-            self.piece_counts[Player.ONE][PieceType.FAR],
-            self.piece_counts[Player.TWO][PieceType.DIAG],
-            self.piece_counts[Player.TWO][PieceType.ORTHO],
-            self.piece_counts[Player.TWO][PieceType.NEAR],
-            self.piece_counts[Player.TWO][PieceType.FAR],
-        ])
+        return np.array(
+            [
+                1 if self.current_player == Player.ONE else 0,
+                1 if self.current_player == Player.TWO else 0,
+                self.piece_counts[Player.ONE][PieceType.DIAG],
+                self.piece_counts[Player.ONE][PieceType.ORTHO],
+                self.piece_counts[Player.ONE][PieceType.NEAR],
+                self.piece_counts[Player.ONE][PieceType.FAR],
+                self.piece_counts[Player.TWO][PieceType.DIAG],
+                self.piece_counts[Player.TWO][PieceType.ORTHO],
+                self.piece_counts[Player.TWO][PieceType.NEAR],
+                self.piece_counts[Player.TWO][PieceType.FAR],
+            ]
+        )
 
     def get_game_state_representation(self) -> GameStateRepresentation:
         return GameStateRepresentation(
@@ -339,23 +337,7 @@ class GameState:
             flat_values=self.get_pieces_state_representation(),
         )
 
-    # def get_possible_next_states(self) -> List[PossibleFutureGameStateRepresentation]:
-    #     # start = perf_counter()
-    #     next_states = []
-    #     legal_moves = self.get_legal_moves()
-    #     for index in np.argwhere(legal_moves):
-    #         move = Move(index[0], index[1], PieceType(index[2]))
-    #         copied_state = copy.deepcopy(self)
-    #         copied_state.make_move(move)
-    #         possible_state_package = PossibleFutureGameStateRepresentation(
-    #             copied_state.get_game_state_representation(), move
-    #         )
-    #         next_states.append(possible_state_package)
-    #     # end = perf_counter() - start
-    #     # print(f"Time to get possible next states: {end:.2f}s")
-    #     return next_states
-    def get_possible_next_states(
-            self) -> List[PossibleFutureGameStateRepresentation]:
+    def get_possible_next_states(self) -> List[PossibleFutureGameStateRepresentation]:
         next_states = []
         legal_moves = self.get_legal_moves()
         for index in np.argwhere(legal_moves):
@@ -371,7 +353,8 @@ class GameState:
             }
             new_state.make_move(move)
             possible_state_package = PossibleFutureGameStateRepresentation(
-                new_state.get_game_state_representation(), move)
+                new_state.get_game_state_representation(), move
+            )
             next_states.append(possible_state_package)
         return next_states
 
@@ -405,21 +388,6 @@ def print_piece_counts(piece_counts):
     for player in [Player.ONE, Player.TWO]:
         for piece_type in PieceType:
             print(f"{piece_type.name}: {piece_counts[player][piece_type]}")
-
-
-def score_position(board_layer):
-    score = 0
-    # Count pieces in strategic positions (corners, edges)
-    score += np.sum(board_layer[0:4:3, 0:4:3]) * 0.5  # Corners
-    score += np.sum(board_layer[1:3, 0:4:3]) * 0.3  # Edge centers
-
-    # Count potential lines
-    for i in range(4):
-        # Horizontal/vertical lines
-        score += 0.2 * (np.sum(board_layer[i, :]) == 2)
-        score += 0.2 * (np.sum(board_layer[:, i]) == 2)
-
-    return score
 
 
 # Bonus rules

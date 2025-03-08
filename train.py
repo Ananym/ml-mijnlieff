@@ -11,25 +11,36 @@ from model import ModelWrapper
 from tqdm import tqdm
 from opponents import RandomOpponent, StrategicOpponent
 from mcts import MCTS, mcts_self_play_game
+import random
 
 # Training parameters
-DEFAULT_EPISODES = 100
-DEFAULT_BATCH_SIZE = 512
-DEFAULT_SAVE_INTERVAL = 50
-DEFAULT_NUM_CHECKPOINTS = 3
-DEFAULT_MCTS_SIMS = 100
-DEFAULT_MCTS_RATIO = 0.3
+DEFAULT_EPISODES = 60
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_SAVE_INTERVAL = 10
+DEFAULT_NUM_CHECKPOINTS = 5
+DEFAULT_MCTS_SIMS = 400
+DEFAULT_MCTS_RATIO = 0.5
 # Strategic ratio is the percentage of games that use the strategic opponent
 # Strategic opponent is defined using algorithmic heuristics
-DEFAULT_STRATEGIC_RATIO = 0.4
-DEFAULT_RANDOM_RATIO = 0.3
-DEFAULT_BUFFER_SIZE = 2000
-DEFAULT_POLICY_WEIGHT = 1.0  # FIXED: Increased from 0.5 to balance policy and value
-DEFAULT_BOOTSTRAP_WEIGHT = 0.3
-DEFAULT_NUM_EPOCHS = 80
+DEFAULT_BUFFER_SIZE = 6000
+DEFAULT_POLICY_WEIGHT = 1.0
+DEFAULT_NUM_EPOCHS = 10
 DEFAULT_LR_PATIENCE = 8
 DEFAULT_STAGNATION_THRESHOLD = 0.01
 DEFAULT_LR_RESET_FACTOR = 5.0
+
+# Opponent ratio scheduling constants
+INITIAL_RANDOM_OPPONENT_RATIO = 0.8  # Start with high random opponent exposure
+FINAL_RANDOM_OPPONENT_RATIO = 0.2  # Phase out to minimal random exposure
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.1  # Start with low strategic opponent exposure
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.7  # Increase strategic opponents over time
+OPPONENT_TRANSITION_ITERATIONS = 150  # Complete transition over 50 iterations
+
+# Add to constants at top of file
+BOOTSTRAP_MIN_WEIGHT = 0.1  # Much lower starting point
+BOOTSTRAP_MAX_WEIGHT = 0.3  # Lower maximum
+BOOTSTRAP_TRANSITION_ITERATIONS = 100  # Slower transition
+DIAGNOSTIC_INTERVAL = 5  # Print detailed diagnostics every N iterations
 
 
 @dataclass
@@ -38,28 +49,31 @@ class TrainingExample:
     policy: np.ndarray  # One-hot encoded actual move made
     value: float  # Game outcome from current player's perspective
     current_player: Player  # Store which player made the move
+    mcts_value: float = None  # Optional MCTS value prediction
 
 
 def hybrid_training_loop(
     model: ModelWrapper,
     num_episodes: int = DEFAULT_EPISODES,
+    num_epochs: int = DEFAULT_NUM_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    buffer_size: int = DEFAULT_BUFFER_SIZE,
+    mcts_sim_count: int = DEFAULT_MCTS_SIMS,
+    mcts_game_ratio: float = DEFAULT_MCTS_RATIO,
+    bootstrap_weight: float = DEFAULT_BOOTSTRAP_WEIGHT,
+    policy_weight: float = DEFAULT_POLICY_WEIGHT,
+    initial_random_ratio: float = INITIAL_RANDOM_OPPONENT_RATIO,
+    final_random_ratio: float = FINAL_RANDOM_OPPONENT_RATIO,
+    initial_strategic_ratio: float = INITIAL_STRATEGIC_OPPONENT_RATIO,
+    final_strategic_ratio: float = FINAL_STRATEGIC_OPPONENT_RATIO,
+    transition_iterations: int = OPPONENT_TRANSITION_ITERATIONS,
     save_interval: int = DEFAULT_SAVE_INTERVAL,
     num_checkpoints: int = DEFAULT_NUM_CHECKPOINTS,
-    mcts_sim_count: int = DEFAULT_MCTS_SIMS,  # MCTS simulations per move
-    mcts_game_ratio: float = DEFAULT_MCTS_RATIO,  # Percentage of model moves that use MCTS
-    strategic_opponent_ratio: float = DEFAULT_STRATEGIC_RATIO,  # Percentage of strategic games
-    random_opponent_ratio: float = DEFAULT_RANDOM_RATIO,  # Percentage of random opponents
-    buffer_size: int = DEFAULT_BUFFER_SIZE,
-    policy_weight: float = DEFAULT_POLICY_WEIGHT,  # Weight for policy loss
-    bootstrap_weight: float = DEFAULT_BOOTSTRAP_WEIGHT,  # Weight for value bootstrapping
-    num_epochs: int = DEFAULT_NUM_EPOCHS,
-    lr_patience: int = DEFAULT_LR_PATIENCE,  # Patience for learning rate scheduler
-    loss_stagnation_threshold: float = DEFAULT_STAGNATION_THRESHOLD,  # Threshold to detect stuck training
-    lr_reset_factor: float = DEFAULT_LR_RESET_FACTOR,  # Multiply base LR by this when resetting
     debug: bool = False,
 ):
-    """Training loop that combines MCTS-guided self-play with opponent play and value bootstrapping"""
+    """Training loop that combines supervised learning from expert demonstrations
+    and reinforcement learning through self-play.
+    """
     # Initialize random number generator
     rng = np.random.Generator(np.random.PCG64())
 
@@ -107,13 +121,44 @@ def hybrid_training_loop(
     checkpoint_files = []
 
     def get_adjusted_value(game, winner, move_count, current_player):
-        # Simplify to clear win/loss/draw signals without the score bonus
+        """Get time-aware value that incorporates score difference"""
+        # Constants
+        AVG_GAME_LENGTH = 15.0
+        MIN_VALUE_SCALE = 0.4  # Minimum scaling for early moves
+        SCORE_WEIGHT = 0.3  # How much to weigh score difference vs win/loss
+
+        # Calculate how far into the game we are
+        progress = min(1.0, move_count / AVG_GAME_LENGTH)
+
+        # Calculate base scale based on game progression
+        value_scale = MIN_VALUE_SCALE + (1.0 - MIN_VALUE_SCALE) * progress
+
+        # Get scores for both players
+        p1_score = game.scores[Player.ONE]
+        p2_score = game.scores[Player.TWO]
+
+        # Calculate normalized score difference from current player's perspective
+        if current_player == Player.ONE:
+            score_diff = (p1_score - p2_score) / max(1, p1_score + p2_score)
+        else:
+            score_diff = (p2_score - p1_score) / max(1, p1_score + p2_score)
+
+        # Blend win/loss signal with score difference
         if winner is None:  # Draw
-            return 0.0
+            # Use pure score difference for draws
+            return score_diff * value_scale
         elif winner == current_player:  # Win
-            return 1.0
+            # Win plus score advantage
+            outcome_value = value_scale
+            return (
+                1 - SCORE_WEIGHT
+            ) * outcome_value + SCORE_WEIGHT * score_diff * value_scale
         else:  # Loss
-            return -1.0
+            # Loss plus score disadvantage
+            outcome_value = -value_scale
+            return (
+                1 - SCORE_WEIGHT
+            ) * outcome_value + SCORE_WEIGHT * score_diff * value_scale
 
     def create_opponent_example(game, move, opponent_type):
         """Create a training example from an opponent's move"""
@@ -175,15 +220,32 @@ def hybrid_training_loop(
 
         return move, policy_target, root_value, state_rep
 
-    def get_model_move_with_policy(game, use_mcts=False, temperature=1.0):
+    def get_temperature(move_count, iteration):
+        """Dynamic temperature that encourages exploration early and exploitation later"""
+        # More exploration in early moves
+        if move_count < 4:
+            base_temp = 1.5
+        elif move_count < 8:
+            base_temp = 1.2
+        elif move_count < 12:
+            base_temp = 1.0
+        else:
+            base_temp = 0.8
+
+        # More exploration in early training iterations
+        iteration_factor = max(0.5, 1.0 - (iteration / 50))
+        return base_temp * iteration_factor
+
+    def get_model_move_with_policy(game, use_mcts=True, temperature=1.0):
         """Get a move from the model along with the training policy target
         (full MCTS distribution if MCTS was used, otherwise one-hot)"""
         legal_moves = game.get_legal_moves()
         state_rep = game.get_game_state_representation()
 
         if use_mcts:
-            # Use pure rollout MCTS for move selection (no model)
+            # Use model-guided MCTS (AlphaZero style) instead of pure rollouts
             mcts = MCTS(
+                model=model,  # Pass the model to guide search
                 num_simulations=mcts_sim_count,
                 c_puct=1.0,
             )
@@ -194,8 +256,12 @@ def hybrid_training_loop(
             # Use full MCTS distribution as policy target when MCTS is used
             policy_target = mcts_policy.copy()
 
-            # No predicted value in pure rollout mode
-            root_value = 0.0
+            # Get value prediction from root node
+            root_value = (
+                root_node.predicted_value
+                if root_node.predicted_value is not None
+                else 0.0
+            )
         else:
             # Use direct policy from neural network
             policy, value_pred = model.predict(
@@ -240,6 +306,12 @@ def hybrid_training_loop(
 
         move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
 
+        # Add small Dirichlet noise to root node policy for exploration
+        if game.current_player == Player.ONE:  # Only add noise as P1 for consistency
+            noise = np.random.dirichlet([0.3] * len(policy_flat), size=1)[0]
+            policy_flat = 0.9 * policy_flat + 0.1 * noise  # 10% noise
+            policy_flat /= np.sum(policy_flat)  # Renormalize
+
         return move, policy_target, root_value, state_rep
 
     # Set up signal handler for graceful interruption
@@ -255,19 +327,60 @@ def hybrid_training_loop(
 
     signal.signal(signal.SIGINT, handle_interrupt)
 
+    # Function to update opponent ratios based on current iteration
+    def get_opponent_ratios(iteration):
+        progress = min(1.0, iteration / transition_iterations)
+
+        # Linear interpolation between initial and final values
+        random_ratio = initial_random_ratio + progress * (
+            final_random_ratio - initial_random_ratio
+        )
+        strategic_ratio = initial_strategic_ratio + progress * (
+            final_strategic_ratio - initial_strategic_ratio
+        )
+
+        # Ensure self-play ratio is always positive by capping total opponent ratio
+        total_opponent_ratio = random_ratio + strategic_ratio
+        if total_opponent_ratio > 0.9:
+            # Scale down both to keep relative proportions but cap total
+            scale = 0.9 / total_opponent_ratio
+            random_ratio *= scale
+            strategic_ratio *= scale
+
+        return random_ratio, strategic_ratio
+
+    # Initialize opponent ratios for first iteration
+    random_opponent_ratio, strategic_opponent_ratio = get_opponent_ratios(iteration)
+
+    # Add function to calculate bootstrap weight based on iteration
+    def get_bootstrap_weight(iteration):
+        """Start with lower bootstrapping and increase gradually"""
+        progress = min(1.0, iteration / BOOTSTRAP_TRANSITION_ITERATIONS)
+        return BOOTSTRAP_MIN_WEIGHT + progress * (
+            BOOTSTRAP_MAX_WEIGHT - BOOTSTRAP_MIN_WEIGHT
+        )
+
     print("Starting hybrid training loop with value bootstrapping")
     print("Episodes per iteration:", num_episodes)
     print("MCTS simulations per move:", mcts_sim_count)
     print("MCTS move ratio: {:.1%}".format(mcts_game_ratio))
-    print("Strategic opponent ratio: {:.1%}".format(strategic_opponent_ratio))
-    print("Random opponent ratio: {:.1%}".format(random_opponent_ratio))
+    print("Initial opponent ratios:")
+    print("  Random: {:.1%}".format(random_opponent_ratio))
+    print("  Strategic: {:.1%}".format(strategic_opponent_ratio))
     print(
-        "Self-play ratio: {:.1%}".format(
-            1.0 - strategic_opponent_ratio - random_opponent_ratio
+        "  Self-play: {:.1%}".format(
+            1.0 - random_opponent_ratio - strategic_opponent_ratio
         )
     )
+    print("Final opponent ratios after {} iterations:".format(transition_iterations))
+    print("  Random: {:.1%}".format(final_random_ratio))
+    print("  Strategic: {:.1%}".format(final_strategic_ratio))
+    print(
+        "  Self-play: {:.1%}".format(1.0 - final_random_ratio - final_strategic_ratio)
+    )
     print("Using AlphaZero-style MCTS policy targets for better learning")
-    print("Value bootstrapping weight: {:.2f}".format(bootstrap_weight))
+    print("Initial bootstrap weight: {:.2f}".format(get_bootstrap_weight(iteration)))
+    print("Final bootstrap weight: {:.2f}".format(BOOTSTRAP_MAX_WEIGHT))
     print("Batch size:", batch_size)
     print("Replay buffer size:", buffer_size)
     print("Policy weight: {:.1f}".format(policy_weight))
@@ -278,11 +391,16 @@ def hybrid_training_loop(
             iteration += 1
             iteration_start = time.time()
 
+            # Update opponent ratios based on current iteration
+            random_opponent_ratio, strategic_opponent_ratio = get_opponent_ratios(
+                iteration
+            )
+
+            # Update bootstrap weight based on current iteration
+            bootstrap_weight = get_bootstrap_weight(iteration)
+
             # Reset iteration stats
             iter_stats = stats_template.copy()
-
-            # Temporary buffer for this iteration to check outcome balance
-            iter_examples = []
 
             # Create progress bar for all games
             episode_pbar = tqdm(
@@ -338,26 +456,28 @@ def hybrid_training_loop(
                             iter_stats["direct_moves"] += 1
 
                         # Use temperature based on move count
-                        # temperature = 1.0 if move_count < 10 else 0.5
-                        # Use a higher, fixed temperature for more moves
-                        temperature = 1.2
+                        temperature = get_temperature(move_count, iteration)
 
-                        # Get model's move with AlphaZero-style policy (full MCTS distribution when MCTS is used)
+                        # Get model's move with AlphaZero-style policy
                         move, policy_target, value_pred, state_rep = (
                             get_model_move_with_policy(
                                 game, use_mcts=use_mcts, temperature=temperature
                             )
                         )
 
-                        # Store the example with value prediction
-                        examples.append(
-                            TrainingExample(
-                                state_rep=state_rep,
-                                policy=policy_target,
-                                value=0.0,  # Will be filled in later
-                                current_player=game.current_player,
+                        # When storing examples after MCTS-based moves
+                        if use_mcts:
+                            # Root node value is already available from MCTS search
+                            # Store it with the example for later use
+                            examples.append(
+                                TrainingExample(
+                                    state_rep=state_rep,
+                                    policy=policy_target,
+                                    value=0.0,  # Will be filled in later
+                                    current_player=game.current_player,
+                                    mcts_value=value_pred,  # Store the MCTS value prediction
+                                )
                             )
-                        )
                     else:
                         # Opponent's turn
                         move = opponent.get_move(game)
@@ -365,7 +485,7 @@ def hybrid_training_loop(
                             game.pass_turn()
                             continue
 
-                        # Only store examples from strategic opponent (random moves aren't useful to learn from)
+                        # Only store examples from strategic opponent
                         if opponent_type == "strategic":
                             # Create and store example from opponent's move
                             opponent_example = create_opponent_example(
@@ -388,8 +508,16 @@ def hybrid_training_loop(
                                 game, winner, move_count, example.current_player
                             )
 
-                            # Apply bootstrapping for all but the last move
-                            if i < len(examples) - 1:
+                            # If this move used MCTS and we have an MCTS value, use improved target
+                            if (
+                                hasattr(example, "mcts_value")
+                                and example.mcts_value is not None
+                            ):
+                                example.value = get_improved_value_target(
+                                    outcome_value, example.mcts_value, i
+                                )
+                            else:
+                                # For non-MCTS moves, use standard bootstrapping
                                 # The next player made a move, so get their perspective's value prediction
                                 next_example = examples[i + 1]
                                 next_state_rep = next_example.state_rep
@@ -407,18 +535,13 @@ def hybrid_training_loop(
                                     (1 - bootstrap_weight) * outcome_value
                                     + bootstrap_weight * bootstrap_value
                                 )
-                            else:
-                                # Last move uses pure outcome
-                                example.value = outcome_value
 
-                            # Track win/loss/draw examples in stats
-                            if (
-                                outcome_value > 0.2
-                            ):  # Counting as a win (allowing for score bonus)
+                            # Update stats
+                            if outcome_value > 0.2:
                                 iter_stats["win_examples"] += 1
-                            elif outcome_value < -0.2:  # Counting as a loss
+                            elif outcome_value < -0.2:
                                 iter_stats["loss_examples"] += 1
-                            else:  # Draw or very close game
+                            else:
                                 iter_stats["draw_examples"] += 1
 
                         # Update game statistics
@@ -451,17 +574,7 @@ def hybrid_training_loop(
                         break  # Game over
 
                 # Add examples to this iteration's buffer
-                iter_examples.extend(examples)
-
-                # Replay buffer statistics
-                mcts_examples = 0
-                direct_examples = 0
-                for example in examples:  # Check just these examples
-                    # If policy is one-hot encoded, it's from direct policy, otherwise from MCTS
-                    if np.sum(example.policy) == 1.0 and np.max(example.policy) == 1.0:
-                        direct_examples += 1
-                    else:
-                        mcts_examples += 1
+                replay_buffer.extend(examples)
 
                 # Update progress bar
                 episode_pbar.update(1)
@@ -470,83 +583,25 @@ def hybrid_training_loop(
                         "wins": iter_stats["win_examples"],
                         "losses": iter_stats["loss_examples"],
                         "type": opponent_type,
-                        "mcts_ratio": f"{iter_stats['mcts_moves'] / (iter_stats['mcts_moves'] + iter_stats['direct_moves'] + 1e-8):.2f}",
                     }
                 )
 
-            # Balance the examples based on outcome (wins/losses) before adding to buffer
-            win_examples = [ex for ex in iter_examples if ex.value > 0.2]
-            loss_examples = [ex for ex in iter_examples if ex.value < -0.2]
-            draw_examples = [ex for ex in iter_examples if -0.2 <= ex.value <= 0.2]
-
-            # If we have an imbalance, resample to balance
-            max_count = max(
-                len(win_examples), len(loss_examples), 1
-            )  # At least 1 to avoid div by 0
-            balanced_examples = []
-
-            # Add all draw examples
-            balanced_examples.extend(draw_examples)
-
-            # For win examples, duplicate up to max_count if needed
-            if win_examples:
-                if (
-                    len(win_examples) < max_count / 2
-                ):  # If less than half of max, duplicate
-                    duplicate_factor = int(max_count / len(win_examples))
-                    balanced_examples.extend(win_examples * duplicate_factor)
-                else:
-                    balanced_examples.extend(win_examples)
-
-            # For loss examples, duplicate up to max_count if needed
-            if loss_examples:
-                if (
-                    len(loss_examples) < max_count / 2
-                ):  # If less than half of max, duplicate
-                    duplicate_factor = int(max_count / len(loss_examples))
-                    balanced_examples.extend(loss_examples * duplicate_factor)
-                else:
-                    balanced_examples.extend(loss_examples)
-
-            # Add balanced examples to replay buffer
-            replay_buffer.extend(balanced_examples)
-
-            # Log balance statistics
-            tqdm.write(
-                f"Examples this iteration - Wins: {len(win_examples)}, Losses: {len(loss_examples)}, Draws: {len(draw_examples)}"
-            )
-            tqdm.write(
-                f"After balancing - Total examples: {len(balanced_examples)}, Buffer size: {len(replay_buffer)}"
-            )
-
             # Trim replay buffer if needed
             if len(replay_buffer) > buffer_size:
-                # Simple random sampling without forcing extreme distributions
                 indices = rng.choice(
                     len(replay_buffer), size=buffer_size, replace=False
                 )
                 replay_buffer = [replay_buffer[i] for i in indices]
 
-                # Log the natural distribution
-                buffer_wins = len([ex for ex in replay_buffer if ex.value > 0.2])
-                buffer_losses = len([ex for ex in replay_buffer if ex.value < -0.2])
-                buffer_draws = len(
-                    [ex for ex in replay_buffer if -0.2 <= ex.value <= 0.2]
-                )
-
-                tqdm.write(
-                    f"Trimmed buffer - Natural distribution - Wins: {buffer_wins} ({100 * buffer_wins / len(replay_buffer):.1f}%), "
-                    f"Losses: {buffer_losses} ({100 * buffer_losses / len(replay_buffer):.1f}%), "
-                    f"Draws: {buffer_draws} ({100 * buffer_draws / len(replay_buffer):.1f}%), "
-                    f"Total: {len(replay_buffer)}"
-                )
+                # Log only buffer size after trimming
+                tqdm.write(f"Trimmed buffer size: {len(replay_buffer)}")
 
             # Training phase
             train_pbar = tqdm(range(num_epochs), desc="Training Epochs", leave=False)
             epoch_losses = {"total": 0, "policy": 0, "value": 0}
 
             for _ in train_pbar:
-                # Balanced sampling from replay buffer
+                # Sample from replay buffer
                 indices = rng.choice(
                     len(replay_buffer),
                     size=min(batch_size, len(replay_buffer)),
@@ -599,57 +654,20 @@ def hybrid_training_loop(
             avg_policy = epoch_losses["policy"] / num_epochs
             avg_value = epoch_losses["value"] / num_epochs
 
-            # FIXED: Step the scheduler once per iteration, not per batch
-            model.scheduler.step(avg_total)
+            # Step the scheduler once per iteration
+            model.scheduler.step()
 
             # Update loss and learning rate history for monitoring
             loss_history.append(avg_total)
             current_lr = model.optimizer.param_groups[0]["lr"]
             lr_history.append(current_lr)
 
-            # Check for loss stagnation and implement reactive learning rate control
-            if len(loss_history) >= 3:
-                # If loss is improving, update best loss
-                if avg_total < best_loss:
-                    best_loss = avg_total
-                    stagnation_counter = 0
-                else:
-                    # Calculate recent loss trend
-                    recent_losses = loss_history[-3:]
-                    loss_diff = abs(recent_losses[0] - recent_losses[-1])
-
-                    # If loss is stagnating (not improving by threshold)
-                    if loss_diff < loss_stagnation_threshold:
-                        stagnation_counter += 1
-                    else:
-                        stagnation_counter = 0
-
-                # If we've been stuck for a while, reset learning rate to higher value
-                if stagnation_counter >= 5:  # 5 iterations of stagnation
-                    # Get base learning rate based on model mode
-                    base_lr = (
-                        0.0005 if model.mode == "fast" else 0.0001
-                    )  # FIXED: Higher base LRs
-                    new_lr = base_lr * lr_reset_factor
-
-                    # Reset optimizer with higher learning rate to escape local minimum
-                    tqdm.write(
-                        "\nLoss stagnation detected! Resetting learning rate: {:.8f} → {:.8f}".format(
-                            current_lr, new_lr
-                        )
-                    )
-                    # FIXED: Store the actual new LR to confirm it was applied
-                    actual_new_lr = model.reset_optimizer(new_lr=new_lr)
-                    tqdm.write(f"New learning rate confirmed: {actual_new_lr:.8f}")
-
-                    stagnation_counter = 0
-
-            # Print training statistics
+            # Print core training statistics (simplified)
             elapsed_time = time.time() - training_start
             hours = elapsed_time // 3600
             minutes = (elapsed_time % 3600) // 60
 
-            # Prepare win rate statistics
+            # Prepare key win rate statistics
             strategic_p1_rate = (
                 100
                 * iter_stats["strategic_wins_as_p1"]
@@ -675,60 +693,23 @@ def hybrid_training_loop(
                 * iter_stats["self_play_p1_wins"]
                 / max(1, iter_stats["self_play_games"])
             )
-            mcts_rate = (
-                100
-                * iter_stats["mcts_moves"]
-                / max(1, iter_stats["mcts_moves"] + iter_stats["direct_moves"])
-            )
-
-            # Get win/loss/draw balance in buffer
-            buffer_wins = len([ex for ex in replay_buffer if ex.value > 0.2])
-            buffer_losses = len([ex for ex in replay_buffer if ex.value < -0.2])
-            buffer_draws = len([ex for ex in replay_buffer if -0.2 <= ex.value <= 0.2])
 
             tqdm.write(
                 f"\nIteration {iteration} - Time: {int(hours)}h {int(minutes)}m\n"
-                "Avg Losses: Total: {:.4f}, Policy: {:.4f}, Value: {:.4f}\n".format(
-                    avg_total, avg_policy, avg_value
+                f"Avg Losses: Total: {avg_total:.4f}, Policy: {avg_policy:.4f}, Value: {avg_value:.4f}\n"
+                f"Learning Rate: {model.optimizer.param_groups[0]['lr']:.8f}\n"
+                "Current Ratios: Random: {:.1%}, Strategic: {:.1%}, Self-play: {:.1%}\n".format(
+                    random_opponent_ratio,
+                    strategic_opponent_ratio,
+                    1.0 - random_opponent_ratio - strategic_opponent_ratio,
                 )
-                + "Learning Rate: {:.8f} (Mode: {})\n".format(current_lr, model.mode)
-                + "Self-play P1 Win Rate: {:.1f}%\n".format(selfplay_p1_rate)
-                + "Strategic Performance:\n"
-                + "  As P1: {}/{} ({:.1f}%)\n".format(
-                    iter_stats["strategic_wins_as_p1"],
-                    iter_stats["strategic_games_as_p1"],
-                    strategic_p1_rate,
+                + "Win Rates: Self-play P1: {:.1f}%, ".format(selfplay_p1_rate)
+                + "Strategic P1: {:.1f}%, P2: {:.1f}%, ".format(
+                    strategic_p1_rate, strategic_p2_rate
                 )
-                + "  As P2: {}/{} ({:.1f}%)\n".format(
-                    iter_stats["strategic_wins_as_p2"],
-                    iter_stats["strategic_games_as_p2"],
-                    strategic_p2_rate,
+                + "Random P1: {:.1f}%, P2: {:.1f}%".format(
+                    random_p1_rate, random_p2_rate
                 )
-                + "Random Performance:\n"
-                + "  As P1: {}/{} ({:.1f}%)\n".format(
-                    iter_stats["random_wins_as_p1"],
-                    iter_stats["random_games_as_p1"],
-                    random_p1_rate,
-                )
-                + "  As P2: {}/{} ({:.1f}%)\n".format(
-                    iter_stats["random_wins_as_p2"],
-                    iter_stats["random_games_as_p2"],
-                    random_p2_rate,
-                )
-                + "MCTS usage: {}/{} moves ({:.1f}%)\n".format(
-                    iter_stats["mcts_moves"],
-                    iter_stats["mcts_moves"] + iter_stats["direct_moves"],
-                    mcts_rate,
-                )
-                + "Replay Buffer Balance: Wins: {} ({:.1f}%), Losses: {} ({:.1f}%), Draws: {} ({:.1f}%)\n".format(
-                    buffer_wins,
-                    100 * buffer_wins / len(replay_buffer),
-                    buffer_losses,
-                    100 * buffer_losses / len(replay_buffer),
-                    buffer_draws,
-                    100 * buffer_draws / len(replay_buffer),
-                )
-                + "Bootstrap Weight: {:.2f}".format(bootstrap_weight)
             )
 
             # Save latest model after every iteration
@@ -746,11 +727,68 @@ def hybrid_training_loop(
                     if old_checkpoint != latest_model_path:  # Don't delete latest
                         try:
                             os.remove(old_checkpoint)
-                            tqdm.write(f"Removed old checkpoint: {old_checkpoint}")
                         except OSError:
                             pass
 
-                tqdm.write(f"Saved checkpoint: {save_path}")
+            # Concise diagnostics (every DIAGNOSTIC_INTERVAL iterations)
+            if iteration % DIAGNOSTIC_INTERVAL == 0:
+                # Sample recent examples for diagnostics
+                diagnostic_samples = random.sample(
+                    replay_buffer, min(50, len(replay_buffer))
+                )
+
+                # Get raw predictions for diagnostics
+                board_inputs = np.array(
+                    [ex.state_rep.board for ex in diagnostic_samples]
+                )
+                flat_inputs = np.array(
+                    [ex.state_rep.flat_values for ex in diagnostic_samples]
+                )
+
+                value_preds = []
+                with torch.no_grad():
+                    for i in range(len(diagnostic_samples)):
+                        _, value = model.predict(
+                            board_inputs[i : i + 1],  # Add batch dimension
+                            flat_inputs[i : i + 1],  # Add batch dimension
+                        )
+                        value_preds.append(value[0][0])  # Extract the scalar value
+                value_preds = np.array(value_preds)
+
+                # Track core metrics
+                correct_value_preds = 0
+                avg_top1_prob = 0
+
+                for i, example in enumerate(diagnostic_samples):
+                    # Value accuracy (sign match)
+                    true_sign = np.sign(example.value)
+                    pred_sign = np.sign(value_preds[i])
+                    if true_sign == pred_sign or (
+                        true_sign == 0 and abs(pred_sign) < 0.3
+                    ):
+                        correct_value_preds += 1
+
+                    # Policy concentration
+                    avg_top1_prob += np.max(example.policy)
+
+                value_accuracy = correct_value_preds / len(diagnostic_samples) * 100
+                avg_top1_prob = avg_top1_prob / len(diagnostic_samples)
+
+                # Print core diagnostics
+                tqdm.write("\nDIAGNOSTICS:")
+                tqdm.write(
+                    f"  Value accuracy: {value_accuracy:.1f}% (matching outcome direction)"
+                )
+                tqdm.write(
+                    f"  Policy confidence: {avg_top1_prob:.3f} (avg top move probability)"
+                )
+                tqdm.write(
+                    f"  Loss trend: {'Increasing' if len(loss_history) > 1 and avg_total > loss_history[-2] else 'Decreasing/Stable'}"
+                )
+                tqdm.write(f"  LR: {model.optimizer.param_groups[0]['lr']:.8f}")
+                tqdm.write(
+                    f"  Current params: bootstrap={bootstrap_weight:.2f}, random={random_opponent_ratio:.2f}, strategic={strategic_opponent_ratio:.2f}\n"
+                )
 
     except KeyboardInterrupt:
         print("\nTraining interrupted, saving final model...")
@@ -1104,6 +1142,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Sample from policy during evaluation instead of taking argmax",
     )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=DEFAULT_SAVE_INTERVAL,
+        help=f"Save checkpoints every N iterations (default: {DEFAULT_SAVE_INTERVAL})",
+    )
+    parser.add_argument(
+        "--num-checkpoints",
+        type=int,
+        default=DEFAULT_NUM_CHECKPOINTS,
+        help=f"Number of checkpoints to keep (default: {DEFAULT_NUM_CHECKPOINTS})",
+    )
 
     args = parser.parse_args()
 
@@ -1117,22 +1167,12 @@ if __name__ == "__main__":
         model.load(args.load_model)
         print("Loaded model from", args.load_model)
         if hasattr(model, "optimizer") and model.optimizer is not None:
-            print(
-                "Current learning rate: {:.8f}".format(
-                    model.optimizer.param_groups[0]["lr"]
-                )
-            )
+            print(f"Current learning rate: {model.optimizer.param_groups[0]['lr']:.8f}")
     else:
         if args.fresh:
             print("Starting with fresh model as requested")
         else:
             print("No model found at", args.load_model, "starting fresh")
-        if hasattr(model, "optimizer") and model.optimizer is not None:
-            print(
-                "Initial learning rate: {:.8f}".format(
-                    model.optimizer.param_groups[0]["lr"]
-                )
-            )
 
     # Evaluation mode
     if args.eval:
@@ -1157,10 +1197,46 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             mcts_sim_count=args.mcts_sims,
             mcts_game_ratio=args.mcts_ratio,
-            strategic_opponent_ratio=args.strategic_ratio,
-            random_opponent_ratio=args.random_ratio,
+            initial_random_ratio=INITIAL_RANDOM_OPPONENT_RATIO,
+            final_random_ratio=FINAL_RANDOM_OPPONENT_RATIO,
+            initial_strategic_ratio=INITIAL_STRATEGIC_OPPONENT_RATIO,
+            final_strategic_ratio=FINAL_STRATEGIC_OPPONENT_RATIO,
+            transition_iterations=OPPONENT_TRANSITION_ITERATIONS,
             bootstrap_weight=args.bootstrap,
-            lr_patience=args.lr_patience,
-            lr_reset_factor=args.lr_reset_factor,
+            policy_weight=DEFAULT_POLICY_WEIGHT,
+            save_interval=args.save_interval,
+            num_checkpoints=args.num_checkpoints,
             debug=args.debug,
         )
+
+
+# Modify the bootstrap weight to increase with training
+def get_bootstrap_weight(iteration):
+    """Start with lower bootstrapping and increase gradually"""
+    progress = min(1.0, iteration / BOOTSTRAP_TRANSITION_ITERATIONS)
+    return BOOTSTRAP_MIN_WEIGHT + progress * (
+        BOOTSTRAP_MAX_WEIGHT - BOOTSTRAP_MIN_WEIGHT
+    )
+
+
+# Add this function to improve how value targets are calculated
+def get_improved_value_target(game_outcome_value, mcts_root_value, move_count):
+    """Create better value targets by blending game outcome with MCTS search value"""
+    # How much to mix MCTS value into outcome
+    # Early in game: rely more on MCTS evaluation
+    # Late in game: rely more on actual outcome
+    AVG_GAME_LENGTH = 15.0
+    progress = min(1.0, move_count / AVG_GAME_LENGTH)
+
+    # Calculate mixing ratio that changes with game progression
+    # Early moves: ~70% MCTS value / 30% outcome
+    # Late moves: ~30% MCTS value / 70% outcome
+    mcts_weight = 0.7 - (0.4 * progress)
+
+    # Blend the values
+    blended_value = (
+        1.0 - mcts_weight
+    ) * game_outcome_value + mcts_weight * mcts_root_value
+
+    # Safety clamp to [-1, 1] range
+    return np.clip(blended_value, -1.0, 1.0)

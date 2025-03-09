@@ -12,8 +12,6 @@ def clone_game_state(state: GameState) -> GameState:
     new_state = GameState()
     # Copy board state (2D array)
     new_state.board = state.board.copy()
-    # Copy terrain
-    new_state.terrain = state.terrain.copy()
     # Copy current player (enum)
     new_state.current_player = state.current_player
     # Copy last move (immutable so direct reference is fine)
@@ -108,6 +106,58 @@ class MCTSNode:
         return 0.0 if self.visits == 0 else self.value_sum / self.visits
 
 
+def add_dirichlet_noise(
+    policy_flat, legal_moves_flat, iteration, move_count, max_iterations=150
+):
+    """add dirichlet noise to root policy with dynamic parameters based on training progress
+
+    args:
+        policy_flat: flattened policy vector
+        legal_moves_flat: flattened legal moves mask
+        iteration: current training iteration
+        move_count: current move count in the game
+        max_iterations: maximum training iterations
+
+    returns:
+        modified policy with noise added
+    """
+    legal_indices = np.where(legal_moves_flat > 0)[0]
+
+    if len(legal_indices) == 0:
+        return policy_flat
+
+    # calculate training progress (0 to 1)
+    progress = min(1.0, iteration / max_iterations)
+
+    # dynamic concentration parameter:
+    # - early training: lower alpha (0.15) creates more diverse/spiky distribution
+    # - late training: higher alpha (0.4) creates more uniform noise
+    # this helps explore more aggressively early but refine choices later
+    alpha_param = 0.15 + 0.25 * progress
+
+    # for early game positions, use more aggressive noise
+    if move_count < 5:
+        alpha_param *= 0.8  # reduce alpha for more exploration in opening moves
+
+    # generate dirichlet noise
+    noise = rng.dirichlet([alpha_param] * len(legal_indices))
+
+    # dynamic noise weight:
+    # - start with 0.35 (35% noise) early in training
+    # - decrease to 0.15 (15% noise) by the end
+    # this provides strong exploration early but preserves policy quality later
+    noise_weight = max(0.15, 0.35 - 0.2 * progress)
+
+    # apply noise only to legal moves
+    policy_with_noise = policy_flat.copy()
+    for i, idx in enumerate(legal_indices):
+        policy_with_noise[idx] = (1 - noise_weight) * policy_flat[
+            idx
+        ] + noise_weight * noise[i]
+
+    return policy_with_noise
+
+
 class MCTS:
     """Monte Carlo Tree Search implementation that can work with or without neural network policy guidance"""
 
@@ -119,6 +169,8 @@ class MCTS:
         self.c_puct = c_puct  # Exploration constant
         self.temperature = 1.0  # Temperature for move selection
         self.bootstrap_weight = bootstrap_weight  # Weight for value bootstrapping
+        self.iteration = 0  # Current training iteration
+        self.move_count = 0  # Current move count in the game
 
     def _rollout(self, state: GameState) -> float:
         """Perform a random rollout from the given state until game end"""
@@ -160,16 +212,20 @@ class MCTS:
             )
             policy = policy.squeeze(0)
 
-            # Add Dirichlet noise to root policy for exploration
+            # Add Dirichlet noise to root policy for exploration regardless of player
             legal_flat = legal_moves.flatten()
             policy_flat = policy.flatten()
-            legal_indices = np.where(legal_flat > 0)[0]
 
-            if len(legal_indices) > 0:
-                noise = np.random.dirichlet([0.3] * len(legal_indices))
-                for i, idx in enumerate(legal_indices):
-                    policy_flat[idx] = 0.8 * policy_flat[idx] + 0.2 * noise[i]
-                policy = policy_flat.reshape(policy.shape)
+            # Apply noise with dynamic parameters for both players
+            policy_flat = add_dirichlet_noise(
+                policy_flat,
+                legal_flat,
+                self.iteration,
+                self.move_count,
+                max_iterations=150,
+            )
+
+            policy = policy_flat.reshape(policy.shape)
         else:
             # If no model, use uniform policy over legal moves
             legal_moves = root.game_state.get_legal_moves()
@@ -287,8 +343,18 @@ class MCTS:
         """Set temperature for move selection"""
         self.temperature = temperature
 
+    def set_iteration(self, iteration):
+        """Set current training iteration"""
+        self.iteration = iteration
 
-def mcts_self_play_game(model, mcts_simulations=50, bootstrap_weight=0.5, debug=False):
+    def set_move_count(self, move_count):
+        """Set current move count in the game"""
+        self.move_count = move_count
+
+
+def mcts_self_play_game(
+    model, iteration=0, mcts_simulations=50, bootstrap_weight=0.5, debug=False
+):
     """Play a full game using MCTS for move selection, return training examples with value bootstrapping"""
     # Initialize game
     game = GameState()
@@ -299,12 +365,14 @@ def mcts_self_play_game(model, mcts_simulations=50, bootstrap_weight=0.5, debug=
     mcts = MCTS(
         model, num_simulations=mcts_simulations, bootstrap_weight=bootstrap_weight
     )
+    mcts.set_iteration(iteration)  # Set current iteration for noise scaling
 
     # Track last observed values for bootstrapping
     last_root_node = None
 
     while True:
         # Adjust temperature based on move count
+        mcts.set_move_count(move_count)
         if move_count < 10:
             mcts.set_temperature(1.0)  # Exploration early game
         else:

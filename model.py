@@ -26,9 +26,9 @@ class PolicyValueNet(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Match existing state representation
-        in_channels = 10  # Current state representation channels
-        hidden_channels = 128  # increased from 96 for more capacity
+        # update input channels from 10 to 6
+        in_channels = 6  # Reduced from 10 (removed terrain)
+        hidden_channels = 128
 
         # First convolution layer
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
@@ -39,7 +39,7 @@ class PolicyValueNet(nn.Module):
             [
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
-                ResBlock(hidden_channels),  # Added one more ResBlock
+                ResBlock(hidden_channels),
             ]
         )
 
@@ -55,10 +55,11 @@ class PolicyValueNet(nn.Module):
         # Final policy output layer - one channel per piece type (4 types)
         self.policy_conv3 = nn.Conv2d(32, 4, kernel_size=1)
 
-        # Value head - correctly sized for your inputs
+        # Value head - update flat state dimension from 10 to 12
         self.value_conv = nn.Conv2d(hidden_channels, 32, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(32)
-        self.value_fc1 = nn.Linear(32 * 4 * 4 + 10, 64)  # +10 for your flat state
+        # update from +10 to +12 for flat state (including 2 score values)
+        self.value_fc1 = nn.Linear(32 * 4 * 4 + 12, 64)
         self.value_fc2 = nn.Linear(64, 32)
         self.value_fc3 = nn.Linear(32, 1)
 
@@ -132,49 +133,55 @@ class ModelWrapper:
             print("Using crunch mode - for model optimization and deployment")
             return
 
-        # Simplified learning rate configuration with sensible defaults
+        # div factors used in scheduler
+        self.div_factor = 5
+        self.final_div_factor = 20
+
+        # Simplified learning rate configuration with only max_lr
         if self.mode == "fast":
-            self.lr = 0.001  # Higher but reasonable learning rate
-            print(f"Using fast training mode (lr={self.lr:.6f})")
+            self.max_lr = 0.006  # Higher peak learning rate
+            print(f"Using fast training mode")
         elif self.mode == "stable":
-            self.lr = 0.0003  # Moderate learning rate
-            print(f"Using stable training mode (lr={self.lr:.6f})")
-        elif self.mode == "custom_lr":
-            self.lr = 0.0001  # More standard custom rate
-            print(f"Using custom learning rate: {self.lr:.6f}")
+            self.max_lr = 0.01  # Standard peak learning rate
+            print(f"Using stable training mode")
         else:
             raise ValueError(
-                f"Unknown mode: {mode}. Must be one of: fast, stable, crunch, custom_lr"
+                f"Unknown mode: {mode}. Must be one of: fast, stable, crunch"
             )
+
+        # Calculate initial lr for optimizer
+        initial_lr = self.max_lr / self.div_factor
 
         # Standard AdamW optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=self.lr,
+            lr=initial_lr,
             weight_decay=1e-4,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
 
-        # More sensible one-cycle scheduler with moderate values
-        # Total training iterations (adjust based on your expected training length)
-        max_iterations = 140
+        # Create scheduler with default max iterations
+        self.scheduler = self._create_scheduler(self.optimizer, 140)
 
-        # One-cycle LR with moderate parameters
-        self.scheduler = SafeOneCycleLR(
-            self.optimizer,
-            max_lr=self.lr * 6,
-            total_steps=max_iterations,
-            pct_start=0.3,
-            anneal_strategy="cos",
-            div_factor=10,
-            final_div_factor=30,  # Much smaller reduction (was 100)
+        # Print learning rate info
+        print(f"Initial learning rate: {initial_lr:.6f}")
+        print(f"Will peak at: {self.max_lr:.6f}")
+        print(
+            f"Will finish at: {self.max_lr / (self.div_factor * self.final_div_factor):.6f}"
         )
 
-        # Print actual initial learning rate
-        print(f"Initial learning rate: {self.optimizer.param_groups[0]['lr']:.6f}")
-        print(f"Will peak at: {self.lr * 6:.6f}")
-        print(f"Will finish at: {self.lr * 6 / 1000:.6f}")
+    def _create_scheduler(self, optimizer, remaining_iterations):
+        """Helper function to create a scheduler with consistent parameters"""
+        return SafeOneCycleLR(
+            optimizer,
+            max_lr=self.max_lr,
+            total_steps=remaining_iterations,
+            pct_start=0.3,
+            anneal_strategy="cos",
+            div_factor=self.div_factor,
+            final_div_factor=self.final_div_factor,
+        )
 
     def predict(
         self, board_state, flat_state, legal_moves=None, difficulty: int = None
@@ -355,21 +362,24 @@ class ModelWrapper:
 
         return (total_loss.item(), policy_loss.item(), value_loss.item())
 
-    def save(self, path):
-        """Save model and optimizer state"""
-        torch.save(
-            {
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": (
-                    self.scheduler.state_dict() if hasattr(self, "scheduler") else None
-                ),
-            },
-            path,
-        )
+    def save_checkpoint(self, path, training_state=None):
+        """Save model checkpoint with optional training state"""
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": (
+                self.scheduler.state_dict() if hasattr(self, "scheduler") else None
+            ),
+        }
 
-    def load(self, path):
-        """Load model from checkpoint"""
+        # Add training state if provided
+        if training_state is not None:
+            checkpoint.update(training_state)
+
+        torch.save(checkpoint, path)
+
+    def load_checkpoint(self, path):
+        """Load full checkpoint including training state"""
         checkpoint = torch.load(path, map_location=self.device)
 
         # Load model state
@@ -380,75 +390,76 @@ class ModelWrapper:
             if hasattr(self, "optimizer") and "optimizer_state_dict" in checkpoint:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-                # Check if learning rate is too low and reset if needed
-                current_lr = self.optimizer.param_groups[0]["lr"]
-                min_acceptable_lr = 0.00001
-
-                if current_lr < min_acceptable_lr:
-                    print(
-                        f"Warning: Loaded learning rate is too low ({current_lr:.8f})"
-                    )
-                    new_lr = self.lr  # Reset to initialization value
-                    print(f"Resetting learning rate to {new_lr:.8f}")
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = new_lr
-
             # Load scheduler if available
             if hasattr(self, "scheduler") and "scheduler_state_dict" in checkpoint:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+            # Return training state information (excluding model components)
+            training_state = {
+                k: v
+                for k, v in checkpoint.items()
+                if k
+                not in [
+                    "model_state_dict",
+                    "optimizer_state_dict",
+                    "scheduler_state_dict",
+                ]
+            }
+            return training_state
         else:
-            # Direct state dict
+            # Legacy loading (just weights)
             self.model.load_state_dict(checkpoint)
+            print(f"Model weights loaded successfully on {self.device}")
+            return {}
 
-        print(f"Model loaded successfully on {self.device}")
-        return self.model.count_parameters()
-
-    def reset_optimizer(self, new_lr=None):
+    def reset_optimizer(self, new_max_lr=None):
         """Reset optimizer with optional new learning rate"""
-        if new_lr is None:
-            new_lr = self.lr  # Use default from initialization
+        if new_max_lr is None:
+            new_max_lr = self.max_lr  # Use default from initialization
 
-        print(f"Resetting optimizer with learning rate: {new_lr:.6f}")
+        print(f"Resetting optimizer with max learning rate: {new_max_lr:.6f}")
+
+        # Update max_lr
+        self.max_lr = new_max_lr
+
+        # Calculate initial lr for optimizer
+        initial_lr = self.max_lr / self.div_factor
 
         # Create fresh optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=new_lr,
+            lr=initial_lr,
             weight_decay=1e-4,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
 
-        # One-cycle LR with moderate parameters
+        # Reset scheduler with new optimizer
+        remaining_steps = 140  # Estimate of total training iterations
+        self.scheduler = self._create_scheduler(self.optimizer, remaining_steps)
 
-        # Reset scheduler too with new optimizer
-        max_iterations = 140  # Estimate of total training iterations
-        remaining_steps = max_iterations  # Could be refined if we track iteration
-        self.scheduler = SafeOneCycleLR(
-            self.optimizer,
-            max_lr=self.lr * 6,
-            total_steps=remaining_steps,
-            pct_start=0.3,
-            anneal_strategy="cos",
-            div_factor=10,
-            final_div_factor=30,  # Much smaller reduction (was 100)
+        # Print learning rate info
+        print(f"Initial learning rate: {initial_lr:.6f}")
+        print(f"Will peak at: {self.max_lr:.6f}")
+        print(
+            f"Will finish at: {self.max_lr / (self.div_factor * self.final_div_factor):.6f}"
         )
 
-        # Print actual initial learning rate from optimizer
-        print(f"Initial learning rate: {self.optimizer.param_groups[0]['lr']:.6f}")
-        print(f"Will peak at: {new_lr * 6:.6f}")
-        print(f"Will finish at: {new_lr * 6 / 1000:.6f}")
-
-        return new_lr
+        return initial_lr
 
 
 class SafeOneCycleLR(torch.optim.lr_scheduler.OneCycleLR):
     """OneCycleLR that safely handles extra steps beyond total_steps"""
 
     def __init__(self, optimizer, **kwargs):
-        super().__init__(optimizer, **kwargs)
+        # Set attributes before calling super().__init__
         self.total_steps_completed = False
-        self.min_lr = min(self.get_lr())  # Store minimum learning rate
+
+        # Call parent init
+        super().__init__(optimizer, **kwargs)
+
+        # Store minimum learning rate after parent init
+        self.min_lr = min(self.get_lr())
 
     def step(self, epoch=None):
         if self.total_steps_completed:

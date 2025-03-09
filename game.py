@@ -68,7 +68,6 @@ class GameState:
 
     def __init__(self):
         self.board: NDArray[np.int8] = np.zeros((4, 4, 2), dtype=np.int8)
-        self.terrain: NDArray[np.int8] = np.zeros((4, 4, 4), dtype=np.int8)
         self.current_player = Player.ONE
         self.piece_counts: Dict[Player, Dict[PieceType, int]] = {
             Player.ONE: {pt: 2 for pt in PieceType},
@@ -77,6 +76,7 @@ class GameState:
         self.last_move: Optional[Move] = None
         self.is_over = False
         self.winner: Player | None = None
+        self.move_count = 0  # Track number of moves made
 
     def make_move(self, move: Move) -> TurnResult:
         x, y, piece_type = move.x, move.y, move.piece_type
@@ -87,6 +87,7 @@ class GameState:
         self.board[x, y, player_channel] = 1
         self.piece_counts[self.current_player][piece_type] -= 1
         self.last_move = move
+        self.move_count += 1  # Increment move counter when a move is made
 
         if self.verbose_output:
             self.print_move_info(move)
@@ -301,7 +302,8 @@ class GameState:
         return legal_moves
 
     def get_board_state_representation(self) -> np.ndarray:
-        representation = np.zeros((4, 4, 10), dtype=self.board.dtype)
+        # change from 10 channels to 6 (removing unused terrain)
+        representation = np.zeros((4, 4, 6), dtype=self.board.dtype)
         representation[:, :, :2] = self.board
 
         move_representation = np.zeros((4, 4, 4))
@@ -311,11 +313,15 @@ class GameState:
             ] = 1
 
         representation[:, :, 2:6] = move_representation
-        representation[:, :, 6:10] = self.terrain
+        # terrain layers removed
 
         return representation
 
     def get_pieces_state_representation(self) -> np.ndarray:
+        # add player scores to the flat representation
+        player_one_score = self._calculate_score(Player.ONE)
+        player_two_score = self._calculate_score(Player.TWO)
+
         return np.array(
             [
                 1 if self.current_player == Player.ONE else 0,
@@ -328,6 +334,8 @@ class GameState:
                 self.piece_counts[Player.TWO][PieceType.ORTHO],
                 self.piece_counts[Player.TWO][PieceType.NEAR],
                 self.piece_counts[Player.TWO][PieceType.FAR],
+                player_one_score,
+                player_two_score,
             ]
         )
 
@@ -342,10 +350,10 @@ class GameState:
         legal_moves = self.get_legal_moves()
         for index in np.argwhere(legal_moves):
             move = Move(index[0], index[1], PieceType(index[2]))
-            # Instead of deep copying, we'll create a new state and update only what's necessary
+            # create a new state and update only what's necessary
             new_state = GameState()
             new_state.board = self.board.copy()
-            new_state.terrain = self.terrain
+            # terrain is removed
             new_state.current_player = self.current_player
             new_state.piece_counts = {
                 Player.ONE: self.piece_counts[Player.ONE].copy(),
@@ -357,6 +365,13 @@ class GameState:
             )
             next_states.append(possible_state_package)
         return next_states
+
+    def get_scores(self) -> Dict[Player, int]:
+        """Returns current scores for both players"""
+        return {
+            Player.ONE: self._calculate_score(Player.ONE),
+            Player.TWO: self._calculate_score(Player.TWO),
+        }
 
 
 def count_legal_move_positions(legal_moves):

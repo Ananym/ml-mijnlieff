@@ -39,7 +39,7 @@ class Move:
 @dataclass
 class GameStateRepresentation:
     __slots__ = ["board", "flat_values"]
-    # 4x4x10
+    # 4x4x6
     board: np.ndarray
     # 8x1
     flat_values: np.ndarray
@@ -301,31 +301,111 @@ class GameState:
 
         return legal_moves
 
-    def get_board_state_representation(self) -> np.ndarray:
-        # change from 10 channels to 6 (removing unused terrain)
+    def get_board_state_representation(self, subjective: bool = False) -> np.ndarray:
         representation = np.zeros((4, 4, 6), dtype=self.board.dtype)
-        representation[:, :, :2] = self.board
 
-        move_representation = np.zeros((4, 4, 4))
+        if not subjective:
+            # Standard representation - player one then player two
+            representation[:, :, :2] = self.board
+        else:
+            # Subjective representation - current player then opponent
+            current_idx = self.current_player.value
+            opponent_idx = 1 - current_idx  # flip between 0 and 1
+
+            # Current player's pieces in first layer
+            representation[:, :, 0] = self.board[:, :, current_idx]
+            # Opponent's pieces in second layer
+            representation[:, :, 1] = self.board[:, :, opponent_idx]
+
+        # Last move representation stays the same
+        last_move_representation = np.zeros((4, 4, 4))
         if self.last_move is not None:
-            move_representation[
+            last_move_representation[
                 (self.last_move.x, self.last_move.y, self.last_move.piece_type.value)
             ] = 1
 
-        representation[:, :, 2:6] = move_representation
-        # terrain layers removed
+        representation[:, :, 2:6] = last_move_representation
 
         return representation
 
-    def get_pieces_state_representation(self) -> np.ndarray:
+    def get_pieces_state_representation(self, subjective: bool = False) -> np.ndarray:
         # add player scores to the flat representation
         player_one_score = self._calculate_score(Player.ONE)
         player_two_score = self._calculate_score(Player.TWO)
 
-        return np.array(
+        if not subjective:
+            # traditional ordering: player one then player two
+            return np.array(
+                [
+                    (
+                        1 if self.current_player == Player.ONE else 0
+                    ),  # single value for current player
+                    self.piece_counts[Player.ONE][PieceType.DIAG],
+                    self.piece_counts[Player.ONE][PieceType.ORTHO],
+                    self.piece_counts[Player.ONE][PieceType.NEAR],
+                    self.piece_counts[Player.ONE][PieceType.FAR],
+                    self.piece_counts[Player.TWO][PieceType.DIAG],
+                    self.piece_counts[Player.TWO][PieceType.ORTHO],
+                    self.piece_counts[Player.TWO][PieceType.NEAR],
+                    self.piece_counts[Player.TWO][PieceType.FAR],
+                    player_one_score,
+                    player_two_score,
+                    self.move_count,  # track how many moves have been made
+                ]
+            )
+        else:
+            # subjective ordering: current player then opponent
+            current = self.current_player
+            opponent = Player.TWO if current == Player.ONE else Player.ONE
+            current_score = (
+                player_one_score if current == Player.ONE else player_two_score
+            )
+            opponent_score = (
+                player_two_score if current == Player.ONE else player_one_score
+            )
+
+            return np.array(
+                [
+                    (
+                        1 if current == Player.ONE else 0
+                    ),  # still indicate which player is current
+                    self.piece_counts[current][PieceType.DIAG],
+                    self.piece_counts[current][PieceType.ORTHO],
+                    self.piece_counts[current][PieceType.NEAR],
+                    self.piece_counts[current][PieceType.FAR],
+                    self.piece_counts[opponent][PieceType.DIAG],
+                    self.piece_counts[opponent][PieceType.ORTHO],
+                    self.piece_counts[opponent][PieceType.NEAR],
+                    self.piece_counts[opponent][PieceType.FAR],
+                    current_score,
+                    opponent_score,
+                    self.move_count,  # track how many moves have been made
+                ]
+            )
+
+    def get_game_state_representation(
+        self, subjective: bool = False
+    ) -> GameStateRepresentation:
+        return GameStateRepresentation(
+            board=self.get_board_state_representation(subjective),
+            flat_values=self.get_pieces_state_representation(subjective),
+        )
+
+    def get_new_game_state_representation(self) -> GameStateRepresentation:
+        # use the existing board representation
+        board_representation = self.get_board_state_representation()
+
+        # calculate scores for flat representation
+        player_one_score = self._calculate_score(Player.ONE)
+        player_two_score = self._calculate_score(Player.TWO)
+
+        # create flat representation with single current player indicator
+        # (1 for Player.ONE, 0 for Player.TWO)
+        flat_representation = np.array(
             [
-                1 if self.current_player == Player.ONE else 0,
-                1 if self.current_player == Player.TWO else 0,
+                (
+                    1 if self.current_player == Player.ONE else 0
+                ),  # single value for current player
                 self.piece_counts[Player.ONE][PieceType.DIAG],
                 self.piece_counts[Player.ONE][PieceType.ORTHO],
                 self.piece_counts[Player.ONE][PieceType.NEAR],
@@ -339,10 +419,9 @@ class GameState:
             ]
         )
 
-    def get_game_state_representation(self) -> GameStateRepresentation:
         return GameStateRepresentation(
-            board=self.get_board_state_representation(),
-            flat_values=self.get_pieces_state_representation(),
+            board=board_representation,
+            flat_values=flat_representation,
         )
 
     def get_possible_next_states(self) -> List[PossibleFutureGameStateRepresentation]:

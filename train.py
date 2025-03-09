@@ -155,6 +155,12 @@ def hybrid_training_loop(
         "direct_policy_confidence_sum": 0,  # sum of max probability in direct policy
         "mcts_policy_entropy_sum": 0,  # sum of MCTS policy entropy
         "direct_policy_entropy_sum": 0,  # sum of direct policy entropy
+        "value_prediction_sum": 0,  # sum of value predictions
+        "value_prediction_squared_sum": 0,  # sum of squared value predictions
+        "value_prediction_abs_sum": 0,  # sum of absolute value predictions
+        "value_prediction_count": 0,  # count of value predictions
+        "value_error_sum": 0,  # sum of |actual_outcome - predicted_value|
+        "extreme_value_count": 0,  # count of values near -1 or 1 (confident predictions)
     }
 
     # Keep track of last N checkpoints
@@ -170,7 +176,8 @@ def hybrid_training_loop(
 
     def create_opponent_example(game, move, opponent_type):
         """Create a training example from an opponent's move"""
-        state_rep = game.get_game_state_representation()
+        # Use subjective=True for the state representation
+        state_rep = game.get_game_state_representation(subjective=True)
         legal_moves = game.get_legal_moves()
 
         # Create one-hot encoded policy for the opponent's move
@@ -188,7 +195,8 @@ def hybrid_training_loop(
     def get_model_move_for_play(game, use_mcts=False, temperature=1.0):
         """Get a move from the model for gameplay (returns the move and one-hot policy)"""
         legal_moves = game.get_legal_moves()
-        state_rep = game.get_game_state_representation()
+        # Use subjective=True for the state representation
+        state_rep = game.get_game_state_representation(subjective=True)
 
         if use_mcts:
             # Use pure rollout MCTS for move selection (no model)
@@ -275,7 +283,8 @@ def hybrid_training_loop(
         """Get a move from the model along with the training policy target
         (full MCTS distribution if MCTS was used, otherwise one-hot)"""
         legal_moves = game.get_legal_moves()
-        state_rep = game.get_game_state_representation()
+        # Use subjective=True for the state representation
+        state_rep = game.get_game_state_representation(subjective=True)
         move_count = game.move_count
 
         if use_mcts:
@@ -389,6 +398,14 @@ def hybrid_training_loop(
 
         # Create the move object
         move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+
+        # Track value prediction statistics
+        iter_stats["value_prediction_sum"] += root_value
+        iter_stats["value_prediction_squared_sum"] += root_value * root_value
+        iter_stats["value_prediction_abs_sum"] += abs(root_value)
+        iter_stats["value_prediction_count"] += 1
+        if abs(root_value) > 0.8:  # Track highly confident value predictions
+            iter_stats["extreme_value_count"] += 1
 
         return move, policy_target, root_value, state_rep
 
@@ -796,6 +813,35 @@ def hybrid_training_loop(
                 1, iter_stats["direct_moves"]
             )
 
+            # Calculate value prediction statistics
+            if iter_stats["value_prediction_count"] > 0:
+                avg_value_prediction = (
+                    iter_stats["value_prediction_sum"]
+                    / iter_stats["value_prediction_count"]
+                )
+                avg_abs_value = (
+                    iter_stats["value_prediction_abs_sum"]
+                    / iter_stats["value_prediction_count"]
+                )
+                value_variance = (
+                    iter_stats["value_prediction_squared_sum"]
+                    / iter_stats["value_prediction_count"]
+                ) - (avg_value_prediction * avg_value_prediction)
+                value_std = math.sqrt(max(0, value_variance))
+                extreme_value_ratio = (
+                    iter_stats["extreme_value_count"]
+                    / iter_stats["value_prediction_count"]
+                )
+                avg_value_error = (
+                    iter_stats["value_error_sum"] / iter_stats["value_prediction_count"]
+                    if iter_stats["value_error_sum"] > 0
+                    else 0
+                )
+            else:
+                avg_value_prediction = avg_abs_value = value_std = (
+                    extreme_value_ratio
+                ) = avg_value_error = 0
+
             # Print summary
             print(
                 f"\nIteration {iteration} completed in {time.time() - iteration_start:.1f}s "
@@ -815,6 +861,11 @@ def hybrid_training_loop(
                 f"Examples - Win: {iter_stats['win_examples'] / iter_stats['total_games']:.2f}, "
                 f"Loss: {iter_stats['loss_examples'] / iter_stats['total_games']:.2f}, "
                 f"Draw: {iter_stats['draw_examples'] / iter_stats['total_games']:.2f}"
+            )
+            print(
+                f"Value - Avg: {avg_value_prediction:.3f}, |Avg|: {avg_abs_value:.3f}, "
+                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}, "
+                f"Error: {avg_value_error:.3f}"
             )
 
             # Regular checkpoint saving

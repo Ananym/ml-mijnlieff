@@ -77,11 +77,21 @@ class GameState:
         self.is_over = False
         self.winner: Player | None = None
         self.move_count = 0  # Track number of moves made
+        self.move_history = []  # track history of moves for undo
 
     def make_move(self, move: Move) -> TurnResult:
         x, y, piece_type = move.x, move.y, move.piece_type
         if not self.is_valid_move(move):
             raise IllegalMoveException(self.current_player, move)
+
+        # save previous state info for undo
+        prev_state = {
+            "player": self.current_player,
+            "last_move": self.last_move,
+            "is_over": self.is_over,
+            "winner": self.winner,
+        }
+        self.move_history.append((move, prev_state))
 
         player_channel = self.current_player.value
         self.board[x, y, player_channel] = 1
@@ -171,6 +181,16 @@ class GameState:
         )
 
     def pass_turn(self):
+        # save previous state info for undo
+        prev_state = {
+            "player": self.current_player,
+            "last_move": self.last_move,
+            "is_over": self.is_over,
+            "winner": self.winner,
+        }
+        # use None as move to indicate a pass
+        self.move_history.append((None, prev_state))
+
         self.last_move = None
         if self.verbose_output:
             print("Passing the turn of " + self.current_player.name)
@@ -451,6 +471,42 @@ class GameState:
             Player.ONE: self._calculate_score(Player.ONE),
             Player.TWO: self._calculate_score(Player.TWO),
         }
+
+    def undo_move(self) -> bool:
+        """Undo the last move, restoring the previous game state
+
+        returns:
+            bool: True if a move was undone, False if there was no move to undo
+        """
+        if not self.move_history:
+            return False
+
+        # pop the last move and its previous state
+        last_move, prev_state = self.move_history.pop()
+
+        # check if it was a pass (move is None)
+        if last_move is not None:
+            # restore the piece to the player's supply
+            player = prev_state["player"]
+            piece_type = last_move.piece_type
+            self.piece_counts[player][piece_type] += 1
+
+            # remove the piece from the board
+            x, y = last_move.x, last_move.y
+            self.board[x, y, player.value] = 0
+
+            # only decrement move count for actual moves, not passes
+            self.move_count -= 1
+
+        # restore previous game state
+        self.current_player = prev_state["player"]
+        self.last_move = prev_state[
+            "last_move"
+        ]  # this is the move before the current one
+        self.is_over = prev_state["is_over"]
+        self.winner = prev_state["winner"]
+
+        return True
 
 
 def count_legal_move_positions(legal_moves):

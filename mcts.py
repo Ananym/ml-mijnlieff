@@ -33,7 +33,7 @@ def clone_game_state(state: GameState) -> GameState:
 class MCTSNode:
     """Represents a node in the Monte Carlo search tree"""
 
-    def __init__(self, game_state: GameState, parent=None, move=None):
+    def __init__(self, game_state=None, parent=None, move=None):
         self.game_state = game_state  # Current game state at this node
         self.parent = parent  # Parent node
         self.move = move  # Move that led to this state
@@ -44,24 +44,20 @@ class MCTSNode:
         self.expanded = False  # Whether node has been expanded
         self.predicted_value = None  # Value predicted by neural network
 
-    def expand(self, policy):
+    def expand(self, policy, game_state):
         """Expand node by creating children for all legal moves"""
         # prevent double expansion
         if self.expanded:
             return
 
-        legal_moves = self.game_state.get_legal_moves()
+        legal_moves = game_state.get_legal_moves()
         # For each legal move, create a child node
         for move_idx in np.argwhere(legal_moves):
             x, y, piece_type_idx = move_idx
             move = Move(x, y, PieceType(piece_type_idx))
 
-            # Create new game state by applying the move
-            new_state = clone_game_state(self.game_state)
-            new_state.make_move(move)
-
-            # Create child node
-            child = MCTSNode(new_state, parent=self, move=move)
+            # Create child node without its own game state
+            child = MCTSNode(parent=self, move=move)
 
             # Set prior probability from policy network
             child.prior = policy[x, y, piece_type_idx]
@@ -97,9 +93,9 @@ class MCTSNode:
         self.visits += 1
         self.value_sum += value
 
-    def is_terminal(self):
+    def is_terminal(self, game_state):
         """Check if node represents game end state"""
-        return self.game_state.is_over
+        return game_state.is_over
 
     def get_value(self):
         """Get mean value of node"""
@@ -170,39 +166,90 @@ class MCTS:
 
     def _rollout(self, state: GameState) -> float:
         """Perform a random rollout from the given state until game end"""
-        state = clone_game_state(state)
+        # create a backup state for rollout
+        rollout_state = clone_game_state(state)
 
-        while not state.is_over:
-            legal_moves = state.get_legal_moves()
+        # limit depth for performance
+        max_rollout_depth = 20
+        depth = 0
+
+        while not rollout_state.is_over and depth < max_rollout_depth:
+            legal_moves = rollout_state.get_legal_moves()
             if not np.any(legal_moves):
-                state.pass_turn()
+                rollout_state.pass_turn()
+                depth += 1  # count passes towards depth too for consistency
                 continue
 
             # Get all legal move positions
             legal_positions = np.argwhere(legal_moves)
+            if len(legal_positions) == 0:
+                break
+
             # Choose random move
             idx = rng.integers(len(legal_positions))
             x, y, piece_type = legal_positions[idx]
             move = Move(x, y, PieceType(piece_type))
 
-            state.make_move(move)
+            # Make the move - pass turns are handled inside make_move if needed
+            # and will increment depth implicitly
+            result = rollout_state.make_move(move)
+            depth += 1  # count this move
+
+            # if a forced pass happened, count it towards depth too
+            if result == TurnResult.OPPONENT_WAS_FORCED_TO_PASS:
+                depth += 1
+
+        # If we reached max depth without game end, estimate value
+        if not rollout_state.is_over and depth >= max_rollout_depth:
+            # Simple heuristic based on piece counts and board position
+            return self._estimate_rollout_value(rollout_state, state.current_player)
 
         # Return game outcome from perspective of original player
-        return self._get_game_value(state, state.current_player)
+        return self._get_game_value(rollout_state, state.current_player)
+
+    def _estimate_rollout_value(
+        self, state: GameState, perspective_player: Player
+    ) -> float:
+        """Simple heuristic for rollout termination before game end"""
+        # Compare scores
+        scores = state.get_scores()
+        score_diff = (
+            scores[perspective_player]
+            - scores[Player.ONE if perspective_player == Player.TWO else Player.TWO]
+        )
+
+        # Add piece advantage
+        pieces_left = sum(state.piece_counts[perspective_player].values())
+        opp_pieces_left = sum(
+            state.piece_counts[
+                Player.ONE if perspective_player == Player.TWO else Player.TWO
+            ].values()
+        )
+        piece_advantage = (pieces_left - opp_pieces_left) * 0.1
+
+        # Normalize to [-1, 1] range
+        return max(-1.0, min(1.0, (score_diff * 0.2 + piece_advantage) / 2.0))
 
     def search(self, game_state: GameState) -> np.ndarray:
         """Perform MCTS search from given state and return move probabilities"""
         # Create root node
-        root = MCTSNode(clone_game_state(game_state))
+        root = MCTSNode(move=None, parent=None)
+
+        # Use a single shared game state that we'll modify during search
+        # Clone it once at the beginning to avoid modifying the original
+        search_state = clone_game_state(game_state)
+
+        # Store move sequence during traversal (including passes as None)
+        move_sequence = []
 
         # Initialize root node's predicted value if model exists
         if self.model is not None:
-            state_rep = root.game_state.get_game_state_representation()
+            state_rep = search_state.get_game_state_representation()
             _, value_pred = self.model.predict(state_rep.board, state_rep.flat_values)
             root.predicted_value = value_pred.squeeze()
 
             # Get policy from model for root node
-            legal_moves = root.game_state.get_legal_moves()
+            legal_moves = search_state.get_legal_moves()
             policy, _ = self.model.predict(
                 state_rep.board, state_rep.flat_values, legal_moves
             )
@@ -224,26 +271,40 @@ class MCTS:
             policy = policy_flat.reshape(policy.shape)
         else:
             # If no model, use uniform policy over legal moves
-            legal_moves = root.game_state.get_legal_moves()
+            legal_moves = search_state.get_legal_moves()
             policy = legal_moves / (np.sum(legal_moves) + 1e-8)
+
+        # Expand root with policy
+        root.expand(policy, search_state)
 
         # Run simulations
         for _ in range(self.num_simulations):
             node = root
+            # Clear move sequence for new simulation
+            move_sequence.clear()
 
             # SELECTION: traverse tree to find leaf node
-            while node.expanded and not node.is_terminal():
+            while node.expanded and not node.is_terminal(search_state):
                 node = node.select_child(self.c_puct)
+                # Apply the move to our shared state
+                if node.move:
+                    # Track if the move results in a forced pass
+                    result = search_state.make_move(node.move)
+                    move_sequence.append(node.move)
+
+                    if result == TurnResult.OPPONENT_WAS_FORCED_TO_PASS:
+                        # Also track the automatic pass that occurred
+                        move_sequence.append(None)  # None represents a pass
 
             # If node is terminal, use its game outcome for backpropagation
-            if node.is_terminal():
-                value = self._get_game_value(node.game_state, game_state.current_player)
+            if node.is_terminal(search_state):
+                value = self._get_game_value(search_state, game_state.current_player)
             else:
                 # EXPANSION: use policy network or uniform policy to expand node
                 if self.model is not None:
                     # Use model for policy and value
-                    state_rep = node.game_state.get_game_state_representation()
-                    legal_moves = node.game_state.get_legal_moves()
+                    state_rep = search_state.get_game_state_representation()
+                    legal_moves = search_state.get_legal_moves()
                     policy, value_pred = self.model.predict(
                         state_rep.board, state_rep.flat_values, legal_moves
                     )
@@ -252,16 +313,12 @@ class MCTS:
                     node.predicted_value = value
                 else:
                     # Use uniform policy and rollout for value
-                    legal_moves = node.game_state.get_legal_moves()
+                    legal_moves = search_state.get_legal_moves()
                     policy = legal_moves / (np.sum(legal_moves) + 1e-8)
-                    value = self._rollout(node.game_state)
+                    value = self._rollout(search_state)
 
                 # Expand node with chosen policy
-                node.expand(policy)
-
-                # Update node with obtained value
-                node.update(value)
-                continue
+                node.expand(policy, search_state)
 
             # BACKPROPAGATION: update all nodes in path
             current_node = node
@@ -273,6 +330,10 @@ class MCTS:
                 if current_node is not None:
                     # Flip value when moving to parent (opponent's perspective)
                     current_value = -current_value
+
+            # Undo all moves (including passes) to restore original state
+            for _ in range(len(move_sequence)):
+                search_state.undo_move()
 
         # Calculate move probabilities based on visit counts
         visit_counts = np.zeros((4, 4, 4), dtype=np.float32)

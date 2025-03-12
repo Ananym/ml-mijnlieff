@@ -143,10 +143,9 @@ def add_dirichlet_noise(
     noise = rng.dirichlet([alpha_param] * len(legal_indices))
 
     # dynamic noise weight:
-    # - start with 0.35 (35% noise) early in training
-    # - decrease to 0.15 (15% noise) by the end
-    # this provides strong exploration early but preserves policy quality later
-    noise_weight = max(0.15, 0.35 - 0.2 * progress)
+    # - start with 0.25 (25% noise) early in training
+    # - decrease to 0.10 (10% noise) by the end
+    noise_weight = max(0.10, 0.25 - 0.15 * progress)
 
     # apply noise only to legal moves
     policy_with_noise = policy_flat.copy()
@@ -161,14 +160,11 @@ def add_dirichlet_noise(
 class MCTS:
     """Monte Carlo Tree Search implementation that can work with or without neural network policy guidance"""
 
-    def __init__(
-        self, model=None, num_simulations=100, c_puct=1.0, bootstrap_weight=0.5
-    ):
+    def __init__(self, model=None, num_simulations=100, c_puct=1.0):
         self.model = model  # Neural network model (optional)
         self.num_simulations = num_simulations  # Number of simulations per search
         self.c_puct = c_puct  # Exploration constant
         self.temperature = 1.0  # Temperature for move selection
-        self.bootstrap_weight = bootstrap_weight  # Weight for value bootstrapping
         self.iteration = 0  # Current training iteration
         self.move_count = 0  # Current move count in the game
 
@@ -335,7 +331,7 @@ class MCTS:
         )
 
         # Small bonus based on score difference (max 0.5)
-        score_bonus = 0.1 * max(-0.5, min(0.5, score_diff / 5.0))
+        score_bonus = 0.03 * max(-0.5, min(0.5, score_diff / 5.0))
 
         return base_value + score_bonus
 
@@ -350,143 +346,3 @@ class MCTS:
     def set_move_count(self, move_count):
         """Set current move count in the game"""
         self.move_count = move_count
-
-
-def mcts_self_play_game(
-    model, iteration=0, mcts_simulations=50, bootstrap_weight=0.5, debug=False
-):
-    """Play a full game using MCTS for move selection, return training examples with value bootstrapping"""
-    # Initialize game
-    game = GameState()
-    examples = []
-    move_count = 0
-
-    # Initialize MCTS
-    mcts = MCTS(
-        model, num_simulations=mcts_simulations, bootstrap_weight=bootstrap_weight
-    )
-    mcts.set_iteration(iteration)  # Set current iteration for noise scaling
-
-    # Track last observed values for bootstrapping
-    last_root_node = None
-
-    while True:
-        # Adjust temperature based on move count
-        mcts.set_move_count(move_count)
-        if move_count < 10:
-            mcts.set_temperature(1.0)  # Exploration early game
-        else:
-            mcts.set_temperature(0.5)  # More exploitation late game
-
-        # Check if player can make a legal move
-        legal_moves = game.get_legal_moves()
-        if not np.any(legal_moves):
-            # No legal moves, must pass
-            game.pass_turn()
-            continue
-
-        # Get current state representation before making a move
-        state_rep = game.get_game_state_representation()
-
-        # Use MCTS to get improved policy
-        mcts_policy, root_node = mcts.search(game)
-
-        # Store example (value will be filled in later)
-        examples.append(
-            {
-                "state_rep": state_rep,
-                "policy": mcts_policy,
-                "value": 0.0,  # Placeholder, will be filled later
-                "current_player": game.current_player,
-                "move_number": move_count,
-                "root_node": root_node,  # Store the node for bootstrapping
-            }
-        )
-
-        # Sample move from the MCTS policy
-        policy_flat = mcts_policy.flatten()
-        if np.sum(policy_flat) > 0:  # Ensure policy is valid
-            move_idx = rng.choice(len(policy_flat), p=policy_flat / np.sum(policy_flat))
-            move_coords = np.unravel_index(move_idx, mcts_policy.shape)
-            move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
-        else:
-            # Fallback to random legal move if policy is invalid
-            legal_positions = np.argwhere(legal_moves)
-            idx = rng.integers(len(legal_positions))
-            move_coords = tuple(legal_positions[idx])
-            move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
-
-        # Make the move
-        result = game.make_move(move)
-        move_count += 1
-
-        # Store current root node for next iteration's bootstrapping
-        last_root_node = root_node
-
-        if debug and move_count % 5 == 0:
-            print(f"Move {move_count}, Player {game.current_player.name}")
-
-        # Check if game is over
-        if result == TurnResult.GAME_OVER:
-            # Game is over, get the winner
-            winner = game.get_winner()
-            final_score_p1 = game._calculate_score(Player.ONE)
-            final_score_p2 = game._calculate_score(Player.TWO)
-
-            # Fill in value targets with bootstrapping for all examples
-            for i, example in enumerate(examples):
-                player = example["current_player"]
-
-                # FIXED: Stronger win/loss signal
-                if winner is None:  # Draw
-                    outcome_value = 0.0
-                elif winner == player:  # Win
-                    outcome_value = 1.0
-                else:  # Loss
-                    outcome_value = -1.0
-
-                # Add small score bonus
-                score_diff = (
-                    final_score_p1 - final_score_p2
-                    if player == Player.ONE
-                    else final_score_p2 - final_score_p1
-                )
-                outcome_value += 0.1 * max(-0.5, min(0.5, score_diff / 5.0))
-
-                # Apply bootstrapping if this isn't the last move
-                if i < len(examples) - 1:
-                    next_example = examples[i + 1]
-                    if (
-                        next_example["root_node"]
-                        and next_example["root_node"].predicted_value is not None
-                    ):
-                        # Get opponent's predicted value and flip sign (opponent's perspective)
-                        bootstrap_value = -float(
-                            next_example["root_node"].predicted_value
-                        )
-
-                        # Mix outcome with bootstrapped value
-                        example["value"] = (
-                            (1 - bootstrap_weight)
-                        ) * outcome_value + bootstrap_weight * bootstrap_value
-                    else:
-                        example["value"] = outcome_value
-                else:
-                    # Last move uses pure outcome
-                    example["value"] = outcome_value
-
-                # Remove the root_node to clean up examples before returning
-                del example["root_node"]
-
-            # Clean up and return only necessary data
-            clean_examples = [
-                {
-                    "state_rep": ex["state_rep"],
-                    "policy": ex["policy"],
-                    "value": ex["value"],
-                    "current_player": ex["current_player"],
-                }
-                for ex in examples
-            ]
-
-            return clean_examples

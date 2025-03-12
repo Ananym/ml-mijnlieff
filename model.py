@@ -134,12 +134,13 @@ class ModelWrapper:
             return
 
         # div factors used in scheduler
-        self.div_factor = 5
-        self.final_div_factor = 20
+        self.div_factor = 15
+        self.final_div_factor = 30
+        self.max_iterations = 200
 
         # Simplified learning rate configuration with only max_lr
         if self.mode == "fast":
-            self.max_lr = 0.006  # Higher peak learning rate
+            self.max_lr = 0.1  # Higher peak learning rate
             print(f"Using fast training mode")
         elif self.mode == "stable":
             self.max_lr = 0.01  # Standard peak learning rate
@@ -162,7 +163,7 @@ class ModelWrapper:
         )
 
         # Create scheduler with default max iterations
-        self.scheduler = self._create_scheduler(self.optimizer, 140)
+        self.scheduler = self._create_scheduler(self.optimizer, self.max_iterations)
 
         # Print learning rate info
         print(f"Initial learning rate: {initial_lr:.6f}")
@@ -339,13 +340,16 @@ class ModelWrapper:
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
             policy_loss = policy_loss - 0.03 * entropy
 
-        # Value loss with label smoothing to prevent overconfidence
-        # This is crucial for games with complex scoring systems
-        smoothed_targets = value_targets * 0.93  # Scale targets toward zero
+        # Value loss with stronger label smoothing to prevent overconfidence
+        # Increase smoothing factor from 0.93 to 0.85 to pull targets more toward zero
+        smoothed_targets = (
+            value_targets * 0.85
+        )  # Scale targets toward zero more aggressively
         value_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
 
-        # Small L2 regularization for value predictions
-        value_l2_reg = 0.0001 * torch.mean(torch.square(value_pred))
+        # Increase L2 regularization for value predictions to discourage extreme values
+        # Increase from 0.0001 to 0.0005 for stronger regularization effect
+        value_l2_reg = 0.0005 * torch.mean(torch.square(value_pred))
         value_loss = value_loss + value_l2_reg
 
         # Combine losses with policy_weight emphasis

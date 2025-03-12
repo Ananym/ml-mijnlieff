@@ -10,32 +10,37 @@ from dataclasses import dataclass
 from model import ModelWrapper
 from tqdm import tqdm
 from opponents import RandomOpponent, StrategicOpponent
-from mcts import MCTS, mcts_self_play_game, add_dirichlet_noise
+from mcts import MCTS, add_dirichlet_noise
 import random
 import math
 
 # Training parameters
-DEFAULT_EPISODES = 60
-DEFAULT_BATCH_SIZE = 256
+DEFAULT_EPISODES = 100
+DEFAULT_BATCH_SIZE = 512
 DEFAULT_SAVE_INTERVAL = 10
 DEFAULT_NUM_CHECKPOINTS = 5
-DEFAULT_MCTS_SIMS = 600
-DEFAULT_MCTS_RATIO = 0.4
+DEFAULT_MCTS_SIMS = 200
+DEFAULT_MCTS_RATIO = 1.0
 DEFAULT_BUFFER_SIZE = 20000
-DEFAULT_POLICY_WEIGHT = 0.8
-DEFAULT_NUM_EPOCHS = 64
+DEFAULT_POLICY_WEIGHT = 1.0
+DEFAULT_NUM_EPOCHS = 32
 
 # Opponent ratio scheduling constants
-INITIAL_RANDOM_OPPONENT_RATIO = 0.7
-FINAL_RANDOM_OPPONENT_RATIO = 0.2
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.2
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.6
-OPPONENT_TRANSITION_ITERATIONS = 150
+INITIAL_RANDOM_OPPONENT_RATIO = 0.0
+FINAL_RANDOM_OPPONENT_RATIO = 0.0
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.5
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.5
+OPPONENT_TRANSITION_ITERATIONS = 200
+
+# Scales the 'difficulty' of the strategic opponent by specifying a chance to make a random move
+DEFAULT_INITIAL_RANDOM_CHANCE = 0.9
+DEFAULT_FINAL_RANDOM_CHANCE = 0.1
+DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = 200
 
 # Bootstrap constants
-BOOTSTRAP_MIN_WEIGHT = 0.1
-BOOTSTRAP_MAX_WEIGHT = 0.3
-BOOTSTRAP_TRANSITION_ITERATIONS = 100
+BOOTSTRAP_MIN_WEIGHT = 0.4
+BOOTSTRAP_MAX_WEIGHT = 0.5
+BOOTSTRAP_TRANSITION_ITERATIONS = 200
 
 # Add this constant near the top with other constants
 DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint_interrupted.pth"
@@ -102,31 +107,37 @@ def hybrid_training_loop(
 
     # Enhance interrupt handler to save checkpoint on exit
     interrupt_received = False
+    in_training_phase = False  # track whether we're in the training phase
 
     def handle_interrupt(signum, frame):
         nonlocal interrupt_received
         if interrupt_received:  # Second interrupt, exit immediately
             print("\nForced exit...")
             sys.exit(1)
-        print(
-            "\nInterrupt received, saving checkpoint and finishing current iteration..."
-        )
-        # Save checkpoint for resuming later
-        if not os.path.exists("saved_models"):
-            os.makedirs("saved_models")
 
-        # Use the constant here
-        checkpoint_path = DEFAULT_CHECKPOINT_PATH
-        training_state = {
-            "replay_buffer": replay_buffer,
-            "running_loss": running_loss,
-            "running_count": running_count,
-            "iteration": iteration,
-            "rng_state": rng.__getstate__(),
-        }
-        model.save_checkpoint(checkpoint_path, training_state)
-        print(f"Saved checkpoint to {checkpoint_path}")
-        print(f"Resume with: --resume")  # Simplified message
+        print("\nInterrupt received...")
+
+        if in_training_phase:
+            print("Currently in training phase, will save after this epoch completes.")
+        else:
+            print("Stopping the current iteration and saving checkpoint...")
+
+            # Save checkpoint for resuming later
+            if not os.path.exists("saved_models"):
+                os.makedirs("saved_models")
+
+            # Use the constant here
+            checkpoint_path = DEFAULT_CHECKPOINT_PATH
+            training_state = {
+                "replay_buffer": replay_buffer,
+                "running_loss": running_loss,
+                "running_count": running_count,
+                "iteration": iteration,
+                "rng_state": rng.__getstate__(),
+            }
+            model.save_checkpoint(checkpoint_path, training_state)
+            print(f"Saved checkpoint to {checkpoint_path}")
+            print(f"Resume with: --resume")  # Simplified message
 
         interrupt_received = True
 
@@ -190,51 +201,6 @@ def hybrid_training_loop(
             value=0.0,  # Will be filled in later
             current_player=game.current_player,
         )
-
-    # Helper function to get model's move, either via MCTS or direct policy
-    def get_model_move_for_play(game, use_mcts=False, temperature=1.0):
-        """Get a move from the model for gameplay (returns the move and one-hot policy)"""
-        legal_moves = game.get_legal_moves()
-        # Use subjective=True for the state representation
-        state_rep = game.get_game_state_representation(subjective=True)
-
-        if use_mcts:
-            # Use pure rollout MCTS for move selection (no model)
-            mcts = MCTS(num_simulations=DEFAULT_MCTS_SIMS)
-            mcts.set_temperature(temperature)
-            mcts_policy, root_node = mcts.search(game)
-            policy = mcts_policy
-            # No predicted value in pure rollout mode
-            root_value = 0.0
-        else:
-            # Use direct policy from neural network
-            policy, value_pred = model.predict(
-                state_rep.board, state_rep.flat_values, legal_moves
-            )
-            policy = policy.squeeze(0)
-            root_value = value_pred.squeeze(0)[0]
-
-        # Apply mask for legal moves
-        masked_policy = policy * legal_moves
-        masked_policy = masked_policy / (masked_policy.sum() + 1e-8)
-
-        # Select move based on temperature
-        if temperature > 0:
-            # Sample from the probability distribution
-            policy_flat = masked_policy.flatten()
-            move_idx = rng.choice(len(policy_flat), p=policy_flat)
-            move_coords = np.unravel_index(move_idx, masked_policy.shape)
-        else:
-            # Choose move deterministically
-            move_coords = np.unravel_index(masked_policy.argmax(), masked_policy.shape)
-
-        move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
-
-        # Create one-hot encoded policy target (for gameplay only)
-        policy_target = np.zeros_like(masked_policy)
-        policy_target[move_coords] = 1.0
-
-        return move, policy_target, root_value, state_rep
 
     def get_temperature(move_count, iteration, max_iterations=150):
         """Dynamic temperature with extended exploration and smoother decay.
@@ -449,6 +415,20 @@ def hybrid_training_loop(
         bootstrap_factor = max(0.2, 1.0 - (move_index / 30))
         return (1 - bootstrap_factor) * outcome_value + bootstrap_factor * mcts_value
 
+    def get_random_chance(iteration):
+        """Calculate the random chance for strategic opponent based on current iteration.
+
+        Linearly decreases from DEFAULT_INITIAL_RANDOM_CHANCE to DEFAULT_FINAL_RANDOM_CHANCE
+        over DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS iterations.
+        """
+        if iteration >= DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS:
+            return DEFAULT_FINAL_RANDOM_CHANCE
+
+        progress = iteration / DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS
+        return DEFAULT_INITIAL_RANDOM_CHANCE - progress * (
+            DEFAULT_INITIAL_RANDOM_CHANCE - DEFAULT_FINAL_RANDOM_CHANCE
+        )
+
     print("Starting hybrid training loop with value bootstrapping")
     print("Episodes per iteration:", DEFAULT_EPISODES)
     print("MCTS simulations per move:", DEFAULT_MCTS_SIMS)
@@ -461,19 +441,6 @@ def hybrid_training_loop(
             1.0 - random_opponent_ratio - strategic_opponent_ratio
         )
     )
-    print(
-        "Final opponent ratios after {} iterations:".format(
-            OPPONENT_TRANSITION_ITERATIONS
-        )
-    )
-    print("  Random: {:.1%}".format(FINAL_RANDOM_OPPONENT_RATIO))
-    print("  Strategic: {:.1%}".format(FINAL_STRATEGIC_OPPONENT_RATIO))
-    print(
-        "  Self-play: {:.1%}".format(
-            1.0 - FINAL_RANDOM_OPPONENT_RATIO - FINAL_STRATEGIC_OPPONENT_RATIO
-        )
-    )
-    print("Using AlphaZero-style MCTS policy targets for better learning")
     print("Initial bootstrap weight: {:.2f}".format(get_bootstrap_weight(iteration)))
     print("Final bootstrap weight: {:.2f}".format(BOOTSTRAP_MAX_WEIGHT))
     print("Batch size:", DEFAULT_BATCH_SIZE)
@@ -578,7 +545,13 @@ def hybrid_training_loop(
                             )
                     else:
                         # Opponent's turn
-                        move = opponent.get_move(game)
+                        if opponent_type == "strategic":
+                            # Get random chance based on current iteration
+                            random_chance = get_random_chance(iteration)
+                            move = opponent.get_move(game, random_chance)
+                        else:
+                            move = opponent.get_move(game)
+
                         if move is None:
                             game.pass_turn()
                             continue
@@ -611,6 +584,11 @@ def hybrid_training_loop(
                                 hasattr(example, "mcts_value")
                                 and example.mcts_value is not None
                             ):
+                                # Track value prediction error before applying blending
+                                iter_stats["value_error_sum"] += abs(
+                                    outcome_value - example.mcts_value
+                                )
+
                                 example.value = get_improved_value_target(
                                     outcome_value, example.mcts_value, i
                                 )
@@ -628,6 +606,11 @@ def hybrid_training_loop(
 
                                     # Negate since it's from opponent's perspective
                                     bootstrap_value = -float(next_value[0][0])
+
+                                    # Track value prediction error for bootstrapped values too
+                                    iter_stats["value_error_sum"] += abs(
+                                        outcome_value - bootstrap_value
+                                    )
 
                                     # Mix the outcome with bootstrapped value
                                     example.value = (
@@ -704,6 +687,8 @@ def hybrid_training_loop(
             )
             epoch_losses = {"total": 0, "policy": 0, "value": 0}
 
+            in_training_phase = True  # Set flag to indicate we're in training
+
             for _ in train_pbar:
                 # Sample from replay buffer
                 indices = rng.choice(
@@ -760,6 +745,8 @@ def hybrid_training_loop(
 
             # Step the scheduler once per iteration
             model.scheduler.step()
+
+            in_training_phase = False  # Reset flag after training phase
 
             # Print core training statistics (simplified)
             elapsed_time = time.time() - training_start
@@ -847,15 +834,30 @@ def hybrid_training_loop(
                 f"\nIteration {iteration} completed in {time.time() - iteration_start:.1f}s "
                 f"({int(hours)}h {int(minutes)}m total) | "
                 f"Buffer: {len(replay_buffer)} | "
-                f"Loss: {avg_total:.4f} (p:{avg_policy:.4f}, v:{avg_value:.4f})"
+                f"Loss: {avg_total:.4f} (p:{avg_policy:.4f}, v:{avg_value:.4f}) | "
+                f"LR: {model.optimizer.param_groups[0]['lr']:.6f}"  # current learning rate
             )
+
+            # Enhanced winrate reporting
+            print(
+                f"Win Rates - Strategic: P1 {iter_stats['strategic_wins_as_p1']}/{iter_stats['strategic_games_as_p1']} ({strategic_p1_rate:.1f}%), "
+                f"P2 {iter_stats['strategic_wins_as_p2']}/{iter_stats['strategic_games_as_p2']} ({strategic_p2_rate:.1f}%)"
+            )
+            print(
+                f"Win Rates - Random: P1 {iter_stats['random_wins_as_p1']}/{iter_stats['random_games_as_p1']} ({random_p1_rate:.1f}%), "
+                f"P2 {iter_stats['random_wins_as_p2']}/{iter_stats['random_games_as_p2']} ({random_p2_rate:.1f}%)"
+            )
+            print(
+                f"Win Rates - Self-play: P1 {iter_stats['self_play_p1_wins']}/{iter_stats['self_play_games']} ({self_play_p1_rate:.1f}%)"
+            )
+
             print(
                 f"Moves - MCTS: {iter_stats['mcts_moves']} ({mcts_ratio:.2f}), "
                 f"Direct: {iter_stats['direct_moves']} ({direct_ratio:.2f})"
             )
             print(
-                f"Policy confidence - MCTS: {avg_mcts_confidence:.3f}, Direct: {avg_direct_confidence:.3f} | "
-                f"Entropy - MCTS: {avg_mcts_entropy:.3f}, Direct: {avg_direct_entropy:.3f}"
+                f"Policy confidence - MCTS: {avg_mcts_confidence:.3f}, Direct: {avg_direct_confidence:.3f} | "  # max prob in distribution
+                f"Entropy - MCTS: {avg_mcts_entropy:.3f}, Direct: {avg_direct_entropy:.3f}"  # uncertainty in policy distribution
             )
             print(
                 f"Examples - Win: {iter_stats['win_examples'] / iter_stats['total_games']:.2f}, "
@@ -864,30 +866,41 @@ def hybrid_training_loop(
             )
             print(
                 f"Value - Avg: {avg_value_prediction:.3f}, |Avg|: {avg_abs_value:.3f}, "
-                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}, "
-                f"Error: {avg_value_error:.3f}"
+                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}, "  # ratio of confident predictions (>0.8)
+                f"Error: {avg_value_error:.3f}"  # avg absolute difference between predicted & actual value
             )
 
-            # Regular checkpoint saving
-            if iteration % DEFAULT_SAVE_INTERVAL == 0:
-                if not os.path.exists("saved_models"):
-                    os.makedirs("saved_models")
+            # Print opponent ratios
+            print("Opponent ratios for this iteration:")
+            print("  Random: {:.1%}".format(random_opponent_ratio))
+            print("  Strategic: {:.1%}".format(strategic_opponent_ratio))
+            print(
+                "  Self-play: {:.1%}".format(
+                    1.0 - random_opponent_ratio - strategic_opponent_ratio
+                )
+            )
+            print(
+                "Strategic opponent random chance: {:.1%}".format(
+                    get_random_chance(iteration)
+                )
+            )
+            print()
 
-                # Save latest model (weights only, for compatibility)
-                model.save(latest_model_path)
-
-                # Every so often, save a full checkpoint
-                if iteration % (DEFAULT_SAVE_INTERVAL * 2) == 0:
-                    checkpoint_path = f"saved_models/checkpoint_iter_{iteration}.pth"
-                    training_state = {
-                        "replay_buffer": replay_buffer,
-                        "running_loss": running_loss,
-                        "running_count": running_count,
-                        "iteration": iteration,
-                        "rng_state": rng.__getstate__(),
-                    }
-                    model.save_checkpoint(checkpoint_path, training_state)
-                    print(f"Saved full checkpoint to {checkpoint_path}")
+            # Print final random chance at the end of training
+            print("Final opponent ratios:")
+            print("  Random: {:.1%}".format(FINAL_RANDOM_OPPONENT_RATIO))
+            print("  Strategic: {:.1%}".format(FINAL_STRATEGIC_OPPONENT_RATIO))
+            print(
+                "  Self-play: {:.1%}".format(
+                    1.0 - FINAL_RANDOM_OPPONENT_RATIO - FINAL_STRATEGIC_OPPONENT_RATIO
+                )
+            )
+            print(
+                "Final strategic opponent random chance: {:.1%}".format(
+                    DEFAULT_FINAL_RANDOM_CHANCE
+                )
+            )
+            print()
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
@@ -901,7 +914,7 @@ def hybrid_training_loop(
     if not os.path.exists("saved_models"):
         os.makedirs("saved_models")
     final_path = "saved_models/model_final.pth"
-    model.save(final_path)
+    model.save_checkpoint(final_path)  # Use save_checkpoint instead of save
     print(f"Saved final model to {final_path}")
 
     return model
@@ -909,10 +922,10 @@ def hybrid_training_loop(
 
 if __name__ == "__main__":
     # Parse command line arguments
-    device = "cpu"  # default to CPU
     mode = "stable"  # default mode
     load_path = None
     resume_path = None
+    device = None  # Don't set a default yet
 
     # Check for device, fast mode, and load/resume path
     i = 1
@@ -931,17 +944,24 @@ if __name__ == "__main__":
             resume_path = DEFAULT_CHECKPOINT_PATH
         i += 1
 
-    # Only try to use CUDA if explicitly requested
-    if device == "cuda":
+    # Determine device (auto-select CUDA if available)
+    if os.environ.get("FORCE_CPU") == "1":
+        print("FORCE_CPU environment variable set, using CPU")
+        device = "cpu"
+    elif device is None:  # No explicit device specified
         try:
             import torch.cuda
 
-            if not torch.cuda.is_available():
-                print("CUDA requested but not available, falling back to CPU")
+            if torch.cuda.is_available():
+                device = "cuda"
+                print("CUDA is available, using GPU")
+            else:
                 device = "cpu"
+                print("CUDA not available, using CPU")
         except ImportError:
-            print("CUDA requested but torch.cuda not available, falling back to CPU")
             device = "cpu"
+            print("torch.cuda not available, using CPU")
+    # else: use the explicitly specified device
 
     print(f"Using device: {device}")
 

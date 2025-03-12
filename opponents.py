@@ -16,7 +16,7 @@ class RandomOpponent:
 
 
 class StrategicOpponent:
-    def get_move(self, game_state: GameState) -> Move:
+    def get_move(self, game_state: GameState, random_chance: float = 0.0) -> Move:
         """Strategic opponent with sophisticated prioritization:
         1. Moves that force opponent to skip their turn (no valid moves)
         2. Moves that prevent opponent from placing in center next turn
@@ -24,10 +24,22 @@ class StrategicOpponent:
         4. Moves in center squares
         5. Moves that complete a three-line
         6. Any other legal move
+
+        Args:
+            game_state: current state of the game
+            random_chance: probability (0.0-1.0) of making a completely random move
         """
         legal_moves = game_state.get_legal_moves()
         if not np.any(legal_moves):
             return None
+
+        # check if we should make a random move based on random_chance
+        if random_chance > 0 and np.random.random() < random_chance:
+            # use RandomOpponent's logic for a completely random move
+            legal_positions = np.argwhere(legal_moves)
+            idx = np.random.randint(len(legal_positions))
+            x, y, piece_type = legal_positions[idx]
+            return Move(x, y, PieceType(piece_type))
 
         # Define central squares
         central_squares = {(1, 1), (1, 2), (2, 1), (2, 2)}

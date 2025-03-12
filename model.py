@@ -136,7 +136,7 @@ class ModelWrapper:
         # div factors used in scheduler
         self.div_factor = 15
         self.final_div_factor = 30
-        self.max_iterations = 200
+        self.max_iterations = 80
 
         # Simplified learning rate configuration with only max_lr
         if self.mode == "fast":
@@ -340,16 +340,17 @@ class ModelWrapper:
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
             policy_loss = policy_loss - 0.03 * entropy
 
-        # Value loss with stronger label smoothing to prevent overconfidence
-        # Increase smoothing factor from 0.93 to 0.85 to pull targets more toward zero
-        smoothed_targets = (
-            value_targets * 0.85
-        )  # Scale targets toward zero more aggressively
-        value_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
+        value_loss = F.mse_loss(value_pred.squeeze(-1), value_targets)
+        value_variance_penalty = 0.1 * torch.mean(
+            torch.square(torch.abs(value_pred) - 0.5)
+        )
+        value_loss = value_loss + value_variance_penalty
 
         # Increase L2 regularization for value predictions to discourage extreme values
         # Increase from 0.0001 to 0.0005 for stronger regularization effect
-        value_l2_reg = 0.0005 * torch.mean(torch.square(value_pred))
+        value_l2_reg = 0.0001 * torch.mean(
+            torch.square(value_pred)
+        )  # Reduced from 0.0005
         value_loss = value_loss + value_l2_reg
 
         # Combine losses with policy_weight emphasis

@@ -13,34 +13,44 @@ from opponents import RandomOpponent, StrategicOpponent
 from mcts import MCTS, add_dirichlet_noise
 import random
 import math
+from eval_model import policy_vs_mcts_eval  # import the evaluation function
+from collections import defaultdict  # for buffer balancing
 
 # Training parameters
 DEFAULT_EPISODES = 100
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_SAVE_INTERVAL = 10
 DEFAULT_NUM_CHECKPOINTS = 5
-DEFAULT_MCTS_SIMS = 200
 DEFAULT_MCTS_RATIO = 1.0
 DEFAULT_BUFFER_SIZE = 20000
-DEFAULT_POLICY_WEIGHT = 1.0
-DEFAULT_NUM_EPOCHS = 32
+DEFAULT_POLICY_WEIGHT = 0.5
+DEFAULT_NUM_EPOCHS = 8
+DEFAULT_EVAL_INTERVAL = 5  # run eval every 20 iterations
+DEFAULT_EVAL_GAMES = 30  # number of games to play during evaluation
+DEFAULT_LEARN_FROM_STRATEGIC = False  # whether to learn from strategic opponent's moves
+
+# MCTS simulation scaling constants
+DEFAULT_MIN_MCTS_SIMS = 200
+DEFAULT_MAX_MCTS_SIMS = 800
+
+MAX_ITERATIONS = 20
 
 # Opponent ratio scheduling constants
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.25
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.10
-OPPONENT_TRANSITION_ITERATIONS = 80
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.1
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.1
+OPPONENT_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Scales the 'difficulty' of the strategic opponent by specifying a chance to make a random move
-DEFAULT_INITIAL_RANDOM_CHANCE = 0.9
+DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
 DEFAULT_FINAL_RANDOM_CHANCE = 0.0
-DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = 80
+DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Bootstrap constants
-BOOTSTRAP_MIN_WEIGHT = 0.0
-BOOTSTRAP_MAX_WEIGHT = 0.0
-BOOTSTRAP_TRANSITION_ITERATIONS = 80
+BOOTSTRAP_MIN_WEIGHT = 0.2  # Start with modest bootstrapping
+BOOTSTRAP_MAX_WEIGHT = 0.5  # Increase to a reasonable maximum
+BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Add this constant near the top with other constants
 DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint_interrupted.pth"
@@ -52,6 +62,7 @@ class TrainingExample:
     policy: np.ndarray  # One-hot encoded actual move made
     value: float  # Game outcome from current player's perspective
     current_player: Player  # Store which player made the move
+    move_count: int = None  # Current move count when example was created
     mcts_value: float = None  # Optional MCTS value prediction
 
 
@@ -171,7 +182,15 @@ def hybrid_training_loop(
         "value_prediction_abs_sum": 0,  # sum of absolute value predictions
         "value_prediction_count": 0,  # count of value predictions
         "value_error_sum": 0,  # sum of |actual_outcome - predicted_value|
+        "value_error_early_sum": 0,  # sum of errors for move_count < 6
+        "value_error_mid_sum": 0,  # sum of errors for 6 <= move_count <= 11
+        "value_error_late_sum": 0,  # sum of errors for move_count >= 12
+        "value_error_early_count": 0,  # count of errors for move_count < 6
+        "value_error_mid_count": 0,  # count of errors for 6 <= move_count <= 11
+        "value_error_late_count": 0,  # count of errors for move_count >= 12
         "extreme_value_count": 0,  # count of values near -1 or 1 (confident predictions)
+        "cache_hits": 0,  # Track total cache hits
+        "cache_misses": 0,  # Track total cache misses
     }
 
     # Keep track of last N checkpoints
@@ -200,6 +219,7 @@ def hybrid_training_loop(
             policy=policy_target,
             value=0.0,  # Will be filled in later
             current_player=game.current_player,
+            move_count=game.move_count,
         )
 
     def get_temperature(move_count, iteration, max_iterations=150):
@@ -245,6 +265,16 @@ def hybrid_training_loop(
 
         return base_temp * iteration_factor
 
+    def get_mcts_sims_for_iteration(iteration):
+        """Scale MCTS simulations from min to max by final iteration"""
+        # Linear scaling based on iteration progress
+        progress = min(1.0, iteration / MAX_ITERATIONS)
+        sims = DEFAULT_MIN_MCTS_SIMS + progress * (
+            DEFAULT_MAX_MCTS_SIMS - DEFAULT_MIN_MCTS_SIMS
+        )
+        # Return as integer
+        return int(sims)
+
     def get_model_move_with_policy(game, use_mcts=True, temperature=1.0, iteration=0):
         """Get a move from the model along with the training policy target
         (full MCTS distribution if MCTS was used, otherwise one-hot)"""
@@ -258,7 +288,7 @@ def hybrid_training_loop(
             # Noise will be applied inside the MCTS search
             mcts = MCTS(
                 model=model,
-                num_simulations=DEFAULT_MCTS_SIMS,
+                num_simulations=get_mcts_sims_for_iteration(iteration),
                 c_puct=1.0,
             )
             mcts.set_temperature(temperature)
@@ -266,6 +296,13 @@ def hybrid_training_loop(
             mcts.set_move_count(move_count)  # Set move count for noise
             mcts_policy, root_node = mcts.search(game)
             policy = mcts_policy
+
+            # Track cache statistics
+            iter_stats["cache_hits"] += mcts.cache_hits
+            iter_stats["cache_misses"] += mcts.cache_misses
+            # Reset MCTS cache stats for next use
+            mcts.cache_hits = 0
+            mcts.cache_misses = 0
 
             # Use full MCTS distribution as policy target when MCTS is used
             policy_target = mcts_policy.copy()
@@ -370,7 +407,10 @@ def hybrid_training_loop(
         iter_stats["value_prediction_squared_sum"] += root_value * root_value
         iter_stats["value_prediction_abs_sum"] += abs(root_value)
         iter_stats["value_prediction_count"] += 1
-        if abs(root_value) > 0.8:  # Track highly confident value predictions
+
+        # Lower threshold to better match our model's actual behavior
+        # Also count both positive and negative extreme values separately
+        if abs(root_value) > 0.6:  # Track moderately confident value predictions
             iter_stats["extreme_value_count"] += 1
 
         return move, policy_target, root_value, state_rep
@@ -409,11 +449,13 @@ def hybrid_training_loop(
         )
 
     # Function to calculate improved value target using bootstrapping
-    def get_improved_value_target(outcome_value, mcts_value, move_index):
+    def get_improved_value_target(outcome_value, mcts_value, move_index, global_weight):
         """Blend the final outcome with MCTS predicted value for better training signal"""
         # Early moves use more bootstrapping, later moves use more outcome
-        bootstrap_factor = max(0.2, 1.0 - (move_index / 30))
-        return (1 - bootstrap_factor) * outcome_value + bootstrap_factor * mcts_value
+        move_factor = max(0.2, 1.0 - (move_index / 30))
+        # Combine global weight with move-specific factor
+        effective_factor = move_factor * global_weight
+        return (1 - effective_factor) * outcome_value + effective_factor * mcts_value
 
     def get_random_chance(iteration):
         """Calculate the random chance for strategic opponent based on current iteration.
@@ -429,18 +471,168 @@ def hybrid_training_loop(
             DEFAULT_INITIAL_RANDOM_CHANCE - DEFAULT_FINAL_RANDOM_CHANCE
         )
 
+    def evaluate_model(model: ModelWrapper, iteration: int, debug: bool = False):
+        """Run evaluation games between raw policy and MCTS to track progress.
+
+        This function pits the model's raw policy against MCTS-guided play
+        to measure how the policy network is improving over time.
+        """
+        print(f"\nRunning evaluation at iteration {iteration}...")
+        stats = {
+            "raw_policy_wins_as_p1": 0,
+            "raw_policy_wins_as_p2": 0,
+            "raw_policy_games_as_p1": 0,
+            "raw_policy_games_as_p2": 0,
+            "draws": 0,
+            "total_games": 0,
+        }
+
+        # Create progress bar
+        eval_pbar = tqdm(range(DEFAULT_EVAL_GAMES), desc="Evaluation", leave=False)
+
+        for _ in eval_pbar:
+            # Initialize game
+            game = GameState()
+
+            # Decide randomly which player uses raw policy
+            raw_policy_plays_p1 = random.random() < 0.5
+
+            if raw_policy_plays_p1:
+                stats["raw_policy_games_as_p1"] += 1
+            else:
+                stats["raw_policy_games_as_p2"] += 1
+
+            move_count = 0
+
+            # Play the game
+            while True:
+                legal_moves = game.get_legal_moves()
+                if not np.any(legal_moves):
+                    game.pass_turn()
+                    continue
+
+                # Determine which player's turn it is
+                is_p1_turn = game.current_player == Player.ONE
+
+                # Use raw policy if it's this player's turn
+                use_raw_policy = (is_p1_turn and raw_policy_plays_p1) or (
+                    not is_p1_turn and not raw_policy_plays_p1
+                )
+
+                # Get state representation
+                state_rep = game.get_game_state_representation(subjective=True)
+
+                if use_raw_policy:
+                    # Use direct policy from neural network
+                    policy, value_pred = model.predict(
+                        state_rep.board, state_rep.flat_values, legal_moves
+                    )
+                    policy = policy.squeeze(0)
+
+                    # Apply legal moves mask
+                    masked_policy = policy * legal_moves
+
+                    # Renormalize
+                    policy_sum = np.sum(masked_policy)
+                    if policy_sum > 0:
+                        masked_policy = masked_policy / policy_sum
+
+                    # Choose best move deterministically during evaluation
+                    move_coords = np.unravel_index(
+                        masked_policy.argmax(), masked_policy.shape
+                    )
+                else:
+                    # Use model-guided MCTS with more simulations for evaluation
+                    mcts = MCTS(
+                        model=model,
+                        num_simulations=DEFAULT_MAX_MCTS_SIMS,
+                        c_puct=1.0,
+                    )
+                    mcts.set_temperature(
+                        0.0
+                    )  # Use deterministic play during evaluation
+                    mcts_policy, _ = mcts.search(game)
+
+                    # Select best move according to MCTS policy
+                    move_coords = np.unravel_index(
+                        mcts_policy.argmax(), mcts_policy.shape
+                    )
+
+                # Create and make the move
+                move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
+                result = game.make_move(move)
+                move_count += 1
+
+                # Update progress bar
+                current_p1_wins = f"{stats['raw_policy_wins_as_p1']}/{stats['raw_policy_games_as_p1']}"
+                current_p2_wins = f"{stats['raw_policy_wins_as_p2']}/{stats['raw_policy_games_as_p2']}"
+                eval_pbar.set_postfix(
+                    {
+                        "P1": current_p1_wins,
+                        "P2": current_p2_wins,
+                        "draws": stats["draws"],
+                    }
+                )
+
+                if result == TurnResult.GAME_OVER:
+                    # Game is over, get the winner
+                    winner = game.get_winner()
+                    stats["total_games"] += 1
+
+                    if winner is None:
+                        stats["draws"] += 1
+                    elif (winner == Player.ONE and raw_policy_plays_p1) or (
+                        winner == Player.TWO and not raw_policy_plays_p1
+                    ):
+                        # Raw policy player won
+                        if raw_policy_plays_p1:
+                            stats["raw_policy_wins_as_p1"] += 1
+                        else:
+                            stats["raw_policy_wins_as_p2"] += 1
+
+                    break  # Game over
+
+                # Safety check for extremely long games
+                if move_count > 100:
+                    stats["draws"] += 1
+                    stats["total_games"] += 1
+                    break
+
+        # Calculate win rates
+        p1_winrate = (
+            stats["raw_policy_wins_as_p1"] / max(1, stats["raw_policy_games_as_p1"])
+        ) * 100
+        p2_winrate = (
+            stats["raw_policy_wins_as_p2"] / max(1, stats["raw_policy_games_as_p2"])
+        ) * 100
+        draw_rate = (stats["draws"] / max(1, stats["total_games"])) * 100
+
+        # Print results
+        print("\n=== Evaluation Results ===")
+        print(f"Raw Policy vs MCTS ({DEFAULT_EVAL_GAMES} games)")
+        print(
+            f"Raw Policy as P1: {stats['raw_policy_wins_as_p1']}/{stats['raw_policy_games_as_p1']} ({p1_winrate:.1f}%)"
+        )
+        print(
+            f"Raw Policy as P2: {stats['raw_policy_wins_as_p2']}/{stats['raw_policy_games_as_p2']} ({p2_winrate:.1f}%)"
+        )
+        print(f"Draws: {stats['draws']} ({draw_rate:.1f}%)")
+        print("=========================\n")
+
+        return stats
+
     print("Starting hybrid training loop with value bootstrapping")
     print("Episodes per iteration:", DEFAULT_EPISODES)
-    print("MCTS simulations per move:", DEFAULT_MCTS_SIMS)
     print("MCTS move ratio: {:.1%}".format(DEFAULT_MCTS_RATIO))
-    print("Initial opponent ratios:")
-    print("  Random: {:.1%}".format(random_opponent_ratio))
-    print("  Strategic: {:.1%}".format(strategic_opponent_ratio))
-    print(
-        "  Self-play: {:.1%}".format(
-            1.0 - random_opponent_ratio - strategic_opponent_ratio
-        )
-    )
+    print("Learn from strategic opponent: {}".format(DEFAULT_LEARN_FROM_STRATEGIC))
+    # print("Initial opponent ratios:")
+    # print("  Random: {:.1%}".format(random_opponent_ratio))
+    # print("  Strategic: {:.1%}".format(strategic_opponent_ratio))
+    # print(
+    #     "  Self-play: {:.1%}".format(
+    #         1.0 - random_opponent_ratio - strategic_opponent_ratio
+    #     )
+    # )
     print("Initial bootstrap weight: {:.2f}".format(get_bootstrap_weight(iteration)))
     print("Final bootstrap weight: {:.2f}".format(BOOTSTRAP_MAX_WEIGHT))
     print("Batch size:", DEFAULT_BATCH_SIZE)
@@ -453,6 +645,9 @@ def hybrid_training_loop(
             iteration += 1
             iteration_start = time.time()
 
+            # Clear MCTS prediction cache at the start of each iteration
+            MCTS.clear_cache()
+
             # Update opponent ratios based on current iteration
             random_opponent_ratio, strategic_opponent_ratio = get_opponent_ratios(
                 iteration
@@ -463,6 +658,9 @@ def hybrid_training_loop(
 
             # Reset iteration stats
             iter_stats = stats_template.copy()
+
+            # Create a list to collect all examples from this iteration
+            current_iteration_examples = []
 
             # Create progress bar for all games
             episode_pbar = tqdm(
@@ -540,7 +738,20 @@ def hybrid_training_loop(
                                     policy=policy_target,
                                     value=0.0,  # Will be filled in later
                                     current_player=game.current_player,
+                                    move_count=game.move_count,
                                     mcts_value=value_pred,  # Store the MCTS value prediction
+                                )
+                            )
+                        else:
+                            # also store examples for direct policy moves
+                            examples.append(
+                                TrainingExample(
+                                    state_rep=state_rep,
+                                    policy=policy_target,
+                                    value=0.0,  # will be filled in later
+                                    current_player=game.current_player,
+                                    move_count=game.move_count,
+                                    # no mcts_value for direct policy moves
                                 )
                             )
                     else:
@@ -556,8 +767,11 @@ def hybrid_training_loop(
                             game.pass_turn()
                             continue
 
-                        # Only store examples from strategic opponent
-                        if opponent_type == "strategic":
+                        # Only store examples from strategic opponent if configured to do so
+                        if (
+                            opponent_type == "strategic"
+                            and DEFAULT_LEARN_FROM_STRATEGIC
+                        ):
                             # Create and store example from opponent's move
                             opponent_example = create_opponent_example(
                                 game, move, opponent_type
@@ -585,12 +799,25 @@ def hybrid_training_loop(
                                 and example.mcts_value is not None
                             ):
                                 # Track value prediction error before applying blending
-                                iter_stats["value_error_sum"] += abs(
-                                    outcome_value - example.mcts_value
-                                )
+                                error = abs(outcome_value - example.mcts_value)
+                                iter_stats["value_error_sum"] += error
+
+                                # Categorize error by move count
+                                if example.move_count < 6:
+                                    iter_stats["value_error_early_sum"] += error
+                                    iter_stats["value_error_early_count"] += 1
+                                elif example.move_count <= 11:
+                                    iter_stats["value_error_mid_sum"] += error
+                                    iter_stats["value_error_mid_count"] += 1
+                                else:
+                                    iter_stats["value_error_late_sum"] += error
+                                    iter_stats["value_error_late_count"] += 1
 
                                 example.value = get_improved_value_target(
-                                    outcome_value, example.mcts_value, i
+                                    outcome_value,
+                                    example.mcts_value,
+                                    i,
+                                    bootstrap_weight,
                                 )
                             else:
                                 # For non-MCTS moves, use standard bootstrapping
@@ -608,9 +835,19 @@ def hybrid_training_loop(
                                     bootstrap_value = -float(next_value[0][0])
 
                                     # Track value prediction error for bootstrapped values too
-                                    iter_stats["value_error_sum"] += abs(
-                                        outcome_value - bootstrap_value
-                                    )
+                                    error = abs(outcome_value - bootstrap_value)
+                                    iter_stats["value_error_sum"] += error
+
+                                    # Categorize error by move count
+                                    if example.move_count < 6:
+                                        iter_stats["value_error_early_sum"] += error
+                                        iter_stats["value_error_early_count"] += 1
+                                    elif example.move_count <= 11:
+                                        iter_stats["value_error_mid_sum"] += error
+                                        iter_stats["value_error_mid_count"] += 1
+                                    else:
+                                        iter_stats["value_error_late_sum"] += error
+                                        iter_stats["value_error_late_count"] += 1
 
                                     # Mix the outcome with bootstrapped value
                                     example.value = (
@@ -658,28 +895,79 @@ def hybrid_training_loop(
 
                         break  # Game over
 
-                # Add directly to replay buffer - no conversion needed
-                replay_buffer.extend(examples)
+                # Add the game examples to the iteration examples
+                current_iteration_examples.extend(examples)
 
                 # Update progress bar
                 episode_pbar.update(1)
+
+                # Calculate cache hit rate for display
+                total_cache_attempts = (
+                    iter_stats["cache_hits"] + iter_stats["cache_misses"]
+                )
+                current_hit_rate = (
+                    f"{(iter_stats['cache_hits'] / total_cache_attempts * 100):.1f}%"
+                    if total_cache_attempts > 0
+                    else "0.0%"
+                )
+
+                # Calculate strategic opponent stats
+                strategic_p1_wins = f"{iter_stats['strategic_wins_as_p1']}/{iter_stats['strategic_games_as_p1']}"
+                strategic_p2_wins = f"{iter_stats['strategic_wins_as_p2']}/{iter_stats['strategic_games_as_p2']}"
+
+                # Set postfix with expanded information
                 episode_pbar.set_postfix(
                     {
-                        "wins": iter_stats["win_examples"],
-                        "losses": iter_stats["loss_examples"],
-                        "type": opponent_type,
+                        "cache_size": len(MCTS.prediction_cache),
+                        "cache": current_hit_rate,
+                        "strat_p1": strategic_p1_wins,
+                        "strat_p2": strategic_p2_wins,
                     }
                 )
 
-            # Trim replay buffer if needed
-            if len(replay_buffer) > DEFAULT_BUFFER_SIZE:
-                indices = rng.choice(
-                    len(replay_buffer), size=DEFAULT_BUFFER_SIZE, replace=False
-                )
-                replay_buffer = [replay_buffer[i] for i in indices]
+            # Balance the replay buffer using current_iteration_examples
+            tqdm.write(
+                f"Balancing replay buffer (current size: {len(replay_buffer)}, new examples: {len(current_iteration_examples)})"
+            )
+            replay_buffer = balance_replay_buffer(
+                replay_buffer,  # Previous buffer
+                current_iteration_examples,  # New examples we just collected
+                buffer_size=DEFAULT_BUFFER_SIZE,
+            )
 
-                # Log only buffer size after trimming
-                tqdm.write(f"Trimmed buffer size: {len(replay_buffer)}")
+            # Log buffer size and distribution after balancing
+            # Count buffer categories after balancing
+            buffer_win_p1 = buffer_win_p2 = buffer_loss_p1 = buffer_loss_p2 = (
+                buffer_draw_p1
+            ) = buffer_draw_p2 = 0
+            for ex in replay_buffer:
+                player = "p1" if ex.current_player == Player.ONE else "p2"
+                if ex.value > 0.2:
+                    if player == "p1":
+                        buffer_win_p1 += 1
+                    else:
+                        buffer_win_p2 += 1
+                elif ex.value < -0.2:
+                    if player == "p1":
+                        buffer_loss_p1 += 1
+                    else:
+                        buffer_loss_p2 += 1
+                else:
+                    if player == "p1":
+                        buffer_draw_p1 += 1
+                    else:
+                        buffer_draw_p2 += 1
+
+            buffer_size = len(replay_buffer)
+            tqdm.write(
+                f"Balanced buffer: size={buffer_size}, "
+                f"P1 win={buffer_win_p1} ({buffer_win_p1/buffer_size:.1%}), "
+                f"P2 win={buffer_win_p2} ({buffer_win_p2/buffer_size:.1%}), "
+                f"P1 loss={buffer_loss_p1} ({buffer_loss_p1/buffer_size:.1%}), "
+                f"P2 loss={buffer_loss_p2} ({buffer_loss_p2/buffer_size:.1%}), "
+                f"P1 draw={buffer_draw_p1} ({buffer_draw_p1/buffer_size:.1%}), "
+                f"P2 draw={buffer_draw_p2} ({buffer_draw_p2/buffer_size:.1%})"
+            )
 
             # Training phase
             train_pbar = tqdm(
@@ -747,6 +1035,14 @@ def hybrid_training_loop(
             model.scheduler.step()
 
             in_training_phase = False  # Reset flag after training phase
+
+            # Run evaluation every DEFAULT_EVAL_INTERVAL iterations
+            if iteration % DEFAULT_EVAL_INTERVAL == 0:
+                eval_stats = policy_vs_mcts_eval(
+                    model,
+                    num_games=DEFAULT_EVAL_GAMES,
+                    mcts_simulations=DEFAULT_MAX_MCTS_SIMS,
+                )
 
             # Print core training statistics (simplified)
             elapsed_time = time.time() - training_start
@@ -819,15 +1115,56 @@ def hybrid_training_loop(
                     iter_stats["extreme_value_count"]
                     / iter_stats["value_prediction_count"]
                 )
+
+                # Add detailed debugging for these metrics to diagnose the zero std issue
+                print(f"Value stats debug:")
+                print(f"  sum: {iter_stats['value_prediction_sum']:.4f}")
+                print(
+                    f"  squared_sum: {iter_stats['value_prediction_squared_sum']:.4f}"
+                )
+                print(f"  count: {iter_stats['value_prediction_count']}")
+                print(f"  avg: {avg_value_prediction:.4f}")
+                print(f"  avg²: {(avg_value_prediction * avg_value_prediction):.8f}")
+                print(
+                    f"  E[X²]: {(iter_stats['value_prediction_squared_sum'] / iter_stats['value_prediction_count']):.8f}"
+                )
+                print(f"  variance: {value_variance:.8f}")
+                print(f"  std: {value_std:.4f}")
+                print(
+                    f"  extreme count: {iter_stats['extreme_value_count']} ({extreme_value_ratio:.2%})"
+                )
+
                 avg_value_error = (
                     iter_stats["value_error_sum"] / iter_stats["value_prediction_count"]
                     if iter_stats["value_error_sum"] > 0
                     else 0
                 )
+
+                # Calculate segregated error averages
+                avg_error_early = (
+                    iter_stats["value_error_early_sum"]
+                    / iter_stats["value_error_early_count"]
+                    if iter_stats["value_error_early_count"] > 0
+                    else 0
+                )
+                avg_error_mid = (
+                    iter_stats["value_error_mid_sum"]
+                    / iter_stats["value_error_mid_count"]
+                    if iter_stats["value_error_mid_count"] > 0
+                    else 0
+                )
+                avg_error_late = (
+                    iter_stats["value_error_late_sum"]
+                    / iter_stats["value_error_late_count"]
+                    if iter_stats["value_error_late_count"] > 0
+                    else 0
+                )
             else:
                 avg_value_prediction = avg_abs_value = value_std = (
                     extreme_value_ratio
-                ) = avg_value_error = 0
+                ) = avg_value_error = avg_error_early = avg_error_mid = (
+                    avg_error_late
+                ) = 0
 
             # Print summary
             print(
@@ -859,17 +1196,60 @@ def hybrid_training_loop(
                 f"Policy confidence - MCTS: {avg_mcts_confidence:.3f}, Direct: {avg_direct_confidence:.3f} | "  # max prob in distribution
                 f"Entropy - MCTS: {avg_mcts_entropy:.3f}, Direct: {avg_direct_entropy:.3f}"  # uncertainty in policy distribution
             )
+
+            # count win/loss/draw samples in buffer
+            buffer_win_samples = 0
+            buffer_loss_samples = 0
+            buffer_draw_samples = 0
+
+            for example in replay_buffer:
+                # using same thresholds as earlier in the code
+                if example.value > 0.2:
+                    buffer_win_samples += 1
+                elif example.value < -0.2:
+                    buffer_loss_samples += 1
+                else:
+                    buffer_draw_samples += 1
+
+            # calculate percentages
+            buffer_size = len(replay_buffer)
+            buffer_win_pct = (buffer_win_samples / max(1, buffer_size)) * 100
+            buffer_loss_pct = (buffer_loss_samples / max(1, buffer_size)) * 100
+            buffer_draw_pct = (buffer_draw_samples / max(1, buffer_size)) * 100
+
+            # print buffer statistics along with iteration examples
             print(
-                f"Examples - Win: {iter_stats['win_examples'] / iter_stats['total_games']:.2f}, "
-                f"Loss: {iter_stats['loss_examples'] / iter_stats['total_games']:.2f}, "
-                f"Draw: {iter_stats['draw_examples'] / iter_stats['total_games']:.2f}"
-            )
-            print(
-                f"Value - Avg: {avg_value_prediction:.3f}, |Avg|: {avg_abs_value:.3f}, "
-                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}, "  # ratio of confident predictions (>0.8)
-                f"Error: {avg_value_error:.3f}"  # avg absolute difference between predicted & actual value
+                f"Examples - Win: {iter_stats['win_examples']}, "
+                f"Loss: {iter_stats['loss_examples']}, "
+                f"Draw: {iter_stats['draw_examples']} | "
+                f"Buffer - Win: {buffer_win_samples} ({buffer_win_pct:.1f}%), "
+                f"Loss: {buffer_loss_samples} ({buffer_loss_pct:.1f}%), "
+                f"Draw: {buffer_draw_samples} ({buffer_draw_pct:.1f}%)"
             )
 
+            print(
+                f"Value - Avg: {avg_value_prediction:.3f}, |Avg|: {avg_abs_value:.3f}, "
+                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}"  # ratio of confident predictions (>0.8)
+            )
+
+            # Print value error statistics by move count
+            print(
+                f"Value Error - Overall: {avg_value_error:.3f}, "  # avg absolute difference between predicted & actual value
+                f"Early (<6): {avg_error_early:.3f} ({iter_stats['value_error_early_count']}), "
+                f"Mid (6-11): {avg_error_mid:.3f} ({iter_stats['value_error_mid_count']}), "
+                f"Late (≥12): {avg_error_late:.3f} ({iter_stats['value_error_late_count']})"
+            )
+
+            # Print cache performance
+            total_predictions = iter_stats["cache_hits"] + iter_stats["cache_misses"]
+            cache_hit_rate = (
+                (iter_stats["cache_hits"] / total_predictions * 100)
+                if total_predictions > 0
+                else 0
+            )
+            print(
+                f"Cache Performance - Hit Rate: {cache_hit_rate:.1f}% ({iter_stats['cache_hits']}/{total_predictions} hits)"
+            )
             # Print opponent ratios
             print("Opponent ratios for this iteration:")
             print("  Random: {:.1%}".format(random_opponent_ratio))
@@ -882,22 +1262,6 @@ def hybrid_training_loop(
             print(
                 "Strategic opponent random chance: {:.1%}".format(
                     get_random_chance(iteration)
-                )
-            )
-            print()
-
-            # Print final random chance at the end of training
-            print("Final opponent ratios:")
-            print("  Random: {:.1%}".format(FINAL_RANDOM_OPPONENT_RATIO))
-            print("  Strategic: {:.1%}".format(FINAL_STRATEGIC_OPPONENT_RATIO))
-            print(
-                "  Self-play: {:.1%}".format(
-                    1.0 - FINAL_RANDOM_OPPONENT_RATIO - FINAL_STRATEGIC_OPPONENT_RATIO
-                )
-            )
-            print(
-                "Final strategic opponent random chance: {:.1%}".format(
-                    DEFAULT_FINAL_RANDOM_CHANCE
                 )
             )
             print()
@@ -918,6 +1282,111 @@ def hybrid_training_loop(
     print(f"Saved final model to {final_path}")
 
     return model
+
+
+def balance_replay_buffer(
+    replay_buffer: List[TrainingExample],
+    new_examples: List[TrainingExample],
+    buffer_size: int = DEFAULT_BUFFER_SIZE,
+) -> List[TrainingExample]:
+    """Balance the replay buffer to achieve a targeted distribution of examples.
+
+    The target distribution is:
+    - 20% p1 perspective moves from games won by p1
+    - 20% p2 perspective moves from games won by p2
+    - 20% p1 perspective moves from games lost by p1
+    - 20% p2 perspective moves from games lost by p2
+    - 10% p1 perspective moves from drawn games
+    - 10% p2 perspective moves from drawn games
+
+    Args:
+        replay_buffer: Current replay buffer
+        new_examples: New examples from latest iteration (will be prioritized)
+        buffer_size: Target size for the balanced buffer
+
+    Returns:
+        Balanced replay buffer
+    """
+    # categorize all examples into 6 buckets
+    buckets = defaultdict(list)
+
+    # first add new examples to appropriate buckets
+    for ex in new_examples:
+        # determine the bucket key (player_perspective, outcome)
+        player = "p1" if ex.current_player == Player.ONE else "p2"
+
+        # use value to determine outcome - using thresholds consistent with rest of codebase
+        if ex.value > 0.2:
+            outcome = "win"
+        elif ex.value < -0.2:
+            outcome = "loss"
+        else:
+            outcome = "draw"
+
+        # add to appropriate bucket
+        buckets[(player, outcome)].append(ex)
+
+    # then add existing buffer examples to buckets
+    # instead of checking if examples exist in new_examples (which causes issues with numpy arrays),
+    # we'll just process all examples from both sources independently
+    for ex in replay_buffer:
+        player = "p1" if ex.current_player == Player.ONE else "p2"
+
+        if ex.value > 0.2:
+            outcome = "win"
+        elif ex.value < -0.2:
+            outcome = "loss"
+        else:
+            outcome = "draw"
+
+        buckets[(player, outcome)].append(ex)
+
+    # calculate target counts for each bucket
+    target_counts = {
+        ("p1", "win"): int(buffer_size * 0.20),
+        ("p2", "win"): int(buffer_size * 0.20),
+        ("p1", "loss"): int(buffer_size * 0.20),
+        ("p2", "loss"): int(buffer_size * 0.20),
+        ("p1", "draw"): int(buffer_size * 0.10),
+        ("p2", "draw"): int(buffer_size * 0.10),
+    }
+
+    # ensure total adds up to buffer_size by adding any rounding difference to the last bucket
+    total_target = sum(target_counts.values())
+    if total_target < buffer_size:
+        target_counts[("p2", "draw")] += buffer_size - total_target
+
+    # create balanced buffer
+    balanced_buffer = []
+    rng = np.random.Generator(np.random.PCG64())
+
+    for bucket_key, target_count in target_counts.items():
+        bucket_examples = buckets[bucket_key]
+        bucket_size = len(bucket_examples)
+
+        if bucket_size == 0:
+            # no examples for this category
+            continue
+
+        if bucket_size <= target_count:
+            # not enough examples, use all and possibly duplicate
+            balanced_buffer.extend(bucket_examples)
+            # duplicate if needed to reach target count
+            if bucket_size < target_count:
+                # randomly duplicate examples to reach target count
+                duplicates = rng.choice(
+                    bucket_examples, size=target_count - bucket_size, replace=True
+                )
+                balanced_buffer.extend(duplicates)
+        else:
+            # too many examples, randomly sample without replacement
+            sampled = rng.choice(bucket_examples, size=target_count, replace=False)
+            balanced_buffer.extend(sampled)
+
+    # shuffle the balanced buffer
+    rng.shuffle(balanced_buffer)
+
+    return balanced_buffer
 
 
 if __name__ == "__main__":

@@ -55,13 +55,23 @@ class PolicyValueNet(nn.Module):
         # Final policy output layer - one channel per piece type (4 types)
         self.policy_conv3 = nn.Conv2d(32, 4, kernel_size=1)
 
-        # Value head - update flat state dimension from 10 to 12
-        self.value_conv = nn.Conv2d(hidden_channels, 32, kernel_size=1)
-        self.value_bn = nn.BatchNorm2d(32)
-        # update from +10 to +12 for flat state (including 2 score values)
-        self.value_fc1 = nn.Linear(32 * 4 * 4 + 12, 64)
-        self.value_fc2 = nn.Linear(64, 32)
-        self.value_fc3 = nn.Linear(32, 1)
+        # Value head - moderately enhanced for better value prediction
+        self.value_conv1 = nn.Conv2d(hidden_channels, 64, kernel_size=3, padding=1)
+        self.value_bn1 = nn.BatchNorm2d(64)
+        self.value_conv2 = nn.Conv2d(
+            64, 32, kernel_size=1
+        )  # additional feature refinement
+        self.value_bn2 = nn.BatchNorm2d(32)
+
+        # wider fully-connected layers
+        self.value_fc1 = nn.Linear(32 * 4 * 4 + 12, 96)  # increased width
+        self.value_fc2 = nn.Linear(96, 64)  # increased width
+        self.value_fc3 = nn.Linear(64, 32)  # additional layer
+        self.value_out = nn.Linear(32, 1)  # output layer
+
+        # initialization with smaller values to encourage gradual learning
+        nn.init.uniform_(self.value_out.weight, -0.03, 0.03)
+        nn.init.constant_(self.value_out.bias, 0.0)
 
         # Initialize weights for better training stability
         self._initialize_weights()
@@ -81,6 +91,7 @@ class PolicyValueNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, board_state, flat_state):
+
         # Initial feature extraction
         x = F.relu(self.bn1(self.conv1(board_state)))
 
@@ -94,13 +105,18 @@ class PolicyValueNet(nn.Module):
         policy = self.policy_conv3(policy)
         policy = policy.permute(0, 2, 3, 1)  # NCHW -> NHWC for 4x4x4 output
 
-        # Value head - outputs single value prediction
-        value = F.relu(self.value_bn(self.value_conv(x)))
+        # Enhanced value head with additional processing
+        value = F.relu(self.value_bn1(self.value_conv1(x)))
+        value = F.relu(self.value_bn2(self.value_conv2(value)))
         value = value.flatten(1)
         value = torch.cat([value, flat_state], dim=1)
+
         value = F.relu(self.value_fc1(value))
+        value = F.dropout(value, p=0.15, training=self.training)  # moderate dropout
         value = F.relu(self.value_fc2(value))
-        value = torch.tanh(self.value_fc3(value))
+        value = F.dropout(value, p=0.2, training=self.training)  # light dropout
+        value = F.relu(self.value_fc3(value))
+        value = torch.tanh(self.value_out(value) * 0.3)  # Good balance
 
         return policy, value
 
@@ -134,9 +150,9 @@ class ModelWrapper:
             return
 
         # div factors used in scheduler
-        self.div_factor = 15
+        self.div_factor = 30
         self.final_div_factor = 30
-        self.max_iterations = 80
+        self.max_iterations = 20
 
         # Simplified learning rate configuration with only max_lr
         if self.mode == "fast":
@@ -308,6 +324,12 @@ class ModelWrapper:
         # Forward pass
         policy_logits, value_pred = self.model(board_inputs, flat_inputs)
 
+        # Apply value target smoothing
+        # Small random noise to prevent value collapse
+        with torch.no_grad():  # don't track gradients for the noise
+            noise = (torch.rand_like(value_targets) - 0.5) * 0.2  # ±0.1 noise
+            smoothed_targets = torch.clamp(value_targets + noise, -1.0, 1.0)
+
         # Calculate policy loss
         batch_size = policy_logits.shape[0]
         policy_logits_flat = policy_logits.reshape(batch_size, -1)
@@ -340,18 +362,23 @@ class ModelWrapper:
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
             policy_loss = policy_loss - 0.03 * entropy
 
-        value_loss = F.mse_loss(value_pred.squeeze(-1), value_targets)
-        value_variance_penalty = 0.1 * torch.mean(
-            torch.square(torch.abs(value_pred) - 0.5)
-        )
-        value_loss = value_loss + value_variance_penalty
+        # Base MSE loss for prediction accuracy
+        value_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
 
-        # Increase L2 regularization for value predictions to discourage extreme values
-        # Increase from 0.0001 to 0.0005 for stronger regularization effect
-        value_l2_reg = 0.0001 * torch.mean(
-            torch.square(value_pred)
-        )  # Reduced from 0.0005
-        value_loss = value_loss + value_l2_reg
+        # Calculate batch statistics on absolute values
+        batch_values = value_pred.squeeze(-1)
+        abs_values = torch.abs(batch_values)  # take absolute values first
+        abs_mean = torch.mean(abs_values)  # mean of absolute values
+        abs_variance = torch.mean(
+            (abs_values - abs_mean) ** 2
+        )  # variance of absolute values
+
+        # Anti-collapse regularization using absolute value variance
+        # Low variance in absolute values = all predictions similar distance from zero
+        variance_penalty = 1.2 * torch.exp(-5.0 * abs_variance)
+
+        # Final value loss
+        value_loss = value_loss + variance_penalty
 
         # Combine losses with policy_weight emphasis
         total_loss = policy_weight * policy_loss + value_loss

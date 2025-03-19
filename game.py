@@ -5,6 +5,7 @@ import numpy as np
 from enum import Enum
 from typing import Dict, Optional, List
 from numpy.typing import NDArray
+import time
 
 
 class PieceType(Enum):
@@ -65,6 +66,42 @@ class IllegalMoveException(Exception):
 
 class GameState:
     verbose_output = False  # Class variable to toggle output
+    enable_timing = False  # Class variable to toggle timing measurements
+
+    # Timing data dictionary to store cumulative times
+    timing_data = {
+        "get_legal_moves": 0.0,
+        "make_move": 0.0,
+        "undo_move": 0.0,
+        "pass_turn": 0.0,
+        "_calculate_score": 0.0,
+    }
+    # Count of calls to each method for averaging
+    timing_counts = {k: 0 for k in timing_data}
+
+    @classmethod
+    def reset_timing(cls):
+        """Reset all timing counters"""
+        cls.timing_data = {k: 0.0 for k in cls.timing_data}
+        cls.timing_counts = {k: 0 for k in cls.timing_data}
+
+    @classmethod
+    def print_timing(cls):
+        """Print timing statistics if enabled"""
+        if not cls.enable_timing:
+            return
+
+        print("\n--- GameState Timing Statistics ---")
+        for method, time_value in cls.timing_data.items():
+            count = cls.timing_counts[method]
+            if count > 0:
+                avg_time = time_value / count
+                print(
+                    f"{method}: {time_value:.6f}s total, {avg_time:.6f}s avg ({count} calls)"
+                )
+            else:
+                print(f"{method}: {time_value:.6f}s total (0 calls)")
+        print("--------------------------------\n")
 
     def __init__(self):
         self.board: NDArray[np.int8] = np.zeros((4, 4, 2), dtype=np.int8)
@@ -80,6 +117,8 @@ class GameState:
         self.move_history = []  # track history of moves for undo
 
     def make_move(self, move: Move) -> TurnResult:
+        start_time = time.perf_counter() if self.enable_timing else 0
+
         x, y, piece_type = move.x, move.y, move.piece_type
         if not self.is_valid_move(move):
             raise IllegalMoveException(self.current_player, move)
@@ -111,20 +150,33 @@ class GameState:
         opp_has_pieces = any(
             self.piece_counts[self.current_player][pt] > 0 for pt in PieceType
         )
+
+        # Time legal moves calculation separately
+        legal_start = time.perf_counter() if self.enable_timing else 0
         opp_legal_moves = self.get_legal_moves()
+        if self.enable_timing:
+            # Don't double-count this get_legal_moves call
+            self.timing_data["get_legal_moves"] -= time.perf_counter() - legal_start
+            self.timing_counts["get_legal_moves"] -= 1
+
         opp_must_pass = False
         if np.all(opp_legal_moves[:, :, :] == 0):
             opp_must_pass = True
 
+        result = TurnResult.NORMAL
         if self_has_pieces and opp_must_pass:
             self.pass_turn()
-            return TurnResult.OPPONENT_WAS_FORCED_TO_PASS
+            result = TurnResult.OPPONENT_WAS_FORCED_TO_PASS
         elif (not self_has_pieces and opp_must_pass) or not opp_has_pieces:
             self.is_over = True
             self.winner = self.get_winner()
-            return TurnResult.GAME_OVER
-        else:
-            return TurnResult.NORMAL
+            result = TurnResult.GAME_OVER
+
+        if self.enable_timing:
+            self.timing_data["make_move"] += time.perf_counter() - start_time
+            self.timing_counts["make_move"] += 1
+
+        return result
 
     def print_move_info(self, move: Move):
         x, y, piece_type = move.x, move.y, move.piece_type
@@ -181,6 +233,8 @@ class GameState:
         )
 
     def pass_turn(self):
+        start_time = time.perf_counter() if self.enable_timing else 0
+
         # save previous state info for undo
         prev_state = {
             "player": self.current_player,
@@ -198,6 +252,10 @@ class GameState:
             Player.ONE if self.current_player == Player.TWO else Player.TWO
         )
 
+        if self.enable_timing:
+            self.timing_data["pass_turn"] += time.perf_counter() - start_time
+            self.timing_counts["pass_turn"] += 1
+
     def get_winner(self) -> Optional[Player]:
         score_one = self._calculate_score(Player.ONE)
         score_two = self._calculate_score(Player.TWO)
@@ -210,6 +268,7 @@ class GameState:
             return None  # Draw
 
     def _calculate_score(self, player: Player) -> int:
+        start_time = time.perf_counter() if self.enable_timing else 0
 
         def get_value_or_none(arr, indices):
             try:
@@ -246,23 +305,19 @@ class GameState:
                         score += 2
                     elif lineLength == 3:
                         score += 1
+
+        if self.enable_timing:
+            self.timing_data["_calculate_score"] += time.perf_counter() - start_time
+            self.timing_counts["_calculate_score"] += 1
+
         return score
 
     def has_legal_moves(self) -> bool:
         return np.any(self.get_legal_moves())
 
-    # def get_legal_moves(self) -> np.ndarray:
-    #     legal_moves = np.zeros((4, 4, 4), dtype=np.int64)
-
-    #     for x in range(4):
-    #         for y in range(4):
-    #             for piece_type in range(4):
-    #                 if self.is_valid_move(Move(x, y, piece_type)):
-    #                     legal_moves[x, y, piece_type] = 1
-
-    #     return legal_moves
-
     def get_legal_moves(self) -> np.ndarray:
+        start_time = time.perf_counter() if self.enable_timing else 0
+
         # Initialize legal moves array
         legal_moves = np.zeros((4, 4, 4), dtype=np.int64)
 
@@ -273,6 +328,9 @@ class GameState:
 
         # If no pieces are available, return all zeros
         if not np.any(available_pieces):
+            if self.enable_timing:
+                self.timing_data["get_legal_moves"] += time.perf_counter() - start_time
+                self.timing_counts["get_legal_moves"] += 1
             return legal_moves
 
         # Create a mask for empty cells
@@ -285,6 +343,10 @@ class GameState:
             for piece_type in range(4):
                 if available_pieces[piece_type]:
                     legal_moves[:, :, piece_type] = edge_cells & empty_cells
+
+            if self.enable_timing:
+                self.timing_data["get_legal_moves"] += time.perf_counter() - start_time
+                self.timing_counts["get_legal_moves"] += 1
             return legal_moves
 
         # Apply constraints based on the last move
@@ -318,6 +380,10 @@ class GameState:
             for piece_type in range(4):
                 if available_pieces[piece_type]:
                     legal_moves[:, :, piece_type] = empty_cells
+
+        if self.enable_timing:
+            self.timing_data["get_legal_moves"] += time.perf_counter() - start_time
+            self.timing_counts["get_legal_moves"] += 1
 
         return legal_moves
 
@@ -478,7 +544,12 @@ class GameState:
         returns:
             bool: True if a move was undone, False if there was no move to undo
         """
+        start_time = time.perf_counter() if self.enable_timing else 0
+
         if not self.move_history:
+            if self.enable_timing:
+                self.timing_data["undo_move"] += time.perf_counter() - start_time
+                self.timing_counts["undo_move"] += 1
             return False
 
         # pop the last move and its previous state
@@ -505,6 +576,10 @@ class GameState:
         ]  # this is the move before the current one
         self.is_over = prev_state["is_over"]
         self.winner = prev_state["winner"]
+
+        if self.enable_timing:
+            self.timing_data["undo_move"] += time.perf_counter() - start_time
+            self.timing_counts["undo_move"] += 1
 
         return True
 

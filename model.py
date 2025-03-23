@@ -69,6 +69,9 @@ class PolicyValueNet(nn.Module):
         self.value_fc3 = nn.Linear(64, 32)  # additional layer
         self.value_out = nn.Linear(32, 1)  # output layer
 
+        # Consider adding batch normalization for the final layer inputs
+        self.value_bn3 = nn.BatchNorm1d(32)  # Add between final FC and tanh
+
         # initialization with smaller values to encourage gradual learning
         nn.init.uniform_(self.value_out.weight, -0.03, 0.03)
         nn.init.constant_(self.value_out.bias, 0.0)
@@ -116,7 +119,8 @@ class PolicyValueNet(nn.Module):
         value = F.relu(self.value_fc2(value))
         value = F.dropout(value, p=0.2, training=self.training)  # light dropout
         value = F.relu(self.value_fc3(value))
-        value = torch.tanh(self.value_out(value) * 0.3)  # Good balance
+        value = self.value_bn3(value)  # Normalize before final output
+        value = torch.tanh(self.value_out(value) * 0.7)  # Good balance
 
         return policy, value
 
@@ -150,16 +154,16 @@ class ModelWrapper:
             return
 
         # div factors used in scheduler
-        self.div_factor = 30
-        self.final_div_factor = 30
-        self.max_iterations = 20
+        self.div_factor = 10
+        self.final_div_factor = 20
+        self.max_iterations = 60
 
         # Simplified learning rate configuration with only max_lr
         if self.mode == "fast":
             self.max_lr = 0.1  # Higher peak learning rate
             print(f"Using fast training mode")
         elif self.mode == "stable":
-            self.max_lr = 0.01  # Standard peak learning rate
+            self.max_lr = 0.002  # Standard peak learning rate
             print(f"Using stable training mode")
         else:
             raise ValueError(
@@ -173,7 +177,7 @@ class ModelWrapper:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=initial_lr,
-            weight_decay=1e-4,
+            weight_decay=5e-5,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
@@ -327,7 +331,7 @@ class ModelWrapper:
         # Apply value target smoothing
         # Small random noise to prevent value collapse
         with torch.no_grad():  # don't track gradients for the noise
-            noise = (torch.rand_like(value_targets) - 0.5) * 0.2  # ±0.1 noise
+            noise = (torch.rand_like(value_targets) - 0.5) * 0.1  # ±0.1 noise
             smoothed_targets = torch.clamp(value_targets + noise, -1.0, 1.0)
 
         # Calculate policy loss
@@ -373,12 +377,25 @@ class ModelWrapper:
             (abs_values - abs_mean) ** 2
         )  # variance of absolute values
 
-        # Anti-collapse regularization using absolute value variance
-        # Low variance in absolute values = all predictions similar distance from zero
-        variance_penalty = 1.2 * torch.exp(-5.0 * abs_variance)
+        # Adjust the variance penalty to be more sensitive
+        variance_penalty = 0.3 * torch.exp(-4.0 * abs_variance)
 
         # Final value loss
         value_loss = value_loss + variance_penalty
+
+        # Force distribution matching by direct intervention
+        # Target ideal normal-like distribution for value predictions
+        predicted_values = self.model(board_inputs, flat_inputs)[1].view(-1)
+        # Sort values and force them to match target distribution
+        sorted_values, _ = torch.sort(predicted_values)
+        n = sorted_values.size(0)
+        # Create target distribution (evenly spaced from -0.9 to 0.9)
+        target_distribution = torch.linspace(-0.9, 0.9, n, device=sorted_values.device)
+        # Add direct distribution matching loss
+        distribution_loss = F.mse_loss(sorted_values, target_distribution) * 0.0
+
+        # Add to total loss
+        value_loss = value_loss + distribution_loss
 
         # Combine losses with policy_weight emphasis
         total_loss = policy_weight * policy_loss + value_loss
@@ -461,7 +478,7 @@ class ModelWrapper:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=initial_lr,
-            weight_decay=1e-4,
+            weight_decay=5e-5,
             betas=(0.9, 0.999),
             eps=1e-8,
         )

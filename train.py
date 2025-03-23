@@ -18,11 +18,11 @@ from collections import defaultdict  # for buffer balancing
 
 # Training parameters
 DEFAULT_EPISODES = 100
-DEFAULT_BATCH_SIZE = 512
+DEFAULT_BATCH_SIZE = 1024
 DEFAULT_SAVE_INTERVAL = 10
 DEFAULT_NUM_CHECKPOINTS = 5
 DEFAULT_MCTS_RATIO = 1.0
-DEFAULT_BUFFER_SIZE = 20000
+DEFAULT_BUFFER_SIZE = 5000
 DEFAULT_POLICY_WEIGHT = 0.5
 DEFAULT_NUM_EPOCHS = 8
 DEFAULT_EVAL_INTERVAL = 5  # run eval every 20 iterations
@@ -30,10 +30,10 @@ DEFAULT_EVAL_GAMES = 30  # number of games to play during evaluation
 DEFAULT_LEARN_FROM_STRATEGIC = False  # whether to learn from strategic opponent's moves
 
 # MCTS simulation scaling constants
-DEFAULT_MIN_MCTS_SIMS = 200
-DEFAULT_MAX_MCTS_SIMS = 800
+DEFAULT_MIN_MCTS_SIMS = 25
+DEFAULT_MAX_MCTS_SIMS = 25
 
-MAX_ITERATIONS = 20
+MAX_ITERATIONS = 60
 
 # Opponent ratio scheduling constants
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0
@@ -48,8 +48,8 @@ DEFAULT_FINAL_RANDOM_CHANCE = 0.0
 DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Bootstrap constants
-BOOTSTRAP_MIN_WEIGHT = 0.2  # Start with modest bootstrapping
-BOOTSTRAP_MAX_WEIGHT = 0.5  # Increase to a reasonable maximum
+BOOTSTRAP_MIN_WEIGHT = 0.1  # Start with modest bootstrapping
+BOOTSTRAP_MAX_WEIGHT = 0.3  # Increase to a reasonable maximum
 BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Add this constant near the top with other constants

@@ -28,55 +28,106 @@ class PolicyValueNet(nn.Module):
         super().__init__()
         # update input channels from 10 to 6
         in_channels = 6  # Reduced from 10 (removed terrain)
-        hidden_channels = 128
+        hidden_channels = 192  # Increased from 128
 
-        # First convolution layer
+        # First convolution layer - wider
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(hidden_channels)
 
-        # Add residual blocks for better feature extraction
+        # Add residual blocks for better feature extraction - increased depth
         self.res_blocks = nn.ModuleList(
             [
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
+                ResBlock(hidden_channels),  # added one more res block
             ]
         )
 
-        # Policy head - enhanced for more accurate move prediction
-        # Multiple stages of refinement with attention to the placement constraints
+        # Policy head - unchanged from previous version
         self.policy_conv1 = nn.Conv2d(hidden_channels, 64, kernel_size=1)
         self.policy_bn1 = nn.BatchNorm2d(64)
-
-        # Second policy layer with larger capacity
         self.policy_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
         self.policy_bn2 = nn.BatchNorm2d(32)
-
-        # Final policy output layer - one channel per piece type (4 types)
         self.policy_conv3 = nn.Conv2d(32, 4, kernel_size=1)
 
-        # Value head - moderately enhanced for better value prediction
-        self.value_conv1 = nn.Conv2d(hidden_channels, 64, kernel_size=3, padding=1)
-        self.value_bn1 = nn.BatchNorm2d(64)
-        self.value_conv2 = nn.Conv2d(
-            64, 32, kernel_size=1
-        )  # additional feature refinement
-        self.value_bn2 = nn.BatchNorm2d(32)
+        # Enhanced value head - massively increased capacity
+        value_conv_channels = 256  # doubled from 128
 
-        # wider fully-connected layers
-        self.value_fc1 = nn.Linear(32 * 4 * 4 + 12, 96)  # increased width
-        self.value_fc2 = nn.Linear(96, 64)  # increased width
-        self.value_fc3 = nn.Linear(64, 32)  # additional layer
-        self.value_out = nn.Linear(32, 1)  # output layer
+        # Initial convolution with more filters
+        self.value_conv1 = nn.Conv2d(
+            hidden_channels, value_conv_channels, kernel_size=3, padding=1
+        )
+        self.value_bn1 = nn.BatchNorm2d(value_conv_channels)
 
-        # Consider adding batch normalization for the final layer inputs
-        self.value_bn3 = nn.BatchNorm1d(32)  # Add between final FC and tanh
+        # Multi-scale feature extraction with three parallel paths
+        # Path A: point-wise features
+        self.value_conv2a = nn.Conv2d(value_conv_channels, 96, kernel_size=1)
+        self.value_bn2a = nn.BatchNorm2d(96)
 
-        # initialization with smaller values to encourage gradual learning
-        nn.init.uniform_(self.value_out.weight, -0.03, 0.03)
+        # Path B: local features (3x3)
+        self.value_conv2b = nn.Conv2d(value_conv_channels, 96, kernel_size=3, padding=1)
+        self.value_bn2b = nn.BatchNorm2d(96)
+
+        # Path C: wider receptive field (5x5 via two 3x3)
+        self.value_conv2c_1 = nn.Conv2d(
+            value_conv_channels, 96, kernel_size=3, padding=1
+        )
+        self.value_bn2c_1 = nn.BatchNorm2d(96)
+        self.value_conv2c_2 = nn.Conv2d(96, 96, kernel_size=3, padding=1)
+        self.value_bn2c_2 = nn.BatchNorm2d(96)
+
+        # Merge all three paths
+        self.value_conv3 = nn.Conv2d(288, 128, kernel_size=1)  # 96*3 -> 128
+        self.value_bn3 = nn.BatchNorm2d(128)
+
+        # Deeper spatial processing with residual connection
+        self.value_conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.value_bn4 = nn.BatchNorm2d(128)
+        self.value_conv5 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.value_bn5 = nn.BatchNorm2d(128)
+
+        # Enhanced flat feature processing
+        flat_feature_size = 12  # assuming 12 flat features
+        self.flat_fc1 = nn.Linear(flat_feature_size, 96)  # increased from 64
+        self.flat_bn1 = nn.BatchNorm1d(96)
+        self.flat_fc2 = nn.Linear(96, 96)  # added another layer
+        self.flat_bn2 = nn.BatchNorm1d(96)
+
+        # Self-attention on the spatial features before flattening
+        self.spatial_attn_q = nn.Conv2d(128, 32, kernel_size=1)
+        self.spatial_attn_k = nn.Conv2d(128, 32, kernel_size=1)
+        self.spatial_attn_v = nn.Conv2d(128, 128, kernel_size=1)
+
+        # Wider and deeper fully-connected layers with skip connections
+        spatial_size = 128 * 4 * 4  # 128 channels on 4x4 board
+        combined_size = spatial_size + 96  # spatial + enhanced flat features
+
+        # Main FC pathway - massively wider
+        self.value_fc1 = nn.Linear(combined_size, 512)  # doubled from 256
+        self.value_bn_fc1 = nn.BatchNorm1d(512)
+        self.value_fc2 = nn.Linear(512, 384)  # doubled from 192
+        self.value_bn_fc2 = nn.BatchNorm1d(384)
+        self.value_fc3 = nn.Linear(384, 256)  # doubled from 128
+        self.value_bn_fc3 = nn.BatchNorm1d(256)
+        self.value_fc4 = nn.Linear(256, 192)  # increased from 64
+        self.value_bn_fc4 = nn.BatchNorm1d(192)
+        self.value_fc5 = nn.Linear(192, 128)  # added another layer
+        self.value_bn_fc5 = nn.BatchNorm1d(128)
+        self.value_fc6 = nn.Linear(128, 64)  # added another layer
+        self.value_bn_fc6 = nn.BatchNorm1d(64)
+
+        # Auxiliary pathways for skip connections
+        self.value_aux1 = nn.Linear(combined_size, 384)  # matches fc2 output
+        self.value_aux2 = nn.Linear(512, 256)  # matches fc3 output
+        self.value_aux3 = nn.Linear(384, 128)  # matches fc5 output
+
+        # Final value output - LESS CONSTRAINED for better learning
+        self.value_out = nn.Linear(64, 1)
+        nn.init.uniform_(self.value_out.weight, -0.05, 0.05)  # wider initialization
         nn.init.constant_(self.value_out.bias, 0.0)
 
-        # Initialize weights for better training stability
+        # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -94,7 +145,6 @@ class PolicyValueNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, board_state, flat_state):
-
         # Initial feature extraction
         x = F.relu(self.bn1(self.conv1(board_state)))
 
@@ -108,19 +158,86 @@ class PolicyValueNet(nn.Module):
         policy = self.policy_conv3(policy)
         policy = policy.permute(0, 2, 3, 1)  # NCHW -> NHWC for 4x4x4 output
 
-        # Enhanced value head with additional processing
+        # Enhanced value head with multi-path processing
+        # Main spatial processing
         value = F.relu(self.value_bn1(self.value_conv1(x)))
-        value = F.relu(self.value_bn2(self.value_conv2(value)))
-        value = value.flatten(1)
-        value = torch.cat([value, flat_state], dim=1)
 
-        value = F.relu(self.value_fc1(value))
-        value = F.dropout(value, p=0.15, training=self.training)  # moderate dropout
-        value = F.relu(self.value_fc2(value))
-        value = F.dropout(value, p=0.2, training=self.training)  # light dropout
-        value = F.relu(self.value_fc3(value))
-        value = self.value_bn3(value)  # Normalize before final output
-        value = torch.tanh(self.value_out(value) * 0.7)  # Good balance
+        # Parallel spatial feature extraction paths
+        value_a = F.relu(self.value_bn2a(self.value_conv2a(value)))  # point-wise
+        value_b = F.relu(self.value_bn2b(self.value_conv2b(value)))  # local context
+
+        # Third path with wider receptive field
+        value_c = F.relu(self.value_bn2c_1(self.value_conv2c_1(value)))
+        value_c = F.relu(self.value_bn2c_2(self.value_conv2c_2(value_c)))
+
+        # Concatenate all three parallel paths
+        value = torch.cat([value_a, value_b, value_c], dim=1)
+        value = F.relu(self.value_bn3(self.value_conv3(value)))
+
+        # Deeper spatial processing with residual connection
+        identity = value
+        value = F.relu(self.value_bn4(self.value_conv4(value)))
+        value = self.value_bn5(self.value_conv5(value))
+        value = F.relu(value + identity)  # residual connection
+
+        # Self-attention mechanism on spatial features
+        batch_size = value.size(0)
+        h, w = value.size(2), value.size(3)
+
+        # Compute query, key, value projections
+        q = self.spatial_attn_q(value).view(batch_size, 32, -1)  # B x 32 x (H*W)
+        k = self.spatial_attn_k(value).view(batch_size, 32, -1)  # B x 32 x (H*W)
+        v = self.spatial_attn_v(value).view(batch_size, 128, -1)  # B x 128 x (H*W)
+
+        # Compute attention scores
+        attn = torch.bmm(q.permute(0, 2, 1), k)  # B x (H*W) x (H*W)
+        attn = F.softmax(attn / (32**0.5), dim=2)  # scale by sqrt(d_k)
+
+        # Apply attention to values
+        attn_value = torch.bmm(v, attn.permute(0, 2, 1))  # B x 128 x (H*W)
+        attn_value = attn_value.view(batch_size, 128, h, w)  # B x 128 x H x W
+
+        # Add attention result as residual
+        value = value + attn_value * 0.5  # dampened residual connection
+
+        # Process spatial features
+        value_spatial = value.flatten(1)  # flatten spatial dimensions
+
+        # Enhanced flat feature processing
+        flat_features = F.relu(self.flat_bn1(self.flat_fc1(flat_state)))
+        flat_features = F.relu(self.flat_bn2(self.flat_fc2(flat_features)))
+
+        # Combine spatial and flat features
+        value_combined = torch.cat([value_spatial, flat_features], dim=1)
+
+        # Main path with multiple skip connections
+        aux1 = self.value_aux1(value_combined)  # auxiliary path 1
+
+        value = F.relu(self.value_bn_fc1(self.value_fc1(value_combined)))
+        aux2 = self.value_aux2(value)  # auxiliary path 2
+
+        value = F.dropout(value, p=0.1, training=self.training)
+        value = F.relu(self.value_bn_fc2(self.value_fc2(value)))
+        value = value + aux1  # skip connection 1
+
+        aux3 = self.value_aux3(value)  # auxiliary path 3
+
+        value = F.dropout(value, p=0.1, training=self.training)
+        value = F.relu(self.value_bn_fc3(self.value_fc3(value)))
+        value = value + aux2  # skip connection 2
+
+        value = F.dropout(value, p=0.1, training=self.training)
+        value = F.relu(self.value_bn_fc4(self.value_fc4(value)))
+
+        value = F.dropout(value, p=0.05, training=self.training)
+        value = F.relu(self.value_bn_fc5(self.value_fc5(value)))
+        value = value + aux3  # skip connection 3
+
+        value = F.dropout(value, p=0.05, training=self.training)
+        value = F.relu(self.value_bn_fc6(self.value_fc6(value)))
+
+        # Less restricted output scaling
+        value = torch.tanh(self.value_out(value))  # removed the 0.8 scaling factor
 
         return policy, value
 
@@ -311,7 +428,7 @@ class ModelWrapper:
         flat_inputs,
         policy_targets,
         value_targets,
-        policy_weight=1.5,  # Increased policy weight to focus more on move selection
+        policy_weight=1.0,  # Balanced weighting between policy and value
     ):
         """Perform a single training step with improved loss functions"""
         self.model.train()
@@ -328,11 +445,8 @@ class ModelWrapper:
         # Forward pass
         policy_logits, value_pred = self.model(board_inputs, flat_inputs)
 
-        # Apply value target smoothing
-        # Small random noise to prevent value collapse
-        with torch.no_grad():  # don't track gradients for the noise
-            noise = (torch.rand_like(value_targets) - 0.5) * 0.1  # ±0.1 noise
-            smoothed_targets = torch.clamp(value_targets + noise, -1.0, 1.0)
+        # No value target smoothing - learn exact values
+        smoothed_targets = value_targets
 
         # Calculate policy loss
         batch_size = policy_logits.shape[0]
@@ -352,60 +466,55 @@ class ModelWrapper:
                 -torch.sum(policy_targets_flat * log_policy, dim=1)
             )
 
-            # Add entropy bonus to encourage exploration (smaller for distributions)
+            # Smaller entropy bonus
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
-            policy_loss = policy_loss - 0.01 * entropy
+            policy_loss = policy_loss - 0.005 * entropy  # reduced from 0.01
         else:
             # Cross-entropy for one-hot targets (supervised learning)
             policy_indices = torch.argmax(policy_targets_flat, dim=1)
             policy_loss = F.cross_entropy(policy_logits_flat, policy_indices)
 
-            # Stronger entropy bonus for one-hot targets
+            # Reduced entropy bonus
             log_policy = F.log_softmax(policy_logits_flat, dim=1)
             policy_probs = F.softmax(policy_logits_flat, dim=1)
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
-            policy_loss = policy_loss - 0.03 * entropy
+            policy_loss = policy_loss - 0.01 * entropy  # reduced from 0.03
 
-        # Base MSE loss for prediction accuracy
-        value_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
+        # Improved directional correctness loss that properly handles draws
+        # For non-zero targets: check sign match
+        # For zero targets: reward predictions close to zero
+        non_draw_mask = smoothed_targets != 0
+        draw_mask = smoothed_targets == 0
 
-        # Calculate batch statistics on absolute values
-        batch_values = value_pred.squeeze(-1)
-        abs_values = torch.abs(batch_values)  # take absolute values first
-        abs_mean = torch.mean(abs_values)  # mean of absolute values
-        abs_variance = torch.mean(
-            (abs_values - abs_mean) ** 2
-        )  # variance of absolute values
+        # For non-draws: check if signs match
+        non_draw_correct = (
+            (value_pred.squeeze(-1) * smoothed_targets) > 0
+        ) & non_draw_mask
 
-        # Adjust the variance penalty to be more sensitive
-        variance_penalty = 0.3 * torch.exp(-4.0 * abs_variance)
+        # For draws: check if prediction is close to zero
+        draw_correct = (torch.abs(value_pred.squeeze(-1)) < 0.3) & draw_mask
 
-        # Final value loss
-        value_loss = value_loss + variance_penalty
+        # Combine both conditions
+        correct_prediction = non_draw_correct | draw_correct
+        sign_loss = torch.mean(1.0 - correct_prediction.float())
 
-        # Force distribution matching by direct intervention
-        # Target ideal normal-like distribution for value predictions
-        predicted_values = self.model(board_inputs, flat_inputs)[1].view(-1)
-        # Sort values and force them to match target distribution
-        sorted_values, _ = torch.sort(predicted_values)
-        n = sorted_values.size(0)
-        # Create target distribution (evenly spaced from -0.9 to 0.9)
-        target_distribution = torch.linspace(-0.9, 0.9, n, device=sorted_values.device)
-        # Add direct distribution matching loss
-        distribution_loss = F.mse_loss(sorted_values, target_distribution) * 0.0
+        # base MSE loss
+        mse_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
 
-        # Add to total loss
-        value_loss = value_loss + distribution_loss
+        # combined loss with higher weight on directional correctness
+        value_loss = mse_loss + 0.5 * sign_loss
 
-        # Combine losses with policy_weight emphasis
+        # Combine losses with equal weight
         total_loss = policy_weight * policy_loss + value_loss
 
-        # Optimization step with gradient clipping
+        # Optimization step with relaxed gradient clipping
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # Clip gradients to prevent training instability
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # Increased gradient clipping for larger model
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=5.0
+        )  # increased from 1.0
 
         self.optimizer.step()
 

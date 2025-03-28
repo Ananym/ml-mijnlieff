@@ -13,8 +13,8 @@ from opponents import RandomOpponent, StrategicOpponent
 from mcts import MCTS, add_dirichlet_noise
 import random
 import math
-from eval_model import policy_vs_mcts_eval  # import the evaluation function
 from collections import defaultdict  # for buffer balancing
+from eval_model import policy_vs_mcts_eval  # import the updated evaluation function
 
 # Training parameters
 DEFAULT_EPISODES = 100
@@ -25,13 +25,16 @@ DEFAULT_MCTS_RATIO = 1.0
 DEFAULT_BUFFER_SIZE = 5000
 DEFAULT_POLICY_WEIGHT = 0.5
 DEFAULT_NUM_EPOCHS = 8
-DEFAULT_EVAL_INTERVAL = 5  # run eval every 20 iterations
-DEFAULT_EVAL_GAMES = 30  # number of games to play during evaluation
+DEFAULT_EVAL_INTERVAL = 20  # run eval every 20 iterations
+DEFAULT_EVAL_GAMES = 60  # number of games to play during evaluation
+DEFAULT_STRATEGIC_EVAL_GAMES = (
+    60  # number of games to play against strategic opponent during evaluation
+)
 DEFAULT_LEARN_FROM_STRATEGIC = False  # whether to learn from strategic opponent's moves
 
 # MCTS simulation scaling constants
-DEFAULT_MIN_MCTS_SIMS = 25
-DEFAULT_MAX_MCTS_SIMS = 25
+DEFAULT_MIN_MCTS_SIMS = 200
+DEFAULT_MAX_MCTS_SIMS = 800
 
 MAX_ITERATIONS = 60
 
@@ -48,8 +51,8 @@ DEFAULT_FINAL_RANDOM_CHANCE = 0.0
 DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Bootstrap constants
-BOOTSTRAP_MIN_WEIGHT = 0.1  # Start with modest bootstrapping
-BOOTSTRAP_MAX_WEIGHT = 0.3  # Increase to a reasonable maximum
+BOOTSTRAP_MIN_WEIGHT = 0.2  # Start with modest bootstrapping
+BOOTSTRAP_MAX_WEIGHT = 0.4  # Increase to a moderate maximum
 BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 # Add this constant near the top with other constants
@@ -184,10 +187,16 @@ def hybrid_training_loop(
         "value_error_sum": 0,  # sum of |actual_outcome - predicted_value|
         "value_error_early_sum": 0,  # sum of errors for move_count < 6
         "value_error_mid_sum": 0,  # sum of errors for 6 <= move_count <= 11
-        "value_error_late_sum": 0,  # sum of errors for move_count >= 12
+        "value_error_late_sum": 0,  # sum of errors for 12 <= move_count < 14
+        "value_error_very_late_sum": 0,  # sum of errors for move_count >= 14
         "value_error_early_count": 0,  # count of errors for move_count < 6
         "value_error_mid_count": 0,  # count of errors for 6 <= move_count <= 11
-        "value_error_late_count": 0,  # count of errors for move_count >= 12
+        "value_error_late_count": 0,  # count of errors for 12 <= move_count < 14
+        "value_error_very_late_count": 0,  # count of errors for move_count >= 14
+        "value_correct_early_count": 0,  # count of directionally correct predictions for move_count < 6
+        "value_correct_mid_count": 0,  # count of directionally correct predictions for 6 <= move_count <= 11
+        "value_correct_late_count": 0,  # count of directionally correct predictions for 12 <= move_count < 14
+        "value_correct_very_late_count": 0,  # count of directionally correct predictions for move_count >= 14
         "extreme_value_count": 0,  # count of values near -1 or 1 (confident predictions)
         "cache_hits": 0,  # Track total cache hits
         "cache_misses": 0,  # Track total cache misses
@@ -471,156 +480,6 @@ def hybrid_training_loop(
             DEFAULT_INITIAL_RANDOM_CHANCE - DEFAULT_FINAL_RANDOM_CHANCE
         )
 
-    def evaluate_model(model: ModelWrapper, iteration: int, debug: bool = False):
-        """Run evaluation games between raw policy and MCTS to track progress.
-
-        This function pits the model's raw policy against MCTS-guided play
-        to measure how the policy network is improving over time.
-        """
-        print(f"\nRunning evaluation at iteration {iteration}...")
-        stats = {
-            "raw_policy_wins_as_p1": 0,
-            "raw_policy_wins_as_p2": 0,
-            "raw_policy_games_as_p1": 0,
-            "raw_policy_games_as_p2": 0,
-            "draws": 0,
-            "total_games": 0,
-        }
-
-        # Create progress bar
-        eval_pbar = tqdm(range(DEFAULT_EVAL_GAMES), desc="Evaluation", leave=False)
-
-        for _ in eval_pbar:
-            # Initialize game
-            game = GameState()
-
-            # Decide randomly which player uses raw policy
-            raw_policy_plays_p1 = random.random() < 0.5
-
-            if raw_policy_plays_p1:
-                stats["raw_policy_games_as_p1"] += 1
-            else:
-                stats["raw_policy_games_as_p2"] += 1
-
-            move_count = 0
-
-            # Play the game
-            while True:
-                legal_moves = game.get_legal_moves()
-                if not np.any(legal_moves):
-                    game.pass_turn()
-                    continue
-
-                # Determine which player's turn it is
-                is_p1_turn = game.current_player == Player.ONE
-
-                # Use raw policy if it's this player's turn
-                use_raw_policy = (is_p1_turn and raw_policy_plays_p1) or (
-                    not is_p1_turn and not raw_policy_plays_p1
-                )
-
-                # Get state representation
-                state_rep = game.get_game_state_representation(subjective=True)
-
-                if use_raw_policy:
-                    # Use direct policy from neural network
-                    policy, value_pred = model.predict(
-                        state_rep.board, state_rep.flat_values, legal_moves
-                    )
-                    policy = policy.squeeze(0)
-
-                    # Apply legal moves mask
-                    masked_policy = policy * legal_moves
-
-                    # Renormalize
-                    policy_sum = np.sum(masked_policy)
-                    if policy_sum > 0:
-                        masked_policy = masked_policy / policy_sum
-
-                    # Choose best move deterministically during evaluation
-                    move_coords = np.unravel_index(
-                        masked_policy.argmax(), masked_policy.shape
-                    )
-                else:
-                    # Use model-guided MCTS with more simulations for evaluation
-                    mcts = MCTS(
-                        model=model,
-                        num_simulations=DEFAULT_MAX_MCTS_SIMS,
-                        c_puct=1.0,
-                    )
-                    mcts.set_temperature(
-                        0.0
-                    )  # Use deterministic play during evaluation
-                    mcts_policy, _ = mcts.search(game)
-
-                    # Select best move according to MCTS policy
-                    move_coords = np.unravel_index(
-                        mcts_policy.argmax(), mcts_policy.shape
-                    )
-
-                # Create and make the move
-                move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
-                result = game.make_move(move)
-                move_count += 1
-
-                # Update progress bar
-                current_p1_wins = f"{stats['raw_policy_wins_as_p1']}/{stats['raw_policy_games_as_p1']}"
-                current_p2_wins = f"{stats['raw_policy_wins_as_p2']}/{stats['raw_policy_games_as_p2']}"
-                eval_pbar.set_postfix(
-                    {
-                        "P1": current_p1_wins,
-                        "P2": current_p2_wins,
-                        "draws": stats["draws"],
-                    }
-                )
-
-                if result == TurnResult.GAME_OVER:
-                    # Game is over, get the winner
-                    winner = game.get_winner()
-                    stats["total_games"] += 1
-
-                    if winner is None:
-                        stats["draws"] += 1
-                    elif (winner == Player.ONE and raw_policy_plays_p1) or (
-                        winner == Player.TWO and not raw_policy_plays_p1
-                    ):
-                        # Raw policy player won
-                        if raw_policy_plays_p1:
-                            stats["raw_policy_wins_as_p1"] += 1
-                        else:
-                            stats["raw_policy_wins_as_p2"] += 1
-
-                    break  # Game over
-
-                # Safety check for extremely long games
-                if move_count > 100:
-                    stats["draws"] += 1
-                    stats["total_games"] += 1
-                    break
-
-        # Calculate win rates
-        p1_winrate = (
-            stats["raw_policy_wins_as_p1"] / max(1, stats["raw_policy_games_as_p1"])
-        ) * 100
-        p2_winrate = (
-            stats["raw_policy_wins_as_p2"] / max(1, stats["raw_policy_games_as_p2"])
-        ) * 100
-        draw_rate = (stats["draws"] / max(1, stats["total_games"])) * 100
-
-        # Print results
-        print("\n=== Evaluation Results ===")
-        print(f"Raw Policy vs MCTS ({DEFAULT_EVAL_GAMES} games)")
-        print(
-            f"Raw Policy as P1: {stats['raw_policy_wins_as_p1']}/{stats['raw_policy_games_as_p1']} ({p1_winrate:.1f}%)"
-        )
-        print(
-            f"Raw Policy as P2: {stats['raw_policy_wins_as_p2']}/{stats['raw_policy_games_as_p2']} ({p2_winrate:.1f}%)"
-        )
-        print(f"Draws: {stats['draws']} ({draw_rate:.1f}%)")
-        print("=========================\n")
-
-        return stats
-
     print("Starting hybrid training loop with value bootstrapping")
     print("Episodes per iteration:", DEFAULT_EPISODES)
     print("MCTS move ratio: {:.1%}".format(DEFAULT_MCTS_RATIO))
@@ -799,19 +658,46 @@ def hybrid_training_loop(
                                 and example.mcts_value is not None
                             ):
                                 # Track value prediction error before applying blending
-                                error = abs(outcome_value - example.mcts_value)
+                                # Scale outcome value by move_count/15 for better early move analysis
+                                scaled_outcome_value = outcome_value * (
+                                    example.move_count / 15
+                                )
+                                error = abs(scaled_outcome_value - example.mcts_value)
                                 iter_stats["value_error_sum"] += error
+
+                                # Check directional correctness
+                                is_correct = False
+                                if (
+                                    abs(outcome_value) < 0.3
+                                    and abs(example.mcts_value) < 0.3
+                                ):
+                                    # Both predict close to draw
+                                    is_correct = True
+                                elif outcome_value * example.mcts_value > 0:
+                                    # Same sign (both positive or both negative)
+                                    is_correct = True
 
                                 # Categorize error by move count
                                 if example.move_count < 6:
                                     iter_stats["value_error_early_sum"] += error
                                     iter_stats["value_error_early_count"] += 1
+                                    if is_correct:
+                                        iter_stats["value_correct_early_count"] += 1
                                 elif example.move_count <= 11:
                                     iter_stats["value_error_mid_sum"] += error
                                     iter_stats["value_error_mid_count"] += 1
-                                else:
+                                    if is_correct:
+                                        iter_stats["value_correct_mid_count"] += 1
+                                elif example.move_count <= 13:
                                     iter_stats["value_error_late_sum"] += error
                                     iter_stats["value_error_late_count"] += 1
+                                    if is_correct:
+                                        iter_stats["value_correct_late_count"] += 1
+                                else:
+                                    iter_stats["value_error_very_late_sum"] += error
+                                    iter_stats["value_error_very_late_count"] += 1
+                                    if is_correct:
+                                        iter_stats["value_correct_very_late_count"] += 1
 
                                 example.value = get_improved_value_target(
                                     outcome_value,
@@ -835,19 +721,48 @@ def hybrid_training_loop(
                                     bootstrap_value = -float(next_value[0][0])
 
                                     # Track value prediction error for bootstrapped values too
-                                    error = abs(outcome_value - bootstrap_value)
+                                    # Scale outcome value by move_count/15 for better early move analysis
+                                    scaled_outcome_value = outcome_value * (
+                                        example.move_count / 15
+                                    )
+                                    error = abs(scaled_outcome_value - bootstrap_value)
                                     iter_stats["value_error_sum"] += error
+
+                                    # Check directional correctness
+                                    is_correct = False
+                                    if (
+                                        abs(outcome_value) < 0.3
+                                        and abs(bootstrap_value) < 0.3
+                                    ):
+                                        # Both predict close to draw
+                                        is_correct = True
+                                    elif outcome_value * bootstrap_value > 0:
+                                        # Same sign (both positive or both negative)
+                                        is_correct = True
 
                                     # Categorize error by move count
                                     if example.move_count < 6:
                                         iter_stats["value_error_early_sum"] += error
                                         iter_stats["value_error_early_count"] += 1
+                                        if is_correct:
+                                            iter_stats["value_correct_early_count"] += 1
                                     elif example.move_count <= 11:
                                         iter_stats["value_error_mid_sum"] += error
                                         iter_stats["value_error_mid_count"] += 1
-                                    else:
+                                        if is_correct:
+                                            iter_stats["value_correct_mid_count"] += 1
+                                    elif example.move_count <= 13:
                                         iter_stats["value_error_late_sum"] += error
                                         iter_stats["value_error_late_count"] += 1
+                                        if is_correct:
+                                            iter_stats["value_correct_late_count"] += 1
+                                    else:
+                                        iter_stats["value_error_very_late_sum"] += error
+                                        iter_stats["value_error_very_late_count"] += 1
+                                        if is_correct:
+                                            iter_stats[
+                                                "value_correct_very_late_count"
+                                            ] += 1
 
                                     # Mix the outcome with bootstrapped value
                                     example.value = (
@@ -1040,8 +955,12 @@ def hybrid_training_loop(
             if iteration % DEFAULT_EVAL_INTERVAL == 0:
                 eval_stats = policy_vs_mcts_eval(
                     model,
+                    rng,
+                    iteration=iteration,
                     num_games=DEFAULT_EVAL_GAMES,
+                    strategic_games=DEFAULT_STRATEGIC_EVAL_GAMES,
                     mcts_simulations=DEFAULT_MAX_MCTS_SIMS,
+                    debug=False,
                 )
 
             # Print core training statistics (simplified)
@@ -1116,22 +1035,42 @@ def hybrid_training_loop(
                     / iter_stats["value_prediction_count"]
                 )
 
-                # Add detailed debugging for these metrics to diagnose the zero std issue
-                print(f"Value stats debug:")
-                print(f"  sum: {iter_stats['value_prediction_sum']:.4f}")
-                print(
-                    f"  squared_sum: {iter_stats['value_prediction_squared_sum']:.4f}"
+                # Calculate directional correctness percentages
+                early_correct_pct = (
+                    (
+                        iter_stats["value_correct_early_count"]
+                        / iter_stats["value_error_early_count"]
+                        * 100
+                    )
+                    if iter_stats["value_error_early_count"] > 0
+                    else 0
                 )
-                print(f"  count: {iter_stats['value_prediction_count']}")
-                print(f"  avg: {avg_value_prediction:.4f}")
-                print(f"  avg²: {(avg_value_prediction * avg_value_prediction):.8f}")
-                print(
-                    f"  E[X²]: {(iter_stats['value_prediction_squared_sum'] / iter_stats['value_prediction_count']):.8f}"
+                mid_correct_pct = (
+                    (
+                        iter_stats["value_correct_mid_count"]
+                        / iter_stats["value_error_mid_count"]
+                        * 100
+                    )
+                    if iter_stats["value_error_mid_count"] > 0
+                    else 0
                 )
-                print(f"  variance: {value_variance:.8f}")
-                print(f"  std: {value_std:.4f}")
-                print(
-                    f"  extreme count: {iter_stats['extreme_value_count']} ({extreme_value_ratio:.2%})"
+                late_correct_pct = (
+                    (
+                        iter_stats["value_correct_late_count"]
+                        / iter_stats["value_error_late_count"]
+                        * 100
+                    )
+                    if iter_stats["value_error_late_count"] > 0
+                    else 0
+                )
+                very_late_correct_pct = (
+                    (
+                        iter_stats["value_correct_very_late_count"]
+                        / iter_stats["value_error_very_late_count"]
+                        * 100
+                    )
+                    if iter_stats["value_error_very_late_count"] > 0
+                    else 0
                 )
 
                 avg_value_error = (
@@ -1159,12 +1098,20 @@ def hybrid_training_loop(
                     if iter_stats["value_error_late_count"] > 0
                     else 0
                 )
+                avg_error_very_late = (
+                    iter_stats["value_error_very_late_sum"]
+                    / iter_stats["value_error_very_late_count"]
+                    if iter_stats["value_error_very_late_count"] > 0
+                    else 0
+                )
             else:
                 avg_value_prediction = avg_abs_value = value_std = (
                     extreme_value_ratio
                 ) = avg_value_error = avg_error_early = avg_error_mid = (
                     avg_error_late
-                ) = 0
+                ) = avg_error_very_late = early_correct_pct = mid_correct_pct = (
+                    late_correct_pct
+                ) = very_late_correct_pct = 0
 
             # Print summary
             print(
@@ -1229,15 +1176,16 @@ def hybrid_training_loop(
 
             print(
                 f"Value - Avg: {avg_value_prediction:.3f}, |Avg|: {avg_abs_value:.3f}, "
-                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}"  # ratio of confident predictions (>0.8)
+                f"Std: {value_std:.3f}, Conf: {extreme_value_ratio:.3f}, Extreme Count: {iter_stats['extreme_value_count']}"
             )
 
             # Print value error statistics by move count
             print(
-                f"Value Error - Overall: {avg_value_error:.3f}, "  # avg absolute difference between predicted & actual value
-                f"Early (<6): {avg_error_early:.3f} ({iter_stats['value_error_early_count']}), "
-                f"Mid (6-11): {avg_error_mid:.3f} ({iter_stats['value_error_mid_count']}), "
-                f"Late (≥12): {avg_error_late:.3f} ({iter_stats['value_error_late_count']})"
+                f"Value Error - Overall: {avg_value_error:.3f}, "
+                f"Early (<6): {avg_error_early:.3f} ({early_correct_pct:.1f}% correct), "
+                f"Mid (6-11): {avg_error_mid:.3f} ({mid_correct_pct:.1f}% correct), "
+                f"Late (12-13): {avg_error_late:.3f} ({late_correct_pct:.1f}% correct), "
+                f"Very Late (≥14): {avg_error_very_late:.3f} ({very_late_correct_pct:.1f}% correct)"
             )
 
             # Print cache performance

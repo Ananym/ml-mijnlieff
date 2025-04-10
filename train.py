@@ -12,62 +12,46 @@ from tqdm import tqdm
 from opponents import RandomOpponent, StrategicOpponent
 from mcts import MCTS, add_dirichlet_noise
 import math
-from collections import defaultdict  # for buffer balancing
-from eval_model import policy_vs_mcts_eval  # import the updated evaluation function
+from collections import defaultdict
+from eval_model import policy_vs_mcts_eval
 import torch.nn.functional as F
 
-# Training parameters
-DEFAULT_EPISODES = 50  # Reduced from 100 to ensure faster iterations
-DEFAULT_BATCH_SIZE = 256  # Reduced from 512 for more gradient updates
-DEFAULT_SAVE_INTERVAL = 5  # More frequent saving for better tracking
+DEFAULT_EPISODES = 100
+DEFAULT_BATCH_SIZE = 512
+DEFAULT_SAVE_INTERVAL = 5
 DEFAULT_NUM_CHECKPOINTS = 5
 DEFAULT_MCTS_RATIO = 1.0
 DEFAULT_BUFFER_SIZE = 5000
-DEFAULT_POLICY_WEIGHT = 0.5  # Balanced between policy and value (was 0.2)
-DEFAULT_NUM_EPOCHS = 4  # Reduced from 6 to prevent overfitting
+DEFAULT_POLICY_WEIGHT = 1.0
+DEFAULT_NUM_EPOCHS = 50
 DEFAULT_EVAL_INTERVAL = 20
 DEFAULT_EVAL_GAMES = 60
-DEFAULT_STRATEGIC_EVAL_GAMES = (
-    60  # number of games to play against strategic opponent during evaluation
-)
-DEFAULT_LEARN_FROM_STRATEGIC = False
+DEFAULT_STRATEGIC_EVAL_GAMES = 60
+DEFAULT_MIN_MCTS_SIMS = 50
+DEFAULT_MAX_MCTS_SIMS = 200
+MAX_ITERATIONS = 100
 
-# MCTS simulation parameters - fewer simulations for cleaner signal
-DEFAULT_MIN_MCTS_SIMS = 200  # Increased from 100 for more reliable evaluation
-DEFAULT_MAX_MCTS_SIMS = 200  # Fixed value to eliminate another variable
+BALANCE_REPLAY_BUFFER = False
 
-# Maximum number of iterations - must be defined before it's used
-MAX_ITERATIONS = 100  # Increased from 60 to match model.py
-
-# Noise control parameters - higher values = more noise/exploration
-# Set these low to reduce training noise
-TEMPERATURE_SCALE = 0.0  # Eliminated randomness in move selection
 DIRICHLET_SCALE = 0.0  # No exploration noise
 ENTROPY_BONUS_SCALE = 0.0  # No entropy bonus
 
-# Opponent ratio scheduling constants
-# Calculate opponent ratio scheduling constants
+
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Reduced from 0.1
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
 INITIAL_STRATEGIC_OPPONENT_RATIO = 0.0  # Reduced from 0.2
 FINAL_STRATEGIC_OPPONENT_RATIO = 0.0  # Reduced from 0.3
 OPPONENT_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
-# Scales the 'difficulty' of the strategic opponent by specifying a chance to make a random move
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
 DEFAULT_FINAL_RANDOM_CHANCE = 0.0
 DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
-# Bootstrap constants
-BOOTSTRAP_MIN_WEIGHT = 0.1  # Start with modest bootstrapping
-BOOTSTRAP_MAX_WEIGHT = 0.1  # Increase to a moderate maximum
+BOOTSTRAP_MIN_WEIGHT = 0.0  # Start with modest bootstrapping
+BOOTSTRAP_MAX_WEIGHT = 0.0  # Increase to a moderate maximum
 BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
-# Add this constant near the top with other constants
 DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint_interrupted.pth"
-
-# Remove debug flags
-INSPECT_GRADIENTS = True
 
 
 def log_iteration_report(
@@ -82,7 +66,7 @@ def log_iteration_report(
     value_metrics=None,
 ):
     """
-    Generate a consolidated report for the current iteration
+    Generate a consolidated report for the current iteration (simplified)
 
     Args:
         iteration: Current iteration number
@@ -100,12 +84,12 @@ def log_iteration_report(
     minutes = (elapsed_time % 3600) // 60
     iteration_time = time.time() - iteration_start_time
 
-    # Extract loss statistics
+    # extract loss statistics
     avg_total = loss_stats.get("total", 0)
     avg_policy = loss_stats.get("policy", 0)
     avg_value = loss_stats.get("value", 0)
 
-    # Extract win rate statistics
+    # extract win rate statistics
     strategic_p1_rate = (
         100
         * iter_stats["strategic_wins_as_p1"]
@@ -122,28 +106,31 @@ def log_iteration_report(
     random_p2_rate = (
         100 * iter_stats["random_wins_as_p2"] / max(1, iter_stats["random_games_as_p2"])
     )
+    self_play_p1_wins = iter_stats["self_play_p1_wins"]
+    self_play_games = iter_stats["self_play_games"]
     self_play_p1_rate = (
-        100 * iter_stats["self_play_p1_wins"] / max(1, iter_stats["self_play_games"])
+        100 * self_play_p1_wins / max(1, self_play_games) if self_play_games > 0 else 0
     )
+    # calculate self-play draw rate (total - wins) / total
+    self_play_draws = iter_stats.get(
+        "self_play_draws", 0
+    )  # add self_play_draws to stats
+    self_play_draw_rate = (
+        100 * self_play_draws / max(1, self_play_games) if self_play_games > 0 else 0
+    )
+    self_play_p2_rate = 100.0 - self_play_p1_rate - self_play_draw_rate
 
-    # Calculate move statistics
-    mcts_ratio = iter_stats["mcts_moves"] / max(1, iter_stats["total_moves"])
-    direct_ratio = iter_stats["direct_moves"] / max(1, iter_stats["total_moves"])
-
-    # Get policy confidence and entropy metrics
+    # get policy confidence metric
     avg_mcts_confidence = iter_stats.get("avg_mcts_confidence", 0)
-    avg_direct_confidence = iter_stats.get("avg_direct_confidence", 0)
-    avg_mcts_entropy = iter_stats.get("avg_mcts_entropy", 0)
-    avg_direct_entropy = iter_stats.get("avg_direct_entropy", 0)
 
-    # Extract value prediction metrics
-    avg_value_prediction = iter_stats.get("avg_value_prediction", 0)
-    avg_abs_value = iter_stats.get("avg_abs_value", 0)
-    value_std = iter_stats.get("value_std", 0)
-    extreme_value_ratio = iter_stats.get("extreme_value_ratio", 0)
-    avg_value_error = iter_stats.get("avg_value_error", 0)
+    # extract value prediction metrics
+    avg_value_prediction = (
+        value_metrics.get("avg_value_prediction", 0) if value_metrics else 0
+    )
+    avg_abs_value = value_metrics.get("avg_abs_value", 0) if value_metrics else 0
+    value_std = value_metrics.get("value_std", 0) if value_metrics else 0
 
-    # Get cache performance
+    # get cache performance
     total_predictions = iter_stats["cache_hits"] + iter_stats["cache_misses"]
     cache_hit_rate = (
         (iter_stats["cache_hits"] / total_predictions * 100)
@@ -151,12 +138,12 @@ def log_iteration_report(
         else 0
     )
 
-    # Extract correlation metrics if available
+    # extract correlation metrics if available
     pearson_correlation = (
         value_metrics.get("pearson_correlation", 0) if value_metrics else 0
     )
 
-    # Count win/loss/draw samples in buffer
+    # count win/loss/draw samples in buffer
     buffer_win_samples = 0
     buffer_loss_samples = 0
     buffer_draw_samples = 0
@@ -188,38 +175,23 @@ def log_iteration_report(
     # Value prediction quality section (condensed)
     print(f"\n--- VALUE PREDICTION ---")
     print(
-        f"Distribution: mean={avg_value_prediction:.8f}, |mean|={avg_abs_value:.8f}, std={value_std:.8f}"
+        f"Distribution: mean={avg_value_prediction:.4f}, |mean|={avg_abs_value:.4f}, std={value_std:.4f}"
     )
-    print(
-        f"Extreme vals: {extreme_value_ratio:.8f} ({iter_stats['extreme_value_count']} preds)"
-    )
-    print(
-        f"Error: {avg_value_error:.8f} | Outcome correlation: {pearson_correlation:.8f}"
-    )
-
-    # Analyze value head for collapse
-    near_zero_pct = iter_stats.get("near_zero_pct", 0)
-    if near_zero_pct > 0.8:
-        print(
-            f"⚠️ WARNING: Possible value collapse ({near_zero_pct:.1%} near-zero predictions)"
-        )
+    print(f"Outcome correlation (Pearson): {pearson_correlation:.4f}")
 
     # Performance section
     print(f"\n--- PERFORMANCE ---")
     print(
+        f"Self-play: P1 win {self_play_p1_rate:.1f}%, P2 win {self_play_p2_rate:.1f}%, Draw {self_play_draw_rate:.1f}%"
+    )
+    print(
         f"Strategic: P1 win {strategic_p1_rate:.1f}%, P2 win {strategic_p2_rate:.1f}%"
     )
     print(f"Random: P1 win {random_p1_rate:.1f}%, P2 win {random_p2_rate:.1f}%")
-    print(f"Self-play: P1 win {self_play_p1_rate:.1f}%")
 
     # Decision quality
     print(f"\n--- DECISION QUALITY ---")
-    print(
-        f"MCTS: {iter_stats['mcts_moves']} moves ({mcts_ratio:.2f}), conf: {avg_mcts_confidence:.3f}, entropy: {avg_mcts_entropy:.3f}"
-    )
-    print(
-        f"Direct: {iter_stats['direct_moves']} moves ({direct_ratio:.2f}), conf: {avg_direct_confidence:.3f}, entropy: {avg_direct_entropy:.3f}"
-    )
+    print(f"MCTS Confidence (avg max policy): {avg_mcts_confidence:.3f}")
 
     # Buffer stats
     print(f"\n--- TRAINING DATA ---")
@@ -227,34 +199,18 @@ def log_iteration_report(
         f"Buffer: {buffer_size} examples (win: {buffer_win_pct:.1f}%, loss: {buffer_loss_pct:.1f}%, draw: {buffer_draw_pct:.1f}%)"
     )
     print(
-        f"Current iter: {iter_stats['win_examples']} win, {iter_stats['loss_examples']} loss, {iter_stats['draw_examples']} draw"
+        f"Current iter added: {iter_stats['win_examples']} win, {iter_stats['loss_examples']} loss, {iter_stats['draw_examples']} draw"
     )
     print(f"Cache hit rate: {cache_hit_rate:.1f}%")
 
-    # Gradient health (condensed)
+    # Gradient health
     if grad_stats and isinstance(grad_stats, dict) and "status" not in grad_stats:
         print(f"\n--- GRADIENT HEALTH ---")
 
         # For our new model structure, check value_fc4 gradients
-        if "value_fc4_weight" in grad_stats:
-            fc4_weight = grad_stats.get("value_fc4_weight", {})
-            fc4_weight_max_abs = max(
-                abs(fc4_weight.get("min", 0)), abs(fc4_weight.get("max", 0))
-            )
-            fc4_weight_mean_abs = abs(fc4_weight.get("mean", 0))
-
-            gradient_status = "HEALTHY"
-            if fc4_weight_max_abs > 1.0:
-                gradient_status = "⚠️ EXPLODING"
-            elif fc4_weight_max_abs < 0.0001:
-                gradient_status = "⚠️ VANISHING"
-
-            print(
-                f"Value head final layer - max: {fc4_weight_max_abs:.6f}, mean: {fc4_weight_mean_abs:.6f}"
-            )
-            print(f"Gradient status: {gradient_status}")
-        # Fall back to fc3 for old model structure
-        elif "value_fc3_weight" in grad_stats:
+        if (
+            "value_fc3_weight" in grad_stats
+        ):  # Assuming model structure has fc3 as final value layer
             fc3_weight = grad_stats.get("value_fc3_weight", {})
             fc3_weight_max_abs = max(
                 abs(fc3_weight.get("min", 0)), abs(fc3_weight.get("max", 0))
@@ -268,7 +224,7 @@ def log_iteration_report(
                 gradient_status = "⚠️ VANISHING"
 
             print(
-                f"Value head final layer - max: {fc3_weight_max_abs:.6f}, mean: {fc3_weight_mean_abs:.6f}"
+                f"Value head final layer - max abs grad: {fc3_weight_max_abs:.6f}, mean abs grad: {fc3_weight_mean_abs:.6f}"
             )
             print(f"Gradient status: {gradient_status}")
 
@@ -287,8 +243,6 @@ class TrainingExample:
 
 def inspect_value_head_gradients(model):
     """Inspect gradients flowing into value head layers"""
-    if not INSPECT_GRADIENTS:
-        return {}
 
     # gather gradients from value head layers
     gradient_stats = {}
@@ -341,17 +295,12 @@ def inspect_value_head_gradients(model):
     return gradient_stats
 
 
-def hybrid_training_loop(
+def training_loop(
     model: ModelWrapper,
     resume_path: str = None,
 ):
-    """Training loop that combines supervised learning from expert demonstrations
-    with self-play reinforcement learning via AlphaZero-style MCTS"""
-
-    # Initialize random number generator
     rng = np.random.Generator(np.random.PCG64())
 
-    # Initialize training state
     replay_buffer = []
     running_loss = {
         "total": 1e-8,
@@ -361,7 +310,6 @@ def hybrid_training_loop(
     running_count = 0
     iteration = 0
 
-    # Metrics and config
     stats_template = {
         "win_rate": 0.0,
         "loss_rate": 0.0,
@@ -373,16 +321,11 @@ def hybrid_training_loop(
     win_stats = {k: {**stats_template} for k in ["self", "strategic", "random"]}
     strategic_opponent = StrategicOpponent()
     random_opponent = RandomOpponent()
-    # Removed unused latest_model_path variable
-
-    # Initialize training directories
     os.makedirs("saved_models", exist_ok=True)
     os.makedirs("saved_plots", exist_ok=True)
 
-    # Path for saving checkpoints
     checkpoint_path = DEFAULT_CHECKPOINT_PATH
 
-    # Enhance interrupt handler to save checkpoint on exit
     interrupt_received = False
     in_training_phase = False  # track whether we're in the training phase
 
@@ -422,9 +365,9 @@ def hybrid_training_loop(
     # Start the training timer
     training_start = time.time()
 
-    # Base stats template
+    # Base stats template - simplified
     stats_template = {
-        # Game outcome stats - keep these
+        # game outcome stats
         "strategic_wins_as_p1": 0,
         "strategic_wins_as_p2": 0,
         "strategic_games_as_p1": 0,
@@ -434,49 +377,28 @@ def hybrid_training_loop(
         "random_games_as_p1": 0,
         "random_games_as_p2": 0,
         "self_play_p1_wins": 0,
+        "self_play_draws": 0,  # track draws for win rate calculation
         "self_play_games": 0,
-        "mcts_moves": 0,
-        "direct_moves": 0,
-        "total_moves": 0,
         "total_games": 0,
+        # buffer content stats
         "win_examples": 0,
         "loss_examples": 0,
         "draw_examples": 0,
-        # Policy metrics - keep these
+        # mcts/value stats
         "mcts_policy_confidence_sum": 0,
-        "direct_policy_confidence_sum": 0,
-        "mcts_policy_entropy_sum": 0,
-        "direct_policy_entropy_sum": 0,
-        # Basic value prediction stats - keep some
+        "mcts_moves": 0,  # count mcts moves for averaging confidence
         "value_prediction_sum": 0,
-        "value_prediction_squared_sum": 0,
+        "value_prediction_squared_sum": 0,  # needed for std dev
         "value_prediction_abs_sum": 0,
         "value_prediction_count": 0,
-        "extreme_value_count": 0,
-        "value_error_sum": 0,  # Still needed for reporting
-        # Cache stats - keep these
+        # correlation stats
+        "value_actual_pred_products": 0,  # needed for pearson correlation
+        "value_actual_squared": 0,  # needed for pearson correlation
+        "value_pred_squared": 0,  # needed for pearson correlation
+        # cache stats
         "cache_hits": 0,
         "cache_misses": 0,
-        # New value prediction metrics - keep all of these
-        "value_absolute_diff_sum": 0,
-        "value_relative_diff_sum": 0,
-        "value_scaled_diff_sum": 0,
-        "value_actual_pred_products": 0,
-        "value_actual_squared": 0,
-        "value_pred_squared": 0,
-        "high_conf_error_sum": 0,
-        "high_conf_count": 0,
-        "med_conf_error_sum": 0,
-        "med_conf_count": 0,
-        "low_conf_error_sum": 0,
-        "low_conf_count": 0,
-        "move_indices": [],
-        "predicted_values": [],
-        "actual_values": [],
     }
-
-    # Keep track of last N checkpoints
-    checkpoint_files = []
 
     def get_adjusted_value(game, winner, current_player):
         """Calculate training value target based purely on score differential.
@@ -629,14 +551,8 @@ def hybrid_training_loop(
             # Max probability in the policy distribution
             mcts_policy_confidence = np.max(policy)
 
-            # Calculate policy entropy: -sum(p_i * log(p_i))
-            # Add small epsilon to avoid log(0)
-            epsilon = 1e-10
-            mcts_policy_entropy = -np.sum(policy * np.log(policy + epsilon))
-
             # Update statistics
             iter_stats["mcts_policy_confidence_sum"] += mcts_policy_confidence
-            iter_stats["mcts_policy_entropy_sum"] += mcts_policy_entropy
 
         else:
             # Use direct policy from neural network
@@ -686,32 +602,14 @@ def hybrid_training_loop(
             policy_target = np.zeros_like(masked_policy)
             policy_target[move_coords] = 1.0
 
-            # Calculate direct policy confidence metrics
-            # Get raw policy before masking and noise for confidence calculation
-            raw_policy = policy.copy()
-            direct_policy_confidence = np.max(raw_policy)
-
-            # Calculate policy entropy on the raw policy
-            epsilon = 1e-10
-            direct_policy_entropy = -np.sum(raw_policy * np.log(raw_policy + epsilon))
-
-            # Update statistics
-            iter_stats["direct_policy_confidence_sum"] += direct_policy_confidence
-            iter_stats["direct_policy_entropy_sum"] += direct_policy_entropy
-
         # Create the move object
         move = Move(move_coords[0], move_coords[1], PieceType(move_coords[2]))
 
-        # Track value prediction statistics
+        # Track value prediction statistics (only basic ones)
         iter_stats["value_prediction_sum"] += root_value
         iter_stats["value_prediction_squared_sum"] += root_value * root_value
         iter_stats["value_prediction_abs_sum"] += abs(root_value)
         iter_stats["value_prediction_count"] += 1
-
-        # Lower threshold to better match our model's actual behavior
-        # Also count both positive and negative extreme values separately
-        if abs(root_value) > 0.6:  # Track moderately confident value predictions
-            iter_stats["extreme_value_count"] += 1
 
         return move, policy_target, root_value, state_rep
 
@@ -752,7 +650,7 @@ def hybrid_training_loop(
     def get_improved_value_target(outcome_value, mcts_value, move_index, global_weight):
         """Blend the final outcome with MCTS predicted value for better training signal"""
         # Early moves use more bootstrapping, later moves use more outcome
-        move_factor = max(0.2, 1.0 - (move_index / 30))
+        move_factor = max(0.2, 1.0 - (move_index / 16))
         # Combine global weight with move-specific factor
         effective_factor = move_factor * global_weight
         return (1 - effective_factor) * outcome_value + effective_factor * mcts_value
@@ -774,15 +672,6 @@ def hybrid_training_loop(
     print("Starting hybrid training loop with value bootstrapping")
     print("Episodes per iteration:", DEFAULT_EPISODES)
     print("MCTS move ratio: {:.1%}".format(DEFAULT_MCTS_RATIO))
-    print("Learn from strategic opponent: {}".format(DEFAULT_LEARN_FROM_STRATEGIC))
-    # print("Initial opponent ratios:")
-    # print("  Random: {:.1%}".format(random_opponent_ratio))
-    # print("  Strategic: {:.1%}".format(strategic_opponent_ratio))
-    # print(
-    #     "  Self-play: {:.1%}".format(
-    #         1.0 - random_opponent_ratio - strategic_opponent_ratio
-    #     )
-    # )
     print("Initial bootstrap weight: {:.2f}".format(get_bootstrap_weight(iteration)))
     print("Final bootstrap weight: {:.2f}".format(BOOTSTRAP_MAX_WEIGHT))
     print("Batch size:", DEFAULT_BATCH_SIZE)
@@ -917,15 +806,6 @@ def hybrid_training_loop(
                             game.pass_turn()
                             continue
 
-                        # Only store examples from strategic opponent if configured to do so
-                        if (
-                            opponent_type == "strategic"
-                            and DEFAULT_LEARN_FROM_STRATEGIC
-                        ):
-                            # Create and store example from opponent's move
-                            opponent_example = create_opponent_example(game, move)
-                            examples.append(opponent_example)
-
                     # Make move
                     result = game.make_move(move)
                     move_count += 1
@@ -951,28 +831,9 @@ def hybrid_training_loop(
                                 scaled_outcome_value = outcome_value * (
                                     example.move_count / 15
                                 )
-                                error = abs(scaled_outcome_value - example.mcts_value)
-                                iter_stats["value_error_sum"] += error
-
-                                # Calculate additional error metrics
-
-                                # 1. Absolute difference from actual score differential
-                                abs_diff = abs(outcome_value - example.mcts_value)
-                                iter_stats["value_absolute_diff_sum"] += abs_diff
-
-                                # 2. Relative difference (error divided by magnitude of actual)
-                                if (
-                                    abs(outcome_value) > 0.01
-                                ):  # avoid division by near-zero
-                                    rel_diff = abs_diff / abs(outcome_value)
-                                    iter_stats["value_relative_diff_sum"] += rel_diff
-
-                                # 3. Error scaled by game progression - less error expected as game progresses
-                                # Use exponential weighting: later moves should have exponentially less error
-                                game_progress = min(1.0, example.move_count / 15)
-                                expected_error = max(0.1, 1.0 - (game_progress**1.5))
-                                scaled_diff = abs_diff / expected_error
-                                iter_stats["value_scaled_diff_sum"] += scaled_diff
+                                # removed detailed error calculation, keeping only correlation components
+                                # error = abs(scaled_outcome_value - example.mcts_value)
+                                # iter_stats["value_error_sum"] += error
 
                                 # 4. Track for correlation calculation
                                 iter_stats["value_actual_pred_products"] += (
@@ -985,41 +846,8 @@ def hybrid_training_loop(
                                     example.mcts_value * example.mcts_value
                                 )
 
-                                # 5. Track error by prediction confidence level
-                                pred_abs = abs(example.mcts_value)
-                                if pred_abs > 0.7:
-                                    iter_stats["high_conf_error_sum"] += abs_diff
-                                    iter_stats["high_conf_count"] += 1
-                                elif pred_abs > 0.3:
-                                    iter_stats["med_conf_error_sum"] += abs_diff
-                                    iter_stats["med_conf_count"] += 1
-                                else:
-                                    iter_stats["low_conf_error_sum"] += abs_diff
-                                    iter_stats["low_conf_count"] += 1
-
-                                # 6. Store time series data (limit to 1000 samples per iteration)
-                                if len(iter_stats["move_indices"]) < 1000:
-                                    iter_stats["move_indices"].append(
-                                        example.move_count
-                                    )
-                                    iter_stats["predicted_values"].append(
-                                        example.mcts_value
-                                    )
-                                    iter_stats["actual_values"].append(outcome_value)
-
-                                # Track basic value statistics
-                                iter_stats["value_prediction_sum"] += example.mcts_value
-                                iter_stats["value_prediction_squared_sum"] += (
-                                    example.mcts_value**2
-                                )
-                                iter_stats["value_prediction_abs_sum"] += abs(
-                                    example.mcts_value
-                                )
-                                iter_stats["value_prediction_count"] += 1
-
-                                # Track extreme value counts (values near -1 or 1)
-                                if abs(example.mcts_value) > 0.8:
-                                    iter_stats["extreme_value_count"] += 1
+                                # removed tracking error by confidence level
+                                # removed storing time series data
 
                                 example.value = get_improved_value_target(
                                     outcome_value,
@@ -1042,36 +870,9 @@ def hybrid_training_loop(
                                     # since we use subjective=True in state_rep creation
                                     bootstrap_value = float(next_value[0][0])
 
-                                    # Track value prediction error for bootstrapped values too
-                                    # Scale outcome value by move_count/15 for better early move analysis
-                                    scaled_outcome_value = outcome_value * (
-                                        example.move_count / 15
-                                    )
-                                    error = abs(scaled_outcome_value - bootstrap_value)
-                                    iter_stats["value_error_sum"] += error
-
-                                    # Calculate additional error metrics (same as above)
-
-                                    # 1. Absolute difference from actual score differential
-                                    abs_diff = abs(outcome_value - bootstrap_value)
-                                    iter_stats["value_absolute_diff_sum"] += abs_diff
-
-                                    # 2. Relative difference (error divided by magnitude of actual)
-                                    if (
-                                        abs(outcome_value) > 0.01
-                                    ):  # avoid division by near-zero
-                                        rel_diff = abs_diff / abs(outcome_value)
-                                        iter_stats[
-                                            "value_relative_diff_sum"
-                                        ] += rel_diff
-
-                                    # 3. Error scaled by game progression
-                                    game_progress = min(1.0, example.move_count / 15)
-                                    expected_error = max(
-                                        0.1, 1.0 - (game_progress**1.5)
-                                    )
-                                    scaled_diff = abs_diff / expected_error
-                                    iter_stats["value_scaled_diff_sum"] += scaled_diff
+                                    # removed detailed error tracking, keeping correlation components
+                                    # error = abs(scaled_outcome_value - bootstrap_value)
+                                    # iter_stats["value_error_sum"] += error
 
                                     # 4. Track for correlation calculation
                                     iter_stats["value_actual_pred_products"] += (
@@ -1084,45 +885,12 @@ def hybrid_training_loop(
                                         bootstrap_value * bootstrap_value
                                     )
 
-                                    # 5. Track error by prediction confidence level
-                                    pred_abs = abs(bootstrap_value)
-                                    if pred_abs > 0.7:
-                                        iter_stats["high_conf_error_sum"] += abs_diff
-                                        iter_stats["high_conf_count"] += 1
-                                    elif pred_abs > 0.3:
-                                        iter_stats["med_conf_error_sum"] += abs_diff
-                                        iter_stats["med_conf_count"] += 1
-                                    else:
-                                        iter_stats["low_conf_error_sum"] += abs_diff
-                                        iter_stats["low_conf_count"] += 1
+                                    # removed tracking error by confidence level
+                                    # removed storing time series data
 
-                                    # 6. Store time series data (limit to 1000 samples per iteration)
-                                    if len(iter_stats["move_indices"]) < 1000:
-                                        iter_stats["move_indices"].append(
-                                            example.move_count
-                                        )
-                                        iter_stats["predicted_values"].append(
-                                            bootstrap_value
-                                        )
-                                        iter_stats["actual_values"].append(
-                                            outcome_value
-                                        )
-
-                                    # Track basic value statistics
-                                    iter_stats[
-                                        "value_prediction_sum"
-                                    ] += bootstrap_value
-                                    iter_stats["value_prediction_squared_sum"] += (
-                                        bootstrap_value**2
-                                    )
-                                    iter_stats["value_prediction_abs_sum"] += abs(
-                                        bootstrap_value
-                                    )
-                                    iter_stats["value_prediction_count"] += 1
-
-                                    # Track extreme value counts (values near -1 or 1)
-                                    if abs(bootstrap_value) > 0.8:
-                                        iter_stats["extreme_value_count"] += 1
+                                    # Track basic value statistics (already tracked in get_model_move)
+                                    # iter_stats["value_prediction_sum"] += bootstrap_value
+                                    # ... etc
 
                                     # Mix the outcome with bootstrapped value
                                     example.value = (
@@ -1143,12 +911,14 @@ def hybrid_training_loop(
 
                         # Update game statistics
                         iter_stats["total_games"] += 1
-                        iter_stats["total_moves"] += move_count
+                        # iter_stats["total_moves"] += move_count # removed total moves
 
                         if opponent_type == "self-play":
                             iter_stats["self_play_games"] += 1
                             if winner == Player.ONE:
                                 iter_stats["self_play_p1_wins"] += 1
+                            elif winner is None:  # track draws
+                                iter_stats["self_play_draws"] += 1
                         elif opponent_type == "strategic":
                             if model_plays_p1:
                                 iter_stats["strategic_games_as_p1"] += 1
@@ -1202,13 +972,22 @@ def hybrid_training_loop(
 
             # Balance the replay buffer using current_iteration_examples
             tqdm.write(
-                f"Balancing replay buffer (current size: {len(replay_buffer)}, new examples: {len(current_iteration_examples)})"
+                f"Updating replay buffer (current size: {len(replay_buffer)}, new examples: {len(current_iteration_examples)})"
             )
-            replay_buffer = balance_replay_buffer(
-                replay_buffer,  # Previous buffer
-                current_iteration_examples,  # New examples we just collected
-                buffer_size=DEFAULT_BUFFER_SIZE,
-            )
+            if BALANCE_REPLAY_BUFFER:
+                tqdm.write("Applying balancing...")
+                replay_buffer = balance_replay_buffer(
+                    replay_buffer,  # Previous buffer
+                    current_iteration_examples,  # New examples we just collected
+                    buffer_size=DEFAULT_BUFFER_SIZE,
+                )
+            else:
+                # if not balancing, just add new examples and trim if needed
+                replay_buffer.extend(current_iteration_examples)
+                if len(replay_buffer) > DEFAULT_BUFFER_SIZE:
+                    # keep only the most recent examples
+                    replay_buffer = replay_buffer[-DEFAULT_BUFFER_SIZE:]
+                tqdm.write("Skipping balancing, buffer updated.")
 
             # Log buffer size and distribution after balancing
             # Count buffer categories after balancing
@@ -1353,80 +1132,55 @@ def hybrid_training_loop(
             # Collect gradient statistics for reporting
             grad_stats = inspect_value_head_gradients(model)
 
+            # Calculate average MCTS confidence
+            iter_stats["avg_mcts_confidence"] = (
+                iter_stats["mcts_policy_confidence_sum"]
+                / max(1, iter_stats["mcts_moves"])
+                if iter_stats["mcts_moves"] > 0
+                else 0
+            )
+
+            # Calculate value metrics (simplified)
+            value_pred_count = iter_stats["value_prediction_count"]
+            actual_sq = iter_stats["value_actual_squared"]
+            pred_sq = iter_stats["value_pred_squared"]
+
             value_metrics = {
                 "pearson_correlation": (
                     iter_stats["value_actual_pred_products"]
-                    / (
-                        math.sqrt(iter_stats["value_actual_squared"])
-                        * math.sqrt(iter_stats["value_pred_squared"])
-                    )
-                    if iter_stats["value_actual_squared"] > 0
-                    and iter_stats["value_pred_squared"] > 0
-                    else 0
-                ),
-                "avg_absolute_diff": (
-                    iter_stats["value_absolute_diff_sum"]
-                    / iter_stats["value_prediction_count"]
-                    if iter_stats["value_prediction_count"] > 0
-                    else 0
-                ),
-                "avg_relative_diff": (
-                    iter_stats["value_relative_diff_sum"]
-                    / iter_stats["value_prediction_count"]
-                    if iter_stats["value_prediction_count"] > 0
-                    else 0
-                ),
-                "avg_scaled_diff": (
-                    iter_stats["value_scaled_diff_sum"]
-                    / iter_stats["value_prediction_count"]
-                    if iter_stats["value_prediction_count"] > 0
+                    / (math.sqrt(actual_sq) * math.sqrt(pred_sq))
+                    if actual_sq > 0 and pred_sq > 0
                     else 0
                 ),
                 "avg_value_prediction": (
-                    iter_stats["value_prediction_sum"]
-                    / iter_stats["value_prediction_count"]
-                    if iter_stats["value_prediction_count"] > 0
+                    iter_stats["value_prediction_sum"] / value_pred_count
+                    if value_pred_count > 0
                     else 0
                 ),
                 "avg_abs_value": (
-                    iter_stats["value_prediction_abs_sum"]
-                    / iter_stats["value_prediction_count"]
-                    if iter_stats["value_prediction_count"] > 0
+                    iter_stats["value_prediction_abs_sum"] / value_pred_count
+                    if value_pred_count > 0
                     else 0
                 ),
                 "value_std": (
                     math.sqrt(
                         max(
                             0,
-                            iter_stats["value_prediction_squared_sum"]
-                            / iter_stats["value_prediction_count"]
-                            - (
-                                iter_stats["value_prediction_sum"]
-                                / iter_stats["value_prediction_count"]
+                            (
+                                iter_stats["value_prediction_squared_sum"]
+                                / value_pred_count
                             )
+                            - (iter_stats["value_prediction_sum"] / value_pred_count)
                             ** 2,
                         )
                     )
-                    if iter_stats["value_prediction_count"] > 0
+                    if value_pred_count > 0
                     else 0
                 ),
-                "extreme_value_ratio": (
-                    iter_stats["extreme_value_count"]
-                    / iter_stats["value_prediction_count"]
-                    if iter_stats["value_prediction_count"] > 0
-                    else 0
-                ),
-                "avg_value_error": (
-                    iter_stats["value_error_sum"] / iter_stats["value_prediction_count"]
-                    if iter_stats["value_error_sum"] > 0
-                    else 0
-                ),
-                "near_zero_pct": (
-                    np.sum(np.abs(iter_stats["actual_values"]) < 0.1)
-                    / len(iter_stats["actual_values"])
-                    if len(iter_stats["actual_values"]) > 0
-                    else 0
-                ),
+                # removed avg_absolute_diff, avg_relative_diff, avg_scaled_diff
+                # removed extreme_value_ratio
+                # removed avg_value_error
+                # removed near_zero_pct
             }
 
             # Always use consolidated logging
@@ -1622,4 +1376,4 @@ if __name__ == "__main__":
         model.load(load_path)
 
     # Start training
-    hybrid_training_loop(model, resume_path=resume_path)
+    training_loop(model, resume_path=resume_path)

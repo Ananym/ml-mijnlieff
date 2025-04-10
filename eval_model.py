@@ -81,7 +81,7 @@ def policy_vs_mcts_eval(
 
             if use_raw_policy:
                 # Use direct policy from neural network with softmax sampling
-                policy, value_pred = model.predict(
+                policy, _ = model.predict(
                     state_rep.board, state_rep.flat_values, legal_moves
                 )
                 policy = policy.squeeze(0)
@@ -102,7 +102,7 @@ def policy_vs_mcts_eval(
                 else:
                     # Fallback to random selection among legal moves
                     legal_flat = legal_moves.flatten()
-                    legal_indices = np.where(legal_flat > 0)[0]
+                    legal_indices = np.nonzero(legal_flat > 0)[0]
                     move_idx = rng.choice(legal_indices)
                     move_coords = np.unravel_index(move_idx, masked_policy.shape)
             else:
@@ -214,7 +214,7 @@ def policy_vs_mcts_eval(
                 state_rep = game.get_game_state_representation(subjective=True)
 
                 # Use direct policy from neural network with softmax sampling
-                policy, value_pred = model.predict(
+                policy, _ = model.predict(
                     state_rep.board, state_rep.flat_values, legal_moves
                 )
                 policy = policy.squeeze(0)
@@ -235,7 +235,7 @@ def policy_vs_mcts_eval(
                 else:
                     # Fallback to random selection among legal moves
                     legal_flat = legal_moves.flatten()
-                    legal_indices = np.where(legal_flat > 0)[0]
+                    legal_indices = np.nonzero(legal_flat > 0)[0]
                     move_idx = rng.choice(legal_indices)
                     move_coords = np.unravel_index(move_idx, masked_policy.shape)
 

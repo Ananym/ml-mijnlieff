@@ -17,6 +17,10 @@ import time
 #   mcts.run_benchmark(num_simulations=50, num_runs=2)
 ENABLE_TIMING = False
 
+# Noise control - synced with train.py
+# Lower values reduce exploration noise
+DIRICHLET_SCALE = 0.1  # Scale factor for Dirichlet noise
+
 # Random number generator with fixed seed for reproducibility
 rng = np.random.Generator(np.random.PCG64(seed=42))
 
@@ -156,9 +160,13 @@ def add_dirichlet_noise(
     returns:
         modified policy with noise added
     """
-    legal_indices = np.where(legal_moves_flat > 0)[0]
+    legal_indices = np.nonzero(legal_moves_flat > 0)[0]
 
     if len(legal_indices) == 0:
+        return policy_flat
+
+    # If noise is completely disabled, return original policy
+    if DIRICHLET_SCALE <= 0.0:
         return policy_flat
 
     # calculate training progress (0 to 1)
@@ -181,6 +189,9 @@ def add_dirichlet_noise(
     # - start with 0.25 (25% noise) early in training
     # - decrease to 0.10 (10% noise) by the end
     noise_weight = max(0.10, 0.25 - 0.15 * progress)
+
+    # Apply global scale factor to reduce noise
+    noise_weight *= DIRICHLET_SCALE
 
     # apply noise only to legal moves
     policy_with_noise = policy_flat.copy()
@@ -377,25 +388,23 @@ class MCTS:
     def _estimate_rollout_value(
         self, state: GameState, perspective_player: Player
     ) -> float:
-        """Simple heuristic for rollout termination before game end"""
-        # Compare scores
+        """Estimate position value using score differential"""
+        # Get scores from both players
         scores = state.get_scores()
-        score_diff = (
-            scores[perspective_player]
-            - scores[Player.ONE if perspective_player == Player.TWO else Player.TWO]
-        )
+        opponent = Player.ONE if perspective_player == Player.TWO else Player.TWO
 
-        # Add piece advantage
+        # Calculate score differential from perspective player's view
+        score_diff = scores[perspective_player] - scores[opponent]
+
+        # Add smaller weight for piece advantage (piece count matters less than actual score)
         pieces_left = sum(state.piece_counts[perspective_player].values())
-        opp_pieces_left = sum(
-            state.piece_counts[
-                Player.ONE if perspective_player == Player.TWO else Player.TWO
-            ].values()
-        )
-        piece_advantage = (pieces_left - opp_pieces_left) * 0.1
+        opp_pieces_left = sum(state.piece_counts[opponent].values())
+        piece_advantage = (pieces_left - opp_pieces_left) * 0.05
 
-        # Normalize to [-1, 1] range
-        return max(-1.0, min(1.0, (score_diff * 0.2 + piece_advantage) / 2.0))
+        # Normalize to [-0.6, 0.6] range for non-terminal estimates
+        # More conservative than terminal values
+        combined_value = score_diff * 0.15 + piece_advantage
+        return max(-0.6, min(0.6, combined_value))
 
     def search(self, game_state: GameState) -> np.ndarray:
         """Perform MCTS search from given state and return move probabilities"""
@@ -429,7 +438,8 @@ class MCTS:
             legal_moves = search_state.get_legal_moves()
             policy, value_pred = self._predict_with_cache(state_rep, legal_moves)
             policy = policy.squeeze(0)
-            root.predicted_value = value_pred.squeeze()
+            # Convert tensor to float
+            root.predicted_value = value_pred.squeeze().item()
 
             # Add Dirichlet noise to root policy for exploration regardless of player
             legal_flat = legal_moves.flatten()
@@ -526,7 +536,8 @@ class MCTS:
                         state_rep, legal_moves
                     )
                     policy = policy.squeeze(0)
-                    value = value_pred.squeeze()
+                    # Convert tensor to float
+                    value = value_pred.squeeze().item()
                     node.predicted_value = value
 
                     if ENABLE_TIMING:
@@ -641,7 +652,7 @@ class MCTS:
                 visit_counts[x, y, piece_type] = child.visits
 
         # Apply temperature
-        if self.temperature == 0:
+        if abs(self.temperature) < 1e-9:  # epsilon check instead of exact equality
             # Choose most visited move deterministically
             best_idx = np.unravel_index(np.argmax(visit_counts), visit_counts.shape)
             probs = np.zeros_like(visit_counts)
@@ -667,21 +678,40 @@ class MCTS:
         return probs, root
 
     def _get_game_value(self, game_state, original_player):
-        """Calculate the game value from original player's perspective"""
+        """Calculate the game value from original player's perspective using score differential"""
         # Validate the game is actually over
         if not game_state.is_over:
-            # If the game isn't over, this shouldn't be called
-            # Return a neutral value just in case
-            return 0.0
+            # If the game isn't over, estimate using score difference
+            scores = game_state.get_scores()
+            player_score = scores[original_player]
+            opponent = Player.ONE if original_player == Player.TWO else Player.TWO
+            opponent_score = scores[opponent]
+            score_diff = player_score - opponent_score
 
-        # Fast path for win/loss outcome
+            # normalize to [-0.5, 0.5] range for non-terminal estimates
+            # more conservative than terminal values
+            return max(-0.5, min(0.5, score_diff / 8.0))
+
+        # For terminal states, calculate based on winner and score differential
         winner = game_state.get_winner()
-        if winner is None:
-            # Game is a draw
-            return 0.0
+        scores = game_state.get_scores()
+        player_score = scores[original_player]
+        opponent = Player.ONE if original_player == Player.TWO else Player.TWO
+        opponent_score = scores[opponent]
+        score_diff = player_score - opponent_score
 
-        # Return 1 if original player won, -1 if lost
-        return 1.0 if winner == original_player else -1.0
+        # normalize to [-0.8, 0.8] range
+        normalized_diff = max(-0.8, min(0.8, score_diff / 8.0))
+
+        if winner is None:
+            # Game is a draw, use normalized score difference
+            return normalized_diff
+        elif winner == original_player:
+            # Win: ensure positive but consider margin
+            return max(0.8, normalized_diff)
+        else:
+            # Loss: ensure negative but consider margin
+            return min(-0.8, normalized_diff)
 
     def set_temperature(self, temperature):
         """Set temperature for move selection"""

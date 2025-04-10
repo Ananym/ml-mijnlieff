@@ -2,9 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Scale factor for policy entropy bonus (lower = less exploration)
+# This should be synced with ENTROPY_BONUS_SCALE in train.py
+ENTROPY_BONUS_SCALE = 0.1
+
 
 class ResBlock(nn.Module):
-    """Residual block with two convolutions and a skip connection"""
+    """Simple residual block with two convolutions and a skip connection"""
 
     def __init__(self, channels: int):
         super().__init__()
@@ -22,127 +26,78 @@ class ResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    """Enhanced network for 4x4 grid game with movement constraints"""
+    """Streamlined network for 4x4 grid game with movement constraints"""
 
     def __init__(self):
         super().__init__()
-        # update input channels from 10 to 6
-        in_channels = 6  # Reduced from 10 (removed terrain)
-        hidden_channels = 192  # Increased from 128
+        # input channels: 6 channels for board state
+        in_channels = 6
+        # optimized channels for 4x4 grid game
+        hidden_channels = 128  # increased from 64 for better pattern recognition
 
-        # First convolution layer - wider
+        # First convolution layer
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(hidden_channels)
 
-        # Add residual blocks for better feature extraction - increased depth
+        # 3 residual blocks - enough depth for this game's patterns
         self.res_blocks = nn.ModuleList(
             [
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
-                ResBlock(hidden_channels),  # added one more res block
             ]
         )
 
-        # Policy head - unchanged from previous version
-        self.policy_conv1 = nn.Conv2d(hidden_channels, 64, kernel_size=1)
-        self.policy_bn1 = nn.BatchNorm2d(64)
-        self.policy_conv2 = nn.Conv2d(64, 32, kernel_size=3, padding=1)
-        self.policy_bn2 = nn.BatchNorm2d(32)
-        self.policy_conv3 = nn.Conv2d(32, 4, kernel_size=1)
+        # Policy head - improved for better spatial understanding
+        policy_channels = 64  # increased from 32
+        self.policy_conv = nn.Conv2d(hidden_channels, policy_channels, kernel_size=1)
+        self.policy_bn = nn.BatchNorm2d(policy_channels)
+        self.policy_out = nn.Conv2d(policy_channels, 4, kernel_size=1)  # 4 piece types
 
-        # Enhanced value head - massively increased capacity
-        value_conv_channels = 256  # doubled from 128
+        # Value head - redesigned for better evaluation
+        value_channels = 64  # increased from 32
+        self.value_conv = nn.Conv2d(hidden_channels, value_channels, kernel_size=1)
+        self.value_bn = nn.BatchNorm2d(value_channels)
 
-        # Initial convolution with more filters
-        self.value_conv1 = nn.Conv2d(
-            hidden_channels, value_conv_channels, kernel_size=3, padding=1
-        )
-        self.value_bn1 = nn.BatchNorm2d(value_conv_channels)
+        # Spatial features processing
+        # 64 channels on 4x4 board = 1024 features
+        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 256)
+        self.value_bn2 = nn.BatchNorm1d(256)
 
-        # Multi-scale feature extraction with three parallel paths
-        # Path A: point-wise features
-        self.value_conv2a = nn.Conv2d(value_conv_channels, 96, kernel_size=1)
-        self.value_bn2a = nn.BatchNorm2d(96)
-
-        # Path B: local features (3x3)
-        self.value_conv2b = nn.Conv2d(value_conv_channels, 96, kernel_size=3, padding=1)
-        self.value_bn2b = nn.BatchNorm2d(96)
-
-        # Path C: wider receptive field (5x5 via two 3x3)
-        self.value_conv2c_1 = nn.Conv2d(
-            value_conv_channels, 96, kernel_size=3, padding=1
-        )
-        self.value_bn2c_1 = nn.BatchNorm2d(96)
-        self.value_conv2c_2 = nn.Conv2d(96, 96, kernel_size=3, padding=1)
-        self.value_bn2c_2 = nn.BatchNorm2d(96)
-
-        # Merge all three paths
-        self.value_conv3 = nn.Conv2d(288, 128, kernel_size=1)  # 96*3 -> 128
-        self.value_bn3 = nn.BatchNorm2d(128)
-
-        # Deeper spatial processing with residual connection
-        self.value_conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.value_bn4 = nn.BatchNorm2d(128)
-        self.value_conv5 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.value_bn5 = nn.BatchNorm2d(128)
-
-        # Enhanced flat feature processing
+        # Flat features processing
         flat_feature_size = 12  # assuming 12 flat features
-        self.flat_fc1 = nn.Linear(flat_feature_size, 96)  # increased from 64
-        self.flat_bn1 = nn.BatchNorm1d(96)
-        self.flat_fc2 = nn.Linear(96, 96)  # added another layer
-        self.flat_bn2 = nn.BatchNorm1d(96)
+        self.flat_fc = nn.Linear(flat_feature_size, 64)
+        self.flat_bn = nn.BatchNorm1d(64)
 
-        # Self-attention on the spatial features before flattening
-        self.spatial_attn_q = nn.Conv2d(128, 32, kernel_size=1)
-        self.spatial_attn_k = nn.Conv2d(128, 32, kernel_size=1)
-        self.spatial_attn_v = nn.Conv2d(128, 128, kernel_size=1)
+        # Combined processing with deeper network
+        self.value_fc2 = nn.Linear(256 + 64, 128)  # spatial + flat
+        self.value_bn3 = nn.BatchNorm1d(128)
+        self.value_fc3 = nn.Linear(128, 64)
+        self.value_bn4 = nn.BatchNorm1d(64)
+        self.value_fc4 = nn.Linear(64, 1)
 
-        # Wider and deeper fully-connected layers with skip connections
-        spatial_size = 128 * 4 * 4  # 128 channels on 4x4 board
-        combined_size = spatial_size + 96  # spatial + enhanced flat features
-
-        # Main FC pathway - massively wider
-        self.value_fc1 = nn.Linear(combined_size, 512)  # doubled from 256
-        self.value_bn_fc1 = nn.BatchNorm1d(512)
-        self.value_fc2 = nn.Linear(512, 384)  # doubled from 192
-        self.value_bn_fc2 = nn.BatchNorm1d(384)
-        self.value_fc3 = nn.Linear(384, 256)  # doubled from 128
-        self.value_bn_fc3 = nn.BatchNorm1d(256)
-        self.value_fc4 = nn.Linear(256, 192)  # increased from 64
-        self.value_bn_fc4 = nn.BatchNorm1d(192)
-        self.value_fc5 = nn.Linear(192, 128)  # added another layer
-        self.value_bn_fc5 = nn.BatchNorm1d(128)
-        self.value_fc6 = nn.Linear(128, 64)  # added another layer
-        self.value_bn_fc6 = nn.BatchNorm1d(64)
-
-        # Auxiliary pathways for skip connections
-        self.value_aux1 = nn.Linear(combined_size, 384)  # matches fc2 output
-        self.value_aux2 = nn.Linear(512, 256)  # matches fc3 output
-        self.value_aux3 = nn.Linear(384, 128)  # matches fc5 output
-
-        # Final value output - LESS CONSTRAINED for better learning
-        self.value_out = nn.Linear(64, 1)
-        nn.init.uniform_(self.value_out.weight, -0.05, 0.05)  # wider initialization
-        nn.init.constant_(self.value_out.bias, 0.0)
-
-        # Initialize weights
+        # Apply initialization
         self._initialize_weights()
 
     def _initialize_weights(self):
-        # Kaiming initialization for ReLU networks
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
+                # kaiming initialization for conv layers
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+                # standard init for batch norm
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                # xavier for linear layers
+                nn.init.xavier_normal_(m.weight)
                 nn.init.constant_(m.bias, 0)
+
+        # special init for value head final layer to prevent vanishing gradients
+        nn.init.uniform_(self.value_fc4.weight, -0.03, 0.03)
+        nn.init.constant_(self.value_fc4.bias, 0)
 
     def forward(self, board_state, flat_state):
         # Initial feature extraction
@@ -153,91 +108,31 @@ class PolicyValueNet(nn.Module):
             x = block(x)
 
         # Policy head - outputs move probabilities (4x4x4 - one for each piece type)
-        policy = F.relu(self.policy_bn1(self.policy_conv1(x)))
-        policy = F.relu(self.policy_bn2(self.policy_conv2(policy)))
-        policy = self.policy_conv3(policy)
+        policy = F.relu(self.policy_bn(self.policy_conv(x)))
+        policy = self.policy_out(policy)
         policy = policy.permute(0, 2, 3, 1)  # NCHW -> NHWC for 4x4x4 output
 
-        # Enhanced value head with multi-path processing
-        # Main spatial processing
-        value = F.relu(self.value_bn1(self.value_conv1(x)))
+        # Value head - predicts score differential
+        value = F.relu(self.value_bn(self.value_conv(x)))
+        value_flat = value.flatten(1)  # flatten spatial dimensions
 
-        # Parallel spatial feature extraction paths
-        value_a = F.relu(self.value_bn2a(self.value_conv2a(value)))  # point-wise
-        value_b = F.relu(self.value_bn2b(self.value_conv2b(value)))  # local context
-
-        # Third path with wider receptive field
-        value_c = F.relu(self.value_bn2c_1(self.value_conv2c_1(value)))
-        value_c = F.relu(self.value_bn2c_2(self.value_conv2c_2(value_c)))
-
-        # Concatenate all three parallel paths
-        value = torch.cat([value_a, value_b, value_c], dim=1)
-        value = F.relu(self.value_bn3(self.value_conv3(value)))
-
-        # Deeper spatial processing with residual connection
-        identity = value
-        value = F.relu(self.value_bn4(self.value_conv4(value)))
-        value = self.value_bn5(self.value_conv5(value))
-        value = F.relu(value + identity)  # residual connection
-
-        # Self-attention mechanism on spatial features
-        batch_size = value.size(0)
-        h, w = value.size(2), value.size(3)
-
-        # Compute query, key, value projections
-        q = self.spatial_attn_q(value).view(batch_size, 32, -1)  # B x 32 x (H*W)
-        k = self.spatial_attn_k(value).view(batch_size, 32, -1)  # B x 32 x (H*W)
-        v = self.spatial_attn_v(value).view(batch_size, 128, -1)  # B x 128 x (H*W)
-
-        # Compute attention scores
-        attn = torch.bmm(q.permute(0, 2, 1), k)  # B x (H*W) x (H*W)
-        attn = F.softmax(attn / (32**0.5), dim=2)  # scale by sqrt(d_k)
-
-        # Apply attention to values
-        attn_value = torch.bmm(v, attn.permute(0, 2, 1))  # B x 128 x (H*W)
-        attn_value = attn_value.view(batch_size, 128, h, w)  # B x 128 x H x W
-
-        # Add attention result as residual
-        value = value + attn_value * 0.5  # dampened residual connection
+        # Process flat features
+        flat_features = F.relu(self.flat_bn(self.flat_fc(flat_state)))
 
         # Process spatial features
-        value_spatial = value.flatten(1)  # flatten spatial dimensions
-
-        # Enhanced flat feature processing
-        flat_features = F.relu(self.flat_bn1(self.flat_fc1(flat_state)))
-        flat_features = F.relu(self.flat_bn2(self.flat_fc2(flat_features)))
+        value = F.relu(self.value_bn2(self.value_fc1(value_flat)))
 
         # Combine spatial and flat features
-        value_combined = torch.cat([value_spatial, flat_features], dim=1)
+        value_combined = torch.cat([value, flat_features], dim=1)
 
-        # Main path with multiple skip connections
-        aux1 = self.value_aux1(value_combined)  # auxiliary path 1
-
-        value = F.relu(self.value_bn_fc1(self.value_fc1(value_combined)))
-        aux2 = self.value_aux2(value)  # auxiliary path 2
-
+        # Final value processing with modest dropout
+        value = F.dropout(value_combined, p=0.1, training=self.training)
+        value = F.relu(self.value_bn3(self.value_fc2(value)))
         value = F.dropout(value, p=0.1, training=self.training)
-        value = F.relu(self.value_bn_fc2(self.value_fc2(value)))
-        value = value + aux1  # skip connection 1
+        value = F.relu(self.value_bn4(self.value_fc3(value)))
 
-        aux3 = self.value_aux3(value)  # auxiliary path 3
-
-        value = F.dropout(value, p=0.1, training=self.training)
-        value = F.relu(self.value_bn_fc3(self.value_fc3(value)))
-        value = value + aux2  # skip connection 2
-
-        value = F.dropout(value, p=0.1, training=self.training)
-        value = F.relu(self.value_bn_fc4(self.value_fc4(value)))
-
-        value = F.dropout(value, p=0.05, training=self.training)
-        value = F.relu(self.value_bn_fc5(self.value_fc5(value)))
-        value = value + aux3  # skip connection 3
-
-        value = F.dropout(value, p=0.05, training=self.training)
-        value = F.relu(self.value_bn_fc6(self.value_fc6(value)))
-
-        # Less restricted output scaling
-        value = torch.tanh(self.value_out(value))  # removed the 0.8 scaling factor
+        # Final output with tanh activation for [-1, 1] range
+        value = torch.tanh(self.value_fc4(value))
 
         return policy, value
 
@@ -270,32 +165,30 @@ class ModelWrapper:
             print("Using crunch mode - for model optimization and deployment")
             return
 
-        # div factors used in scheduler
-        self.div_factor = 10
-        self.final_div_factor = 20
-        self.max_iterations = 60
+        # Learning rate parameters
+        self.div_factor = 3  # Quicker warmup (was 4)
+        self.final_div_factor = 5  # Less aggressive decay (was 8)
+        self.max_iterations = 100  # Keep synchronized with train.py
 
-        # Simplified learning rate configuration with only max_lr
+        # Learning rates
         if self.mode == "fast":
-            self.max_lr = 0.1  # Higher peak learning rate
-            print(f"Using fast training mode")
+            self.max_lr = 0.01  # Reduced from 0.02 for more stability
         elif self.mode == "stable":
-            self.max_lr = 0.002  # Standard peak learning rate
-            print(f"Using stable training mode")
-        else:
-            raise ValueError(
-                f"Unknown mode: {mode}. Must be one of: fast, stable, crunch"
-            )
+            self.max_lr = 0.003  # Slightly reduced from 0.004
 
-        # Calculate initial lr for optimizer
-        initial_lr = self.max_lr / self.div_factor
+        # Optimizer parameters
+        weight_decay = 3e-5  # Slightly increased from 1e-5 for better regularization
+        betas = (
+            0.9,
+            0.95,
+        )  # Reduced second beta for faster adaptation to recent gradients
 
-        # Standard AdamW optimizer
+        # AdamW optimizer with tuned parameters
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=initial_lr,
-            weight_decay=5e-5,
-            betas=(0.9, 0.999),
+            lr=self.max_lr,
+            weight_decay=weight_decay,
+            betas=betas,
             eps=1e-8,
         )
 
@@ -303,7 +196,7 @@ class ModelWrapper:
         self.scheduler = self._create_scheduler(self.optimizer, self.max_iterations)
 
         # Print learning rate info
-        print(f"Initial learning rate: {initial_lr:.6f}")
+        print(f"Initial learning rate: {self.max_lr:.6f}")
         print(f"Will peak at: {self.max_lr:.6f}")
         print(
             f"Will finish at: {self.max_lr / (self.div_factor * self.final_div_factor):.6f}"
@@ -315,7 +208,7 @@ class ModelWrapper:
             optimizer,
             max_lr=self.max_lr,
             total_steps=remaining_iterations,
-            pct_start=0.3,
+            pct_start=0.3,  # longer warmup period
             anneal_strategy="cos",
             div_factor=self.div_factor,
             final_div_factor=self.final_div_factor,
@@ -327,8 +220,17 @@ class ModelWrapper:
         """Get move probabilities and value estimate with optional difficulty setting"""
         self.model.eval()
         with torch.no_grad():
-            board_state = torch.FloatTensor(board_state).to(self.device)
-            flat_state = torch.FloatTensor(flat_state).to(self.device)
+            # check if inputs are already tensors and handle device conversion
+            if not isinstance(board_state, torch.Tensor):
+                board_state = torch.FloatTensor(board_state).to(self.device)
+            else:
+                board_state = board_state.to(self.device)
+
+            if not isinstance(flat_state, torch.Tensor):
+                flat_state = torch.FloatTensor(flat_state).to(self.device)
+            else:
+                flat_state = flat_state.to(self.device)
+
             if len(board_state.shape) == 3:
                 board_state = board_state.unsqueeze(0)
                 flat_state = flat_state.unsqueeze(0)
@@ -342,7 +244,11 @@ class ModelWrapper:
 
             # Apply legal moves mask if provided
             if legal_moves is not None:
-                legal_moves = torch.FloatTensor(legal_moves).to(self.device)
+                if not isinstance(legal_moves, torch.Tensor):
+                    legal_moves = torch.FloatTensor(legal_moves).to(self.device)
+                else:
+                    legal_moves = legal_moves.to(self.device)
+
                 if len(legal_moves.shape) == 3:
                     legal_moves = legal_moves.unsqueeze(0)
                 legal_moves_flat = legal_moves.view(batch_size, -1)
@@ -428,7 +334,7 @@ class ModelWrapper:
         flat_inputs,
         policy_targets,
         value_targets,
-        policy_weight=1.0,  # Balanced weighting between policy and value
+        policy_weight=0.5,  # balanced weighting (was 0.3)
     ):
         """Perform a single training step with improved loss functions"""
         self.model.train()
@@ -466,59 +372,77 @@ class ModelWrapper:
                 -torch.sum(policy_targets_flat * log_policy, dim=1)
             )
 
-            # Smaller entropy bonus
+            # Add entropy bonus
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
-            policy_loss = policy_loss - 0.005 * entropy  # reduced from 0.01
+            policy_loss = policy_loss - ENTROPY_BONUS_SCALE * entropy
         else:
             # Cross-entropy for one-hot targets (supervised learning)
             policy_indices = torch.argmax(policy_targets_flat, dim=1)
             policy_loss = F.cross_entropy(policy_logits_flat, policy_indices)
 
-            # Reduced entropy bonus
+            # Add entropy bonus
             log_policy = F.log_softmax(policy_logits_flat, dim=1)
             policy_probs = F.softmax(policy_logits_flat, dim=1)
             entropy = -torch.sum(policy_probs * log_policy, dim=1).mean()
-            policy_loss = policy_loss - 0.01 * entropy  # reduced from 0.03
+            policy_loss = policy_loss - ENTROPY_BONUS_SCALE * entropy
 
-        # Improved directional correctness loss that properly handles draws
-        # For non-zero targets: check sign match
-        # For zero targets: reward predictions close to zero
-        non_draw_mask = smoothed_targets != 0
-        draw_mask = smoothed_targets == 0
+        # Use Huber loss for value - better for RL scenarios
+        value_loss = F.smooth_l1_loss(value_pred.squeeze(-1), smoothed_targets)
 
-        # For non-draws: check if signs match
-        non_draw_correct = (
-            (value_pred.squeeze(-1) * smoothed_targets) > 0
-        ) & non_draw_mask
+        # Combine losses with policy weight
+        total_loss = policy_weight * policy_loss + (1.0 - policy_weight) * value_loss
 
-        # For draws: check if prediction is close to zero
-        draw_correct = (torch.abs(value_pred.squeeze(-1)) < 0.3) & draw_mask
-
-        # Combine both conditions
-        correct_prediction = non_draw_correct | draw_correct
-        sign_loss = torch.mean(1.0 - correct_prediction.float())
-
-        # base MSE loss
-        mse_loss = F.mse_loss(value_pred.squeeze(-1), smoothed_targets)
-
-        # combined loss with higher weight on directional correctness
-        value_loss = mse_loss + 0.5 * sign_loss
-
-        # Combine losses with equal weight
-        total_loss = policy_weight * policy_loss + value_loss
-
-        # Optimization step with relaxed gradient clipping
+        # Optimization step with gradient clipping
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # Increased gradient clipping for larger model
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=5.0
-        )  # increased from 1.0
+        # Capture gradient statistics for monitoring
+        grad_stats = {}
+
+        # Get value head gradients for debugging
+        if self.model.value_fc4.weight.grad is not None:
+            fc4_w_grad = self.model.value_fc4.weight.grad
+            fc4_b_grad = self.model.value_fc4.bias.grad
+            fc3_w_grad = self.model.value_fc3.weight.grad
+            fc3_b_grad = self.model.value_fc3.bias.grad
+
+            grad_stats = {
+                "value_fc4_weight": {
+                    "mean": float(fc4_w_grad.mean().item()),
+                    "std": float(fc4_w_grad.std().item()),
+                    "min": float(fc4_w_grad.min().item()),
+                    "max": float(fc4_w_grad.max().item()),
+                    "norm": float(fc4_w_grad.norm().item()),
+                },
+                "value_fc4_bias": {
+                    "mean": float(fc4_b_grad.mean().item()),
+                    "std": float(fc4_b_grad.std().item()),
+                    "min": float(fc4_b_grad.min().item()),
+                    "max": float(fc4_b_grad.max().item()),
+                    "norm": float(fc4_b_grad.norm().item()),
+                },
+                "value_fc3_weight": {
+                    "mean": float(fc3_w_grad.mean().item()),
+                    "std": float(fc3_w_grad.std().item()),
+                    "min": float(fc3_w_grad.min().item()),
+                    "max": float(fc3_w_grad.max().item()),
+                    "norm": float(fc3_w_grad.norm().item()),
+                },
+                "value_fc3_bias": {
+                    "mean": float(fc3_b_grad.mean().item()),
+                    "std": float(fc3_b_grad.std().item()),
+                    "min": float(fc3_b_grad.min().item()),
+                    "max": float(fc3_b_grad.max().item()),
+                    "norm": float(fc3_b_grad.norm().item()),
+                },
+            }
+
+        # Apply gradient clipping to prevent instability
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
         self.optimizer.step()
 
-        return (total_loss.item(), policy_loss.item(), value_loss.item())
+        return (total_loss.item(), policy_loss.item(), value_loss.item(), grad_stats)
 
     def save_checkpoint(self, path, training_state=None):
         """Save model checkpoint with optional training state"""
@@ -580,30 +504,27 @@ class ModelWrapper:
         # Update max_lr
         self.max_lr = new_max_lr
 
-        # Calculate initial lr for optimizer
-        initial_lr = self.max_lr / self.div_factor
-
         # Create fresh optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=initial_lr,
-            weight_decay=5e-5,
-            betas=(0.9, 0.999),
+            lr=self.max_lr,
+            weight_decay=3e-5,
+            betas=(0.9, 0.95),
             eps=1e-8,
         )
 
         # Reset scheduler with new optimizer
-        remaining_steps = 140  # Estimate of total training iterations
+        remaining_steps = self.max_iterations  # use class variable
         self.scheduler = self._create_scheduler(self.optimizer, remaining_steps)
 
         # Print learning rate info
-        print(f"Initial learning rate: {initial_lr:.6f}")
+        print(f"Initial learning rate: {self.max_lr:.6f}")
         print(f"Will peak at: {self.max_lr:.6f}")
         print(
             f"Will finish at: {self.max_lr / (self.div_factor * self.final_div_factor):.6f}"
         )
 
-        return initial_lr
+        return self.max_lr
 
 
 class SafeOneCycleLR(torch.optim.lr_scheduler.OneCycleLR):
@@ -632,7 +553,7 @@ class SafeOneCycleLR(torch.optim.lr_scheduler.OneCycleLR):
         try:
             # Try normal step
             super().step(epoch)
-        except ValueError as e:
+        except ValueError:
             # Scheduler reached the end, set all learning rates to minimum
             self.total_steps_completed = True
             for param_group, lr in zip(

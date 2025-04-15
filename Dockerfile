@@ -1,9 +1,9 @@
 FROM public.ecr.aws/lambda/python:3.13 AS builder
 
 
-COPY requirements.txt .
+COPY requirements-for-lambda.txt .
 RUN microdnf install -y findutils && microdnf clean all && \
-    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r requirements-for-lambda.txt && \
     find /var/lang/lib/python3.13/site-packages -name "*.pyc" -delete && \
     find /var/lang/lib/python3.13/site-packages -name "*.pyo" -delete && \
     # Remove documentation and source files

@@ -16,25 +16,25 @@ from collections import defaultdict
 from eval_model import policy_vs_mcts_eval
 import torch.nn.functional as F
 
-DEFAULT_EPISODES = 100
-DEFAULT_BATCH_SIZE = 512
+DEFAULT_EPISODES = 150  # increased from 100 for more data per iteration
+DEFAULT_BATCH_SIZE = 256  # reduced from 512 - better for smaller model
 DEFAULT_SAVE_INTERVAL = 5
 DEFAULT_NUM_CHECKPOINTS = 5
 DEFAULT_MCTS_RATIO = 1.0
-DEFAULT_BUFFER_SIZE = 5000
-DEFAULT_POLICY_WEIGHT = 1.0
-DEFAULT_NUM_EPOCHS = 50
+DEFAULT_BUFFER_SIZE = 4000  # reduced from 5000 to match smaller model capacity
+DEFAULT_POLICY_WEIGHT = 0.8  # reduced from 1.0 - balance policy and value better
+DEFAULT_NUM_EPOCHS = 20  # reduced from 50 - prevent overfitting
 DEFAULT_EVAL_INTERVAL = 20
 DEFAULT_EVAL_GAMES = 60
 DEFAULT_STRATEGIC_EVAL_GAMES = 60
-DEFAULT_MIN_MCTS_SIMS = 50
+DEFAULT_MIN_MCTS_SIMS = 100  # increased from 50 for better early training signal
 DEFAULT_MAX_MCTS_SIMS = 200
 MAX_ITERATIONS = 100
 
 BALANCE_REPLAY_BUFFER = False
 
-DIRICHLET_SCALE = 0.0  # No exploration noise
-ENTROPY_BONUS_SCALE = 0.0  # No entropy bonus
+DIRICHLET_SCALE = 0.15  # Moderate exploration noise (was 0.0)
+ENTROPY_BONUS_SCALE = 0.05  # Small entropy bonus to encourage exploration (was 0.0)
 
 
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Reduced from 0.1
@@ -514,7 +514,7 @@ def training_loop(
             mcts = MCTS(
                 model=model,
                 num_simulations=get_mcts_sims_for_iteration(iteration),
-                c_puct=1.0,
+                c_puct=1.5,  # increased from 1.0 for more exploration
             )
             mcts.set_temperature(temperature)
             mcts.set_iteration(iteration)  # Set current iteration for noise

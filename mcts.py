@@ -19,7 +19,7 @@ ENABLE_TIMING = False
 
 # Noise control - synced with train.py
 # Lower values reduce exploration noise
-DIRICHLET_SCALE = 0.1  # Scale factor for Dirichlet noise
+DIRICHLET_SCALE = 0.15  # Scale factor for Dirichlet noise (increased from 0.1)
 
 # Random number generator with fixed seed for reproducibility
 rng = np.random.Generator(np.random.PCG64(seed=42))

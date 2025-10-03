@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 # Scale factor for policy entropy bonus (lower = less exploration)
 # This should be synced with ENTROPY_BONUS_SCALE in train.py
-ENTROPY_BONUS_SCALE = 0.1
+ENTROPY_BONUS_SCALE = 0.05
 
 
 class ResBlock(nn.Module):
@@ -33,48 +33,47 @@ class PolicyValueNet(nn.Module):
         # input channels: 6 channels for board state
         in_channels = 6
         # optimized channels for 4x4 grid game
-        hidden_channels = 128  # increased from 64 for better pattern recognition
+        hidden_channels = 64  # reduced from 128 - sufficient for 4x4 board
 
         # First convolution layer
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(hidden_channels)
 
-        # 3 residual blocks - enough depth for this game's patterns
+        # 2 residual blocks - lighter network for faster training
         self.res_blocks = nn.ModuleList(
             [
-                ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
             ]
         )
 
         # Policy head - improved for better spatial understanding
-        policy_channels = 64  # increased from 32
+        policy_channels = 32  # reduced from 64
         self.policy_conv = nn.Conv2d(hidden_channels, policy_channels, kernel_size=1)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_out = nn.Conv2d(policy_channels, 4, kernel_size=1)  # 4 piece types
 
         # Value head - redesigned for better evaluation
-        value_channels = 64  # increased from 32
+        value_channels = 32  # reduced from 64
         self.value_conv = nn.Conv2d(hidden_channels, value_channels, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(value_channels)
 
         # Spatial features processing
-        # 64 channels on 4x4 board = 1024 features
-        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 256)
-        self.value_bn2 = nn.BatchNorm1d(256)
+        # 32 channels on 4x4 board = 512 features
+        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 128)
+        self.value_bn2 = nn.BatchNorm1d(128)
 
         # Flat features processing
         flat_feature_size = 12  # assuming 12 flat features
-        self.flat_fc = nn.Linear(flat_feature_size, 64)
-        self.flat_bn = nn.BatchNorm1d(64)
+        self.flat_fc = nn.Linear(flat_feature_size, 32)
+        self.flat_bn = nn.BatchNorm1d(32)
 
-        # Combined processing with deeper network
-        self.value_fc2 = nn.Linear(256 + 64, 128)  # spatial + flat
-        self.value_bn3 = nn.BatchNorm1d(128)
-        self.value_fc3 = nn.Linear(128, 64)
-        self.value_bn4 = nn.BatchNorm1d(64)
-        self.value_fc4 = nn.Linear(64, 1)
+        # Combined processing with streamlined network
+        self.value_fc2 = nn.Linear(128 + 32, 64)  # spatial + flat
+        self.value_bn3 = nn.BatchNorm1d(64)
+        self.value_fc3 = nn.Linear(64, 32)
+        self.value_bn4 = nn.BatchNorm1d(32)
+        self.value_fc4 = nn.Linear(32, 1)
 
         # Apply initialization
         self._initialize_weights()
@@ -166,22 +165,22 @@ class ModelWrapper:
             return
 
         # Learning rate parameters
-        self.div_factor = 3  # Quicker warmup (was 4)
-        self.final_div_factor = 5  # Less aggressive decay (was 8)
+        self.div_factor = 2.5  # Faster warmup (was 3)
+        self.final_div_factor = 4  # Less aggressive decay (was 5)
         self.max_iterations = 100  # Keep synchronized with train.py
 
-        # Learning rates
+        # Learning rates - increased for smaller model
         if self.mode == "fast":
-            self.max_lr = 0.01  # Reduced from 0.02 for more stability
+            self.max_lr = 0.015  # Increased from 0.01
         elif self.mode == "stable":
-            self.max_lr = 0.003  # Slightly reduced from 0.004
+            self.max_lr = 0.005  # Increased from 0.003
 
         # Optimizer parameters
-        weight_decay = 3e-5  # Slightly increased from 1e-5 for better regularization
+        weight_decay = 2e-5  # Reduced from 3e-5 for smaller model
         betas = (
             0.9,
-            0.95,
-        )  # Reduced second beta for faster adaptation to recent gradients
+            0.999,
+        )  # Standard betas - more stable for smaller model
 
         # AdamW optimizer with tuned parameters
         self.optimizer = torch.optim.AdamW(

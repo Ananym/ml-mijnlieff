@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "*",
+      "Bash(python:*)",
+      "Bash(timeout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nOptimize hyperparameters for improved training efficiency\n\nModel Architecture Changes:\n- Reduced model size from ~400K to ~235K parameters\n- Hidden channels: 128 -> 64\n- Residual blocks: 3 -> 2  \n- Policy head: 64 -> 32 channels\n- Value head: Streamlined FC layers (256->128, 64->32)\n\nTraining Hyperparameters:\n- Episodes per iteration: 100 -> 150 (more diverse data)\n- Batch size: 512 -> 256 (better for smaller model)\n- Training epochs: 50 -> 20 (prevent overfitting)\n- Buffer size: 5000 -> 4000\n- Policy weight: 1.0 -> 0.8 (better policy/value balance)\n\nMCTS & Exploration:\n- Min MCTS sims: 50 -> 100 (stronger training signal)\n- c_puct: 1.0 -> 1.5 (more exploration)\n- Dirichlet noise: 0.0 -> 0.15 (moderate exploration)\n- Entropy bonus: 0.0 -> 0.05 (encourage diversity)\n\nLearning Rate & Optimization:\n- Max LR (stable): 0.003 -> 0.005\n- Max LR (fast): 0.01 -> 0.015\n- Div factor: 3 -> 2.5 (faster warmup)\n- Final div factor: 5 -> 4 (less aggressive decay)\n- Weight decay: 3e-5 -> 2e-5 (less regularization for smaller model)\n- Betas: (0.9, 0.95) -> (0.9, 0.999) (more stable)\n\nExpected improvements:\n- ~2x faster training iterations\n- Better exploration/exploitation balance\n- Reduced overfitting\n- More stable training dynamics\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(taskkill:*)",
+      "Bash(powershell:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

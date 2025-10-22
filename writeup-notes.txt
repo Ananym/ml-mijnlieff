@@ -1,0 +1,13 @@
+
+- independently tested mcts vs strategic to fix logic issues
+- took about 12000 mcts sims to hit 75% winrate!
+
+- scale down strategic, scale up self play to avoid being overfit to the strategic opp
+
+- we had semi-good performance through just self play + strategic, but not good enough
+
+- runtime woes! never figured this out
+
+- hard to spot subtle bugs in mcts logic
+
+- mcts bulk of the train time, model size kinda irrelevent

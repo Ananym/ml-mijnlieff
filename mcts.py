@@ -113,9 +113,11 @@ class MCTSNode:
             priors[i] = child.prior
 
         # Calculate UCB values in a vectorized way
+        # Q values must be negated because child values are from child's perspective,
+        # but we need parent's perspective for action selection
         with np.errstate(divide="ignore", invalid="ignore"):  # Handle division by zero
             q_values = np.divide(
-                values, visits, out=np.zeros_like(values), where=visits != 0
+                -values, visits, out=np.zeros_like(values), where=visits != 0
             )
 
         # Calculate exploration bonus
@@ -133,8 +135,6 @@ class MCTSNode:
         self.visits += 1
         # incremental update formula: https://math.stackexchange.com/questions/106700/incremental-average
         self.value_sum += value
-        # Calculate the average value directly from sum and visits
-        self.value_avg = self.value_sum / self.visits
 
     def is_terminal(self, game_state):
         """Check if node represents game end state"""
@@ -146,7 +146,7 @@ class MCTSNode:
 
 
 def add_dirichlet_noise(
-    policy_flat, legal_moves_flat, iteration, move_count, max_iterations=150
+    policy_flat, legal_moves_flat, iteration, move_count, max_iterations=150, dirichlet_scale=None
 ):
     """add dirichlet noise to root policy with dynamic parameters based on training progress
 
@@ -156,6 +156,7 @@ def add_dirichlet_noise(
         iteration: current training iteration
         move_count: current move count in the game
         max_iterations: maximum training iterations
+        dirichlet_scale: optional scale factor (uses global DIRICHLET_SCALE if None)
 
     returns:
         modified policy with noise added
@@ -165,8 +166,11 @@ def add_dirichlet_noise(
     if len(legal_indices) == 0:
         return policy_flat
 
+    # Use provided scale or fall back to global constant
+    scale = dirichlet_scale if dirichlet_scale is not None else DIRICHLET_SCALE
+
     # If noise is completely disabled, return original policy
-    if DIRICHLET_SCALE <= 0.0:
+    if scale <= 0.0:
         return policy_flat
 
     # calculate training progress (0 to 1)
@@ -190,15 +194,12 @@ def add_dirichlet_noise(
     # - decrease to 0.10 (10% noise) by the end
     noise_weight = max(0.10, 0.25 - 0.15 * progress)
 
-    # Apply global scale factor to reduce noise
-    noise_weight *= DIRICHLET_SCALE
+    # Apply scale factor to reduce noise
+    noise_weight *= scale
 
-    # apply noise only to legal moves
+    # apply noise only to legal moves (vectorized)
     policy_with_noise = policy_flat.copy()
-    for i, idx in enumerate(legal_indices):
-        policy_with_noise[idx] = (1 - noise_weight) * policy_flat[
-            idx
-        ] + noise_weight * noise[i]
+    policy_with_noise[legal_indices] = (1 - noise_weight) * policy_flat[legal_indices] + noise_weight * noise
 
     return policy_with_noise
 
@@ -219,13 +220,15 @@ class MCTS:
         cls.cache_hits = 0
         cls.cache_misses = 0
 
-    def __init__(self, model=None, num_simulations=100, c_puct=1.0):
+    def __init__(self, model=None, num_simulations=100, c_puct=1.0, dirichlet_scale=None, enable_early_stopping=True):
         self.model = model  # Neural network model (optional)
         self.num_simulations = num_simulations  # Number of simulations per search
         self.c_puct = c_puct  # Exploration constant
         self.temperature = 1.0  # Temperature for move selection
         self.iteration = 0  # Current training iteration
         self.move_count = 0  # Current move count in the game
+        self.dirichlet_scale = dirichlet_scale  # Exploration noise scale (None uses default)
+        self.enable_early_stopping = enable_early_stopping  # Whether to allow early stopping
 
         # Timing statistics
         self.timing_stats = {
@@ -401,10 +404,10 @@ class MCTS:
         opp_pieces_left = sum(state.piece_counts[opponent].values())
         piece_advantage = (pieces_left - opp_pieces_left) * 0.05
 
-        # Normalize to [-0.6, 0.6] range for non-terminal estimates
-        # More conservative than terminal values
-        combined_value = score_diff * 0.15 + piece_advantage
-        return max(-0.6, min(0.6, combined_value))
+        # Normalize to [-0.7, 0.7] range for non-terminal estimates (FIXED: was [-0.6, 0.6])
+        # More conservative than terminal values, using same scale as training targets
+        combined_value = score_diff / 6.0 + piece_advantage
+        return max(-0.7, min(0.7, combined_value))
 
     def search(self, game_state: GameState) -> np.ndarray:
         """Perform MCTS search from given state and return move probabilities"""
@@ -434,7 +437,7 @@ class MCTS:
 
         # Initialize root node's predicted value if model exists
         if self.model is not None:
-            state_rep = search_state.get_game_state_representation()
+            state_rep = search_state.get_game_state_representation(subjective=True)
             legal_moves = search_state.get_legal_moves()
             policy, value_pred = self._predict_with_cache(state_rep, legal_moves)
             policy = policy.squeeze(0)
@@ -452,6 +455,7 @@ class MCTS:
                 self.iteration,
                 self.move_count,
                 max_iterations=150,
+                dirichlet_scale=self.dirichlet_scale,
             )
 
             policy = policy_flat.reshape(policy.shape)
@@ -525,12 +529,12 @@ class MCTS:
 
             # If node is terminal, use its game outcome for backpropagation
             if node.is_terminal(search_state):
-                value = self._get_game_value(search_state, game_state.current_player)
+                value = self._get_game_value(search_state, search_state.current_player)
             else:
                 # EXPANSION: use policy network or uniform policy to expand node
                 if self.model is not None:
                     # Use model for policy and value
-                    state_rep = search_state.get_game_state_representation()
+                    state_rep = search_state.get_game_state_representation(subjective=True)
                     legal_moves = search_state.get_legal_moves()
                     policy, value_pred = self._predict_with_cache(
                         state_rep, legal_moves
@@ -577,12 +581,13 @@ class MCTS:
             current_node = node
             current_value = value
 
-            while current_node is not None:
+            while True:
                 current_node.update(current_value)
+                if current_node.parent is None:
+                    break
+                # Flip value when moving to parent (opponent's perspective)
+                current_value = -current_value
                 current_node = current_node.parent
-                if current_node is not None:
-                    # Flip value when moving to parent (opponent's perspective)
-                    current_value = -current_value
 
             if ENABLE_TIMING:
                 self.timing_stats["backprop_time"] += (
@@ -602,7 +607,7 @@ class MCTS:
                 self.timing_counts["undo_time"] += 1
 
             # Check for early stopping - if best move hasn't changed for several iterations
-            if sim_idx > 20 and sim_idx % 5 == 0:
+            if self.enable_early_stopping and sim_idx > 20 and sim_idx % 5 == 0:
                 # Find current best child
                 max_visits = 0
                 current_best_idx = 0
@@ -688,9 +693,9 @@ class MCTS:
             opponent_score = scores[opponent]
             score_diff = player_score - opponent_score
 
-            # normalize to [-0.5, 0.5] range for non-terminal estimates
+            # normalize to [-0.7, 0.7] range for non-terminal estimates
             # more conservative than terminal values
-            return max(-0.5, min(0.5, score_diff / 8.0))
+            return max(-0.7, min(0.7, score_diff / 6.0))
 
         # For terminal states, calculate based on winner and score differential
         winner = game_state.get_winner()
@@ -700,18 +705,18 @@ class MCTS:
         opponent_score = scores[opponent]
         score_diff = player_score - opponent_score
 
-        # normalize to [-0.8, 0.8] range
-        normalized_diff = max(-0.8, min(0.8, score_diff / 8.0))
+        # normalize to [-1.0, 1.0] range (FIXED: was [-0.8, 0.8] with /8.0)
+        normalized_diff = max(-1.0, min(1.0, score_diff / 6.0))
 
         if winner is None:
             # Game is a draw, use normalized score difference
             return normalized_diff
         elif winner == original_player:
             # Win: ensure positive but consider margin
-            return max(0.8, normalized_diff)
+            return max(0.2, normalized_diff)
         else:
             # Loss: ensure negative but consider margin
-            return min(-0.8, normalized_diff)
+            return min(-0.2, normalized_diff)
 
     def set_temperature(self, temperature):
         """Set temperature for move selection"""

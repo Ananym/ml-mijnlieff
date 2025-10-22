@@ -10,38 +10,111 @@ from dataclasses import dataclass
 from model import ModelWrapper
 from tqdm import tqdm
 from opponents import RandomOpponent, StrategicOpponent
-from mcts import MCTS, add_dirichlet_noise
+
+# Import both MCTS implementations
+from mcts import MCTS as SerialMCTS, add_dirichlet_noise
+from mcts_parallel import ParallelMCTS
+from mcts_parallel_v2 import ParallelMCTSv2
+from mcts_batched import BatchedMCTS
 import math
 from collections import defaultdict
 from eval_model import policy_vs_mcts_eval
 import torch.nn.functional as F
+from mcts_trace_logger import get_trace_logger
 
-DEFAULT_EPISODES = 150  # increased from 100 for more data per iteration
-DEFAULT_BATCH_SIZE = 256  # reduced from 512 - better for smaller model
+# Training mode configurations
+TRAINING_MODES = {
+    "fast": {
+        "episodes": 50,
+        "epochs": 5,
+        "min_mcts_sims": 200,
+        "max_mcts_sims": 400,
+        "max_iterations": 100,
+        "eval_interval": 5,
+        "eval_games": 20,
+        "description": "Fast iteration for testing (50 games, 200-400 sims, 20 iters)",
+    },
+    "stable": {
+        "episodes": 100,
+        "epochs": 25,
+        "min_mcts_sims": 400,
+        "max_mcts_sims": 800,
+        "max_iterations": 50,
+        "eval_interval": 10,
+        "eval_games": 40,
+        "description": "Efficient run (100 games, 400-800 sims, 50 iters)",
+    },
+}
+
+# Default values (will be overridden by mode)
+DEFAULT_EPISODES = 100
+DEFAULT_BATCH_SIZE = 512
 DEFAULT_SAVE_INTERVAL = 5
 DEFAULT_NUM_CHECKPOINTS = 5
 DEFAULT_MCTS_RATIO = 1.0
-DEFAULT_BUFFER_SIZE = 4000  # reduced from 5000 to match smaller model capacity
-DEFAULT_POLICY_WEIGHT = 0.8  # reduced from 1.0 - balance policy and value better
-DEFAULT_NUM_EPOCHS = 20  # reduced from 50 - prevent overfitting
-DEFAULT_EVAL_INTERVAL = 20
-DEFAULT_EVAL_GAMES = 60
-DEFAULT_STRATEGIC_EVAL_GAMES = 60
-DEFAULT_MIN_MCTS_SIMS = 100  # increased from 50 for better early training signal
-DEFAULT_MAX_MCTS_SIMS = 200
-MAX_ITERATIONS = 100
+DEFAULT_BUFFER_SIZE = 8000
+DEFAULT_POLICY_WEIGHT = 0.5
+DEFAULT_NUM_EPOCHS = 12
+DEFAULT_EVAL_INTERVAL = 10
+DEFAULT_EVAL_GAMES = 40
+DEFAULT_STRATEGIC_EVAL_GAMES = 40
+DEFAULT_MIN_MCTS_SIMS = 400
+DEFAULT_MAX_MCTS_SIMS = 800
+MAX_ITERATIONS = 50
+
+# Early stopping criteria
+EARLY_STOPPING_ENABLED = True
+EARLY_STOPPING_CHECK_ITERATION = 30  # Check earlier to catch failure modes
+EARLY_STOPPING_MIN_WINRATE = (
+    25.0  # Minimum win rate vs Strategic opponent to continue training
+)
 
 BALANCE_REPLAY_BUFFER = False
 
-DIRICHLET_SCALE = 0.15  # Moderate exploration noise (was 0.0)
+# Dirichlet noise - curriculum learning approach
+DIRICHLET_INITIAL_SCALE = 0.3  # CURRICULUM: High exploration early
+DIRICHLET_FINAL_SCALE = 0.15  # CURRICULUM: Moderate exploration later
+DIRICHLET_TRANSITION_ITERATIONS = 30  # Transition over 30 iterations
+
 ENTROPY_BONUS_SCALE = 0.05  # Small entropy bonus to encourage exploration (was 0.0)
 
 
-INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Reduced from 0.1
+def get_mcts_class(device):
+    """
+    Select the best MCTS implementation based on device.
+
+    - GPU (cuda): Use BatchedMCTS for 2.0x speedup via batched inference
+    - CPU: Use SerialMCTS - parallel overhead is too high on CPU
+
+    Returns the appropriate MCTS class.
+    """
+    if device == "cuda":
+        print("MCTS Strategy: Using BatchedMCTS for GPU (batched inference)")
+        return BatchedMCTS
+    else:
+        print("MCTS Strategy: Using SerialMCTS for CPU (reusable instance)")
+        return SerialMCTS
+
+
+def get_dirichlet_scale(iteration):
+    """Calculate adaptive Dirichlet noise scale - high early, lower later"""
+    if iteration >= DIRICHLET_TRANSITION_ITERATIONS:
+        return DIRICHLET_FINAL_SCALE
+    progress = iteration / DIRICHLET_TRANSITION_ITERATIONS
+    return DIRICHLET_INITIAL_SCALE - progress * (
+        DIRICHLET_INITIAL_SCALE - DIRICHLET_FINAL_SCALE
+    )
+
+
+INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Keep disabled
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.0  # Reduced from 0.2
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.0  # Reduced from 0.3
-OPPONENT_TRANSITION_ITERATIONS = MAX_ITERATIONS
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.7  # Start with 70% Strategic for bootstrapping
+FINAL_STRATEGIC_OPPONENT_RATIO = (
+    0.1  # End with 10% Strategic (reduced from 20% to avoid anti-Strategic patterns)
+)
+OPPONENT_TRANSITION_ITERATIONS = (
+    30  # Transition faster (reduced from 40) to shift to self-play sooner
+)
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
 DEFAULT_FINAL_RANDOM_CHANCE = 0.0
@@ -52,6 +125,49 @@ BOOTSTRAP_MAX_WEIGHT = 0.0  # Increase to a moderate maximum
 BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
 DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint_interrupted.pth"
+
+
+def get_reward_values(reward_config="discrete"):
+    """Get the win/loss/draw reward values for a given config.
+
+    Returns:
+        tuple: (win_value, loss_value, draw_value)
+    """
+    if reward_config == "discrete":
+        return (1.0, -1.0, -0.1)
+    elif reward_config == "discrete_mild":
+        return (1.0, -1.0, -0.3)
+    elif reward_config == "discrete_light":
+        return (1.0, -1.0, -0.15)
+    else:
+        # For continuous configs, use thresholds
+        return (1.0, -1.0, 0.0)
+
+
+def classify_outcome(value, reward_config="discrete"):
+    """Classify a value as 'win', 'loss', or 'draw'.
+
+    Uses the actual reward values with small epsilon for floating point comparison.
+    """
+    win_val, loss_val, draw_val = get_reward_values(reward_config)
+    epsilon = 0.01  # Small tolerance for floating point comparison
+
+    # Check exact values (within epsilon)
+    if abs(value - win_val) < epsilon:
+        return "win"
+    elif abs(value - loss_val) < epsilon:
+        return "loss"
+    elif abs(value - draw_val) < epsilon:
+        return "draw"
+    else:
+        # For continuous configs or bootstrapped values between discrete values
+        # Use midpoint thresholds
+        if value > (win_val + draw_val) / 2:
+            return "win"
+        elif value < (loss_val + draw_val) / 2:
+            return "loss"
+        else:
+            return "draw"
 
 
 def log_iteration_report(
@@ -143,15 +259,16 @@ def log_iteration_report(
         value_metrics.get("pearson_correlation", 0) if value_metrics else 0
     )
 
-    # count win/loss/draw samples in buffer
+    # count win/loss/draw samples in buffer using shared classification logic
     buffer_win_samples = 0
     buffer_loss_samples = 0
     buffer_draw_samples = 0
 
     for example in replay_buffer:
-        if example.value > 0.2:
+        outcome = classify_outcome(example.value, reward_config)
+        if outcome == "win":
             buffer_win_samples += 1
-        elif example.value < -0.2:
+        elif outcome == "loss":
             buffer_loss_samples += 1
         else:
             buffer_draw_samples += 1
@@ -161,74 +278,35 @@ def log_iteration_report(
     buffer_loss_pct = (buffer_loss_samples / max(1, buffer_size)) * 100
     buffer_draw_pct = (buffer_draw_samples / max(1, buffer_size)) * 100
 
-    # Build the consolidated report
-    print(f"\n{'='*35} ITERATION {iteration} REPORT {'='*35}")
+    # Build the consolidated report - SIMPLIFIED for readability
+    print(f"\n{'='*20} ITER {iteration} {'='*20}")
+    print(f"Time: {int(hours)}h{int(minutes):02d}m | Iter: {iteration_time:.0f}s")
     print(
-        f"Time: {int(hours)}h {int(minutes)}m total | {iteration_time:.1f}s for iteration"
-    )
-
-    # Model section
-    print(f"\n--- MODEL METRICS ---")
-    print(f"Loss: {avg_total:.4f} (policy:{avg_policy:.4f}, value:{avg_value:.4f})")
-    print(f"Learning rate: {model.optimizer.param_groups[0]['lr']:.6f}")
-
-    # Value prediction quality section (condensed)
-    print(f"\n--- VALUE PREDICTION ---")
-    print(
-        f"Distribution: mean={avg_value_prediction:.4f}, |mean|={avg_abs_value:.4f}, std={value_std:.4f}"
-    )
-    print(f"Outcome correlation (Pearson): {pearson_correlation:.4f}")
-
-    # Performance section
-    print(f"\n--- PERFORMANCE ---")
-    print(
-        f"Self-play: P1 win {self_play_p1_rate:.1f}%, P2 win {self_play_p2_rate:.1f}%, Draw {self_play_draw_rate:.1f}%"
+        f"Loss: {avg_total:.4f} (P:{avg_policy:.4f} V:{avg_value:.4f}) LR:{model.optimizer.param_groups[0]['lr']:.6f}"
     )
     print(
-        f"Strategic: P1 win {strategic_p1_rate:.1f}%, P2 win {strategic_p2_rate:.1f}%"
-    )
-    print(f"Random: P1 win {random_p1_rate:.1f}%, P2 win {random_p2_rate:.1f}%")
-
-    # Decision quality
-    print(f"\n--- DECISION QUALITY ---")
-    print(f"MCTS Confidence (avg max policy): {avg_mcts_confidence:.3f}")
-
-    # Buffer stats
-    print(f"\n--- TRAINING DATA ---")
-    print(
-        f"Buffer: {buffer_size} examples (win: {buffer_win_pct:.1f}%, loss: {buffer_loss_pct:.1f}%, draw: {buffer_draw_pct:.1f}%)"
+        f"Value: mean={avg_value_prediction:.3f} std={value_std:.3f} corr={pearson_correlation:.3f}"
     )
     print(
-        f"Current iter added: {iter_stats['win_examples']} win, {iter_stats['loss_examples']} loss, {iter_stats['draw_examples']} draw"
+        f"Self: P1={self_play_p1_rate:.0f}% P2={self_play_p2_rate:.0f}% D={self_play_draw_rate:.0f}%"
     )
-    print(f"Cache hit rate: {cache_hit_rate:.1f}%")
+    print(
+        f"Buffer: {buffer_size} (W:{buffer_win_pct:.0f}% L:{buffer_loss_pct:.0f}% D:{buffer_draw_pct:.0f}%) Cache:{cache_hit_rate:.0f}%"
+    )
 
-    # Gradient health
+    # Gradient health check (only show if problematic)
     if grad_stats and isinstance(grad_stats, dict) and "status" not in grad_stats:
-        print(f"\n--- GRADIENT HEALTH ---")
-
-        # For our new model structure, check value_fc4 gradients
-        if (
-            "value_fc3_weight" in grad_stats
-        ):  # Assuming model structure has fc3 as final value layer
+        if "value_fc3_weight" in grad_stats:
             fc3_weight = grad_stats.get("value_fc3_weight", {})
             fc3_weight_max_abs = max(
                 abs(fc3_weight.get("min", 0)), abs(fc3_weight.get("max", 0))
             )
-            fc3_weight_mean_abs = abs(fc3_weight.get("mean", 0))
-
-            gradient_status = "HEALTHY"
             if fc3_weight_max_abs > 1.0:
-                gradient_status = "⚠️ EXPLODING"
+                print(f"WARNING - EXPLODING GRADIENTS: {fc3_weight_max_abs:.6f}")
             elif fc3_weight_max_abs < 0.0001:
-                gradient_status = "⚠️ VANISHING"
+                print(f"WARNING - VANISHING GRADIENTS: {fc3_weight_max_abs:.6f}")
 
-            print(
-                f"Value head final layer - max abs grad: {fc3_weight_max_abs:.6f}, mean abs grad: {fc3_weight_mean_abs:.6f}"
-            )
-            print(f"Gradient status: {gradient_status}")
-
-    print(f"\n{'='*90}")
+    print(f"{'='*50}")
 
 
 @dataclass
@@ -298,7 +376,32 @@ def inspect_value_head_gradients(model):
 def training_loop(
     model: ModelWrapper,
     resume_path: str = None,
+    enable_early_stopping: bool = True,
+    reward_config: str = "discrete",
+    training_mode: str = "stable",
 ):
+    # Select appropriate MCTS class based on device
+    MCTSClass = get_mcts_class(model.device)
+
+    # Apply training mode configuration
+    global DEFAULT_EPISODES, DEFAULT_NUM_EPOCHS, DEFAULT_MIN_MCTS_SIMS, DEFAULT_MAX_MCTS_SIMS
+    global MAX_ITERATIONS, DEFAULT_EVAL_INTERVAL, DEFAULT_EVAL_GAMES, DEFAULT_STRATEGIC_EVAL_GAMES
+
+    if training_mode in TRAINING_MODES:
+        mode_config = TRAINING_MODES[training_mode]
+        DEFAULT_EPISODES = mode_config["episodes"]
+        DEFAULT_NUM_EPOCHS = mode_config["epochs"]
+        DEFAULT_MIN_MCTS_SIMS = mode_config["min_mcts_sims"]
+        DEFAULT_MAX_MCTS_SIMS = mode_config["max_mcts_sims"]
+        MAX_ITERATIONS = mode_config["max_iterations"]
+        DEFAULT_EVAL_INTERVAL = mode_config["eval_interval"]
+        DEFAULT_EVAL_GAMES = mode_config["eval_games"]
+        DEFAULT_STRATEGIC_EVAL_GAMES = mode_config["eval_games"]
+        print(f"\nTraining mode: {training_mode}")
+        print(f"  {mode_config['description']}")
+    else:
+        print(f"\nWARNING: Unknown training mode '{training_mode}', using defaults")
+
     rng = np.random.Generator(np.random.PCG64())
 
     replay_buffer = []
@@ -365,6 +468,11 @@ def training_loop(
     # Start the training timer
     training_start = time.time()
 
+    # Setup trace logging - will trigger at iteration 5 for one game
+    trace_logger = get_trace_logger()
+    trace_enabled_iteration = 5
+    trace_logged = False
+
     # Base stats template - simplified
     stats_template = {
         # game outcome stats
@@ -400,31 +508,74 @@ def training_loop(
         "cache_misses": 0,
     }
 
-    def get_adjusted_value(game, winner, current_player):
-        """Calculate training value target based purely on score differential.
+    def get_adjusted_value(game, winner, current_player, reward_config="discrete"):
+        """Calculate training value target with configurable reward schemes.
 
         Args:
             game: Completed game state
-            winner: Winner of the game (unused in this simplified version)
+            winner: Winner of the game
             current_player: Player from whose perspective we calculate value
+            reward_config: Reward configuration to use:
+                - "discrete": Simple win/loss/draw (+1/-1/-0.1)
+                - "discrete_mild": Win/loss/draw with mild penalty (+1/-1/-0.3)
+                - "discrete_light": Win/loss/draw with light penalty (+1/-1/-0.15)
+                - "score_diff": Original score differential (continuous)
+                - "score_diff_penalty": Score diff with draw penalty
 
         Returns:
-            Normalized value in [-1, 1] range based on score differential
+            Normalized value in [-1, 1] range
         """
-        # Calculate score differential from current player's perspective
         scores = game.get_scores()
         player_score = scores[current_player]
         opponent = Player.ONE if current_player == Player.TWO else Player.TWO
         opponent_score = scores[opponent]
         score_diff = player_score - opponent_score
 
-        # Clamp the score differential to +/- 6
-        clamped_diff = max(-6.0, min(6.0, score_diff))
+        if reward_config == "discrete":
+            # Win: +1, Loss: -1, Draw: -0.1 (draw worse than win, better than loss)
+            if score_diff > 0:
+                return 1.0
+            elif score_diff < 0:
+                return -1.0
+            else:
+                return -0.1
 
-        # Scale to [-1, 1] range
-        normalized_value = clamped_diff / 6.0
+        elif reward_config == "discrete_mild":
+            # Win: +1, Loss: -1, Draw: -0.3 (moderate draw penalty)
+            if score_diff > 0:
+                return 1.0
+            elif score_diff < 0:
+                return -1.0
+            else:
+                return -0.3
 
-        return normalized_value
+        elif reward_config == "discrete_light":
+            # Win: +1, Loss: -1, Draw: -0.15 (light draw penalty)
+            if score_diff > 0:
+                return 1.0
+            elif score_diff < 0:
+                return -1.0
+            else:
+                return -0.15
+
+        elif reward_config == "score_diff":
+            # Original: continuous score differential
+            clamped_diff = max(-6.0, min(6.0, score_diff))
+            return clamped_diff / 6.0
+
+        elif reward_config == "score_diff_penalty":
+            # Score differential but with draw penalty
+            if score_diff == 0:
+                return -0.2  # Penalize draws
+            else:
+                clamped_diff = max(-6.0, min(6.0, score_diff))
+                return clamped_diff / 6.0
+
+        else:
+            raise ValueError(f"Unknown reward_config: {reward_config}")
+
+    # Store reward config at module level for access in training loop
+    REWARD_CONFIG = "discrete"  # Default
 
     def create_opponent_example(game, move):
         """Create a training example from an opponent's move"""
@@ -445,8 +596,19 @@ def training_loop(
         )
 
     def get_temperature(move_count, iteration, max_iterations=150):
-        # too involved of a system - avoid this as a confounding factor for now
-        return 1.0
+        """Temperature schedule that lowers in endgame for more decisive play.
+
+        Early game (moves 0-7): High exploration (T=1.0)
+        Mid game (moves 8-10): Transition (T=1.0 -> 0.1)
+        Late game (moves 11+): Low exploration (T=0.1)
+        """
+        if move_count < 8:
+            return 1.0
+        elif move_count < 11:
+            # Linear transition from 1.0 to 0.1 over moves 8-10
+            return 1.0 - 0.9 * (move_count - 8) / 3
+        else:
+            return 0.1
         # """Dynamic temperature with extended exploration and smoother decay.
 
         # This implementation:
@@ -500,7 +662,9 @@ def training_loop(
         # Return as integer
         return int(sims)
 
-    def get_model_move_with_policy(game, use_mcts=True, temperature=1.0, iteration=0):
+    def get_model_move_with_policy(
+        game, use_mcts=True, temperature=1.0, iteration=0, enable_trace=False
+    ):
         """Get a move from the model along with the training policy target
         (full MCTS distribution if MCTS was used, otherwise one-hot)"""
         legal_moves = game.get_legal_moves()
@@ -509,25 +673,62 @@ def training_loop(
         move_count = game.move_count
 
         if use_mcts:
+            # Trace: Log network prediction before MCTS
+            if enable_trace:
+                raw_policy, raw_value = model.predict(
+                    state_rep.board, state_rep.flat_values, legal_moves
+                )
+                raw_policy = raw_policy.squeeze(0)
+                policy_flat = (raw_policy * legal_moves).flatten()
+                top5_idx = policy_flat.argsort()[-5:][::-1]
+                top5_moves = [
+                    (np.unravel_index(idx, raw_policy.shape), policy_flat[idx])
+                    for idx in top5_idx
+                    if policy_flat[idx] > 0
+                ]
+                trace_logger.log_network_prediction(
+                    f"Move {move_count}", top5_moves, raw_value.squeeze().item()
+                )
+
             # Use model-guided MCTS (AlphaZero style)
             # Noise will be applied inside the MCTS search
-            mcts = MCTS(
-                model=model,
-                num_simulations=get_mcts_sims_for_iteration(iteration),
-                c_puct=1.5,  # increased from 1.0 for more exploration
-            )
-            mcts.set_temperature(temperature)
-            mcts.set_iteration(iteration)  # Set current iteration for noise
-            mcts.set_move_count(move_count)  # Set move count for noise
-            mcts_policy, root_node = mcts.search(game)
+            num_sims = get_mcts_sims_for_iteration(iteration)
+
+            if enable_trace:
+                trace_logger.log_mcts_search_start(num_sims)
+
+            # Update reusable MCTS instance configuration (avoids worker startup overhead)
+            reusable_mcts.num_simulations = num_sims
+            reusable_mcts.dirichlet_scale = get_dirichlet_scale(iteration)
+            reusable_mcts.set_temperature(temperature)
+            reusable_mcts.set_iteration(iteration)  # Set current iteration for noise
+            reusable_mcts.set_move_count(move_count)  # Set move count for noise
+            mcts_policy, root_node = reusable_mcts.search(game)
+
+            # Trace: Log MCTS results
+            if enable_trace:
+                # Get top 5 children by visit count
+                children_sorted = sorted(
+                    root_node.children, key=lambda c: c.visits, reverse=True
+                )[:5]
+                # Negate Q-values to show from parent's perspective (child values are negated in UCB)
+                top5_mcts = [
+                    (c.move, c.visits, -c.get_value()) for c in children_sorted
+                ]
+                trace_logger.log_mcts_search_end(
+                    root_node.get_value(),
+                    root_node.visits,
+                    top5_mcts,
+                    None,  # Will add chosen move later
+                )
             policy = mcts_policy
 
             # Track cache statistics
-            iter_stats["cache_hits"] += mcts.cache_hits
-            iter_stats["cache_misses"] += mcts.cache_misses
+            iter_stats["cache_hits"] += reusable_mcts.cache_hits
+            iter_stats["cache_misses"] += reusable_mcts.cache_misses
             # Reset MCTS cache stats for next use
-            mcts.cache_hits = 0
-            mcts.cache_misses = 0
+            reusable_mcts.cache_hits = 0
+            reusable_mcts.cache_misses = 0
 
             # Use full MCTS distribution as policy target when MCTS is used
             policy_target = mcts_policy.copy()
@@ -546,6 +747,15 @@ def training_loop(
 
             # Convert flat index to 3D coordinates
             move_coords = np.unravel_index(move_idx, policy.shape)
+
+            # Trace: Log chosen move
+            if enable_trace:
+                chosen_move = Move(
+                    move_coords[0], move_coords[1], PieceType(move_coords[2])
+                )
+                trace_logger.log_entries[-1] = trace_logger.log_entries[-1].replace(
+                    "Chosen Move: None", f"Chosen Move: {chosen_move}"
+                )
 
             # Calculate MCTS policy confidence metrics
             # Max probability in the policy distribution
@@ -570,7 +780,12 @@ def training_loop(
             # Apply same dynamic Dirichlet noise for direct moves as in MCTS
             # We want exploration from both player perspectives
             policy_flat = add_dirichlet_noise(
-                policy_flat, legal_flat, iteration, move_count, max_iterations=150
+                policy_flat,
+                legal_flat,
+                iteration,
+                move_count,
+                max_iterations=150,
+                dirichlet_scale=get_dirichlet_scale(iteration),
             )
 
             # Renormalize after applying noise
@@ -679,13 +894,29 @@ def training_loop(
     print("Policy weight: {:.1f}".format(DEFAULT_POLICY_WEIGHT))
     print("Press Ctrl+C to stop training gracefully")
 
+    # Create reusable MCTS instance (configuration will be updated per move)
+    mcts_kwargs = {
+        "model": model,
+        "num_simulations": DEFAULT_MIN_MCTS_SIMS,  # Will be updated
+        "c_puct": 1.5,
+        "dirichlet_scale": get_dirichlet_scale(0),  # Will be updated
+        "enable_early_stopping": enable_early_stopping,
+    }
+    if MCTSClass == ParallelMCTS or MCTSClass == ParallelMCTSv2:
+        mcts_kwargs["num_workers"] = (
+            7  # Parallel MCTS not used on CPU, but keep for GPU compatibility
+        )
+    reusable_mcts = MCTSClass(**mcts_kwargs)
+
     try:
-        while not interrupt_received:  # Run until interrupted
+        while (
+            not interrupt_received and iteration < MAX_ITERATIONS
+        ):  # Run until interrupted or max iterations
             iteration += 1
             iteration_start = time.time()
 
             # Clear MCTS prediction cache at the start of each iteration
-            MCTS.clear_cache()
+            MCTSClass.clear_cache()
 
             # Update opponent ratios based on current iteration
             random_opponent_ratio, strategic_opponent_ratio = get_opponent_ratios(
@@ -709,7 +940,7 @@ def training_loop(
             )
 
             # Generate games with various opponents
-            for _ in range(DEFAULT_EPISODES):
+            for game_num in range(DEFAULT_EPISODES):
                 # First, decide the opponent type
                 game_type_roll = rng.random()
 
@@ -729,6 +960,19 @@ def training_loop(
                     # Self-play game
                     opponent_type = "self-play"
                     model_plays_p1 = True  # Doesn't matter for self-play
+
+                # Enable trace logging for first self-play game of iteration 5
+                is_self_play = opponent_type == "self-play"
+                enable_trace_this_game = (
+                    iteration == trace_enabled_iteration
+                    and not trace_logged
+                    and is_self_play
+                )
+                if enable_trace_this_game:
+                    trace_logger.enable()
+                    print(
+                        f"\n[TRACE] Enabling detailed MCTS trace logging for this game..."
+                    )
 
                 # Initialize game
                 game = GameState()
@@ -764,6 +1008,7 @@ def training_loop(
                                 use_mcts=use_mcts,
                                 temperature=temperature,
                                 iteration=iteration,
+                                enable_trace=enable_trace_this_game,
                             )
                         )
 
@@ -814,11 +1059,22 @@ def training_loop(
                         # Game is over, get the winner
                         winner = game.get_winner()
 
+                        # Log game end if tracing
+                        if enable_trace_this_game:
+                            scores = game.get_scores()
+                            trace_logger.log_game_end(
+                                f"Player.{winner.name}" if winner else "Draw",
+                                f"P1:{scores[Player.ONE]} P2:{scores[Player.TWO]}",
+                                move_count,
+                            )
+                            trace_logger.disable()
+                            trace_logged = True
+
                         # Set value targets based on game outcome and bootstrapping
                         for i, example in enumerate(examples):
                             # Get the final outcome value
                             outcome_value = get_adjusted_value(
-                                game, winner, example.current_player
+                                game, winner, example.current_player, reward_config
                             )
 
                             # If this move used MCTS and we have an MCTS value, use improved target
@@ -901,10 +1157,11 @@ def training_loop(
                                     # Last move - just use outcome
                                     example.value = outcome_value
 
-                            # Update stats
-                            if outcome_value > 0.2:
+                            # Update stats using shared classification logic
+                            outcome = classify_outcome(outcome_value, reward_config)
+                            if outcome == "win":
                                 iter_stats["win_examples"] += 1
-                            elif outcome_value < -0.2:
+                            elif outcome == "loss":
                                 iter_stats["loss_examples"] += 1
                             else:
                                 iter_stats["draw_examples"] += 1
@@ -963,65 +1220,25 @@ def training_loop(
                 # Set postfix with expanded information
                 episode_pbar.set_postfix(
                     {
-                        "cache_size": len(MCTS.prediction_cache),
+                        "cache_size": len(MCTSClass.prediction_cache),
                         "cache": current_hit_rate,
                         "strat_p1": strategic_p1_wins,
                         "strat_p2": strategic_p2_wins,
                     }
                 )
 
-            # Balance the replay buffer using current_iteration_examples
-            tqdm.write(
-                f"Updating replay buffer (current size: {len(replay_buffer)}, new examples: {len(current_iteration_examples)})"
-            )
+            # Balance the replay buffer using current_iteration_examples (SILENCED)
             if BALANCE_REPLAY_BUFFER:
-                tqdm.write("Applying balancing...")
                 replay_buffer = balance_replay_buffer(
-                    replay_buffer,  # Previous buffer
-                    current_iteration_examples,  # New examples we just collected
+                    replay_buffer,
+                    current_iteration_examples,
                     buffer_size=DEFAULT_BUFFER_SIZE,
                 )
             else:
                 # if not balancing, just add new examples and trim if needed
                 replay_buffer.extend(current_iteration_examples)
                 if len(replay_buffer) > DEFAULT_BUFFER_SIZE:
-                    # keep only the most recent examples
                     replay_buffer = replay_buffer[-DEFAULT_BUFFER_SIZE:]
-                tqdm.write("Skipping balancing, buffer updated.")
-
-            # Log buffer size and distribution after balancing
-            # Count buffer categories after balancing
-            buffer_win_p1 = buffer_win_p2 = buffer_loss_p1 = buffer_loss_p2 = (
-                buffer_draw_p1
-            ) = buffer_draw_p2 = 0
-            for ex in replay_buffer:
-                player = "p1" if ex.current_player == Player.ONE else "p2"
-                if ex.value > 0.2:
-                    if player == "p1":
-                        buffer_win_p1 += 1
-                    else:
-                        buffer_win_p2 += 1
-                elif ex.value < -0.2:
-                    if player == "p1":
-                        buffer_loss_p1 += 1
-                    else:
-                        buffer_loss_p2 += 1
-                else:
-                    if player == "p1":
-                        buffer_draw_p1 += 1
-                    else:
-                        buffer_draw_p2 += 1
-
-            buffer_size = len(replay_buffer)
-            tqdm.write(
-                f"Balanced buffer: size={buffer_size}, "
-                f"P1 win={buffer_win_p1} ({buffer_win_p1/buffer_size:.1%}), "
-                f"P2 win={buffer_win_p2} ({buffer_win_p2/buffer_size:.1%}), "
-                f"P1 loss={buffer_loss_p1} ({buffer_loss_p1/buffer_size:.1%}), "
-                f"P2 loss={buffer_loss_p2} ({buffer_loss_p2/buffer_size:.1%}), "
-                f"P1 draw={buffer_draw_p1} ({buffer_draw_p1/buffer_size:.1%}), "
-                f"P2 draw={buffer_draw_p2} ({buffer_draw_p2/buffer_size:.1%})"
-            )
 
             # Training phase
             train_pbar = tqdm(
@@ -1116,7 +1333,7 @@ def training_loop(
 
             # Run evaluation every DEFAULT_EVAL_INTERVAL iterations
             if iteration % DEFAULT_EVAL_INTERVAL == 0:
-                policy_vs_mcts_eval(
+                eval_results = policy_vs_mcts_eval(
                     model,
                     rng,
                     iteration=iteration,
@@ -1125,6 +1342,48 @@ def training_loop(
                     mcts_simulations=DEFAULT_MAX_MCTS_SIMS,
                     debug=False,
                 )
+
+                # Early stopping check
+                if (
+                    EARLY_STOPPING_ENABLED
+                    and iteration >= EARLY_STOPPING_CHECK_ITERATION
+                ):
+                    # Calculate combined win rate vs Strategic opponent
+                    p1_games = eval_results["raw_policy_games_as_p1"]
+                    p2_games = eval_results["raw_policy_games_as_p2"]
+                    p1_wins = eval_results["raw_policy_wins_as_p1"]
+                    p2_wins = eval_results["raw_policy_wins_as_p2"]
+
+                    total_games = p1_games + p2_games
+                    total_wins = p1_wins + p2_wins
+
+                    if total_games > 0:
+                        combined_winrate = (total_wins / total_games) * 100
+
+                        print(f"\n=== Early Stopping Check (Iteration {iteration}) ===")
+                        print(
+                            f"Combined win rate vs Strategic: {combined_winrate:.1f}%"
+                        )
+                        print(f"Minimum required: {EARLY_STOPPING_MIN_WINRATE:.1f}%")
+
+                        if combined_winrate < EARLY_STOPPING_MIN_WINRATE:
+                            print(f"\n*** EARLY STOPPING TRIGGERED ***")
+                            print(
+                                f"Policy network is not learning effectively after {iteration} iterations."
+                            )
+                            print(
+                                f"Win rate vs Strategic ({combined_winrate:.1f}%) is below threshold ({EARLY_STOPPING_MIN_WINRATE:.1f}%)."
+                            )
+                            print(
+                                f"Consider adjusting hyperparameters and restarting training."
+                            )
+                            print("=" * 50)
+                            interrupt_received = True  # Trigger graceful shutdown
+                        else:
+                            print(
+                                f"Win rate vs Strategic is acceptable. Continuing training..."
+                            )
+                        print("=" * 50 + "\n")
 
             # Gather all metrics for the consolidated report
             loss_stats = {"total": avg_total, "policy": avg_policy, "value": avg_value}
@@ -1321,10 +1580,13 @@ def balance_replay_buffer(
 
 if __name__ == "__main__":
     # Parse command line arguments
-    mode = "stable"  # default mode
+    training_mode = "stable"  # default training mode (for hyperparameters)
+    model_mode = "stable"  # default model mode (for ModelWrapper)
     load_path = None
     resume_path = None
     device = None  # Don't set a default yet
+    enable_early_stopping = True  # default enabled
+    reward_config = "discrete"  # default reward configuration
 
     # Check for device, fast mode, and load/resume path
     i = 1
@@ -1333,7 +1595,11 @@ if __name__ == "__main__":
         if arg.startswith("--device="):
             device = arg.split("=")[1]
         elif arg == "--fast":
-            mode = "fast"
+            training_mode = "fast"
+            model_mode = "fast"
+        elif arg.startswith("--mode="):
+            training_mode = arg.split("=")[1]
+            model_mode = arg.split("=")[1]
         elif arg.startswith("--load="):
             load_path = arg.split("=")[1]
         elif arg.startswith("--resume="):
@@ -1341,6 +1607,10 @@ if __name__ == "__main__":
         elif arg == "--resume":
             # Use default checkpoint path when just --resume is specified
             resume_path = DEFAULT_CHECKPOINT_PATH
+        elif arg == "--no-early-stopping":
+            enable_early_stopping = False
+        elif arg.startswith("--reward="):
+            reward_config = arg.split("=")[1]
         i += 1
 
     # Determine device (auto-select CUDA if available)
@@ -1365,7 +1635,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Initialize model with appropriate mode
-    model = ModelWrapper(device=device, mode=mode)
+    model = ModelWrapper(device=device, mode=model_mode)
 
     # Handle loading vs resuming
     if resume_path:
@@ -1375,5 +1645,26 @@ if __name__ == "__main__":
         print(f"Loading model weights from {load_path}")
         model.load(load_path)
 
+    # Print configuration
+    print(f"Reward configuration: {reward_config}")
+    if reward_config == "discrete":
+        print(
+            "  Win: +1.0, Loss: -1.0, Draw: -0.1 (draw worse than win, better than loss)"
+        )
+    elif reward_config == "discrete_mild":
+        print("  Win: +1.0, Loss: -1.0, Draw: -0.3 (moderate draw penalty)")
+    elif reward_config == "discrete_light":
+        print("  Win: +1.0, Loss: -1.0, Draw: -0.15 (light draw penalty)")
+    elif reward_config == "score_diff":
+        print("  Score differential (continuous, no draw penalty)")
+    elif reward_config == "score_diff_penalty":
+        print("  Score differential with draw penalty (-0.2)")
+
     # Start training
-    training_loop(model, resume_path=resume_path)
+    training_loop(
+        model,
+        resume_path=resume_path,
+        enable_early_stopping=enable_early_stopping,
+        reward_config=reward_config,
+        training_mode=training_mode,
+    )

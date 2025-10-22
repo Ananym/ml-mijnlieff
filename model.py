@@ -32,48 +32,49 @@ class PolicyValueNet(nn.Module):
         super().__init__()
         # input channels: 6 channels for board state
         in_channels = 6
-        # optimized channels for 4x4 grid game
-        hidden_channels = 64  # reduced from 128 - sufficient for 4x4 board
+        # Restored to original capacity for better learning
+        hidden_channels = 128  # RESTORED from 64 for ~400K param model
 
         # First convolution layer
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(hidden_channels)
 
-        # 2 residual blocks - lighter network for faster training
+        # 3 residual blocks - RESTORED for better capacity
         self.res_blocks = nn.ModuleList(
             [
+                ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
                 ResBlock(hidden_channels),
             ]
         )
 
-        # Policy head - improved for better spatial understanding
-        policy_channels = 32  # reduced from 64
+        # Policy head - RESTORED to original capacity
+        policy_channels = 64  # RESTORED from 32
         self.policy_conv = nn.Conv2d(hidden_channels, policy_channels, kernel_size=1)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_out = nn.Conv2d(policy_channels, 4, kernel_size=1)  # 4 piece types
 
-        # Value head - redesigned for better evaluation
-        value_channels = 32  # reduced from 64
+        # Value head - RESTORED to original capacity
+        value_channels = 64  # RESTORED from 32
         self.value_conv = nn.Conv2d(hidden_channels, value_channels, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(value_channels)
 
         # Spatial features processing
-        # 32 channels on 4x4 board = 512 features
-        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 128)
-        self.value_bn2 = nn.BatchNorm1d(128)
+        # 64 channels on 4x4 board = 1024 features (was 512 with 32 channels)
+        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 256)  # INCREASED from 128
+        self.value_bn2 = nn.BatchNorm1d(256)  # UPDATED to match
 
         # Flat features processing
         flat_feature_size = 12  # assuming 12 flat features
-        self.flat_fc = nn.Linear(flat_feature_size, 32)
-        self.flat_bn = nn.BatchNorm1d(32)
+        self.flat_fc = nn.Linear(flat_feature_size, 64)  # INCREASED from 32
+        self.flat_bn = nn.BatchNorm1d(64)  # UPDATED to match
 
-        # Combined processing with streamlined network
-        self.value_fc2 = nn.Linear(128 + 32, 64)  # spatial + flat
-        self.value_bn3 = nn.BatchNorm1d(64)
-        self.value_fc3 = nn.Linear(64, 32)
-        self.value_bn4 = nn.BatchNorm1d(32)
-        self.value_fc4 = nn.Linear(32, 1)
+        # Combined processing with restored capacity
+        self.value_fc2 = nn.Linear(256 + 64, 128)  # spatial + flat (INCREASED)
+        self.value_bn3 = nn.BatchNorm1d(128)  # UPDATED to match
+        self.value_fc3 = nn.Linear(128, 64)  # INCREASED from (64, 32)
+        self.value_bn4 = nn.BatchNorm1d(64)  # UPDATED to match
+        self.value_fc4 = nn.Linear(64, 1)  # INCREASED from (32, 1)
 
         # Apply initialization
         self._initialize_weights()
@@ -167,13 +168,13 @@ class ModelWrapper:
         # Learning rate parameters
         self.div_factor = 2.5  # Faster warmup (was 3)
         self.final_div_factor = 4  # Less aggressive decay (was 5)
-        self.max_iterations = 100  # Keep synchronized with train.py
+        self.max_iterations = 50  # Keep synchronized with train.py MAX_ITERATIONS
 
         # Learning rates - increased for smaller model
         if self.mode == "fast":
             self.max_lr = 0.015  # Increased from 0.01
         elif self.mode == "stable":
-            self.max_lr = 0.005  # Increased from 0.003
+            self.max_lr = 0.005  # Increased from 0.003 for faster convergence
 
         # Optimizer parameters
         weight_decay = 2e-5  # Reduced from 3e-5 for smaller model
@@ -333,7 +334,7 @@ class ModelWrapper:
         flat_inputs,
         policy_targets,
         value_targets,
-        policy_weight=0.5,  # balanced weighting (was 0.3)
+        policy_weight,  # balanced weighting (was 0.3)
     ):
         """Perform a single training step with improved loss functions"""
         self.model.train()

@@ -26,7 +26,7 @@ class TurnResult(Enum):
     GAME_OVER = 2
 
 
-@dataclass(frozen=True)  # Making it immutable and hashable
+@dataclass  # Removed frozen=True to allow pickling in multiprocessing
 class Move:
     __slots__ = ["x", "y", "piece_type"]
     x: int
@@ -35,6 +35,11 @@ class Move:
 
     def __hash__(self):
         return hash((self.x, self.y, self.piece_type))
+
+    def __eq__(self, other):
+        if not isinstance(other, Move):
+            return False
+        return self.x == other.x and self.y == other.y and self.piece_type == other.piece_type
 
 
 @dataclass

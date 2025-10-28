@@ -396,17 +396,55 @@ class ModelWrapper:
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # Capture gradient statistics for monitoring
+        # Capture gradient statistics for monitoring AND adaptive weighting
         grad_stats = {}
 
-        # Get value head gradients for debugging
+        # Compute gradient norms for policy and value heads separately
+        policy_grad_norm = 0.0
+        value_grad_norm = 0.0
+
+        # Policy head parameters
+        for param in [self.model.policy_conv.weight, self.model.policy_conv.bias,
+                      self.model.policy_out.weight, self.model.policy_out.bias]:
+            if param.grad is not None:
+                policy_grad_norm += param.grad.norm().item() ** 2
+        policy_grad_norm = policy_grad_norm ** 0.5
+
+        # Value head parameters
+        for param in [self.model.value_conv.weight, self.model.value_conv.bias,
+                      self.model.value_fc1.weight, self.model.value_fc1.bias,
+                      self.model.flat_fc.weight, self.model.flat_fc.bias,
+                      self.model.value_fc2.weight, self.model.value_fc2.bias,
+                      self.model.value_fc3.weight, self.model.value_fc3.bias,
+                      self.model.value_fc4.weight, self.model.value_fc4.bias]:
+            if param.grad is not None:
+                value_grad_norm += param.grad.norm().item() ** 2
+        value_grad_norm = value_grad_norm ** 0.5
+
+        # Calculate adaptive policy weight for next iteration
+        # Target: equal gradient magnitudes (ratio = 1.0)
+        # policy_weight * policy_grad = (1 - policy_weight) * value_grad
+        # Solve for policy_weight: policy_weight = value_grad / (policy_grad + value_grad)
+        if policy_grad_norm > 0 and value_grad_norm > 0:
+            recommended_policy_weight = value_grad_norm / (policy_grad_norm + value_grad_norm)
+            # Clamp to reasonable range [0.1, 0.9]
+            recommended_policy_weight = max(0.1, min(0.9, recommended_policy_weight))
+        else:
+            recommended_policy_weight = policy_weight
+
+        grad_stats['policy_grad_norm'] = policy_grad_norm
+        grad_stats['value_grad_norm'] = value_grad_norm
+        grad_stats['grad_ratio'] = policy_grad_norm / (value_grad_norm + 1e-8)
+        grad_stats['recommended_policy_weight'] = recommended_policy_weight
+
+        # Get value head gradients for debugging (UPDATE not reassign)
         if self.model.value_fc4.weight.grad is not None:
             fc4_w_grad = self.model.value_fc4.weight.grad
             fc4_b_grad = self.model.value_fc4.bias.grad
             fc3_w_grad = self.model.value_fc3.weight.grad
             fc3_b_grad = self.model.value_fc3.bias.grad
 
-            grad_stats = {
+            grad_stats.update({
                 "value_fc4_weight": {
                     "mean": float(fc4_w_grad.mean().item()),
                     "std": float(fc4_w_grad.std().item()),
@@ -435,7 +473,7 @@ class ModelWrapper:
                     "max": float(fc3_b_grad.max().item()),
                     "norm": float(fc3_b_grad.norm().item()),
                 },
-            }
+            })
 
         # Apply gradient clipping to prevent instability
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)

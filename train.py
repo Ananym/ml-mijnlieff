@@ -11,16 +11,26 @@ from model import ModelWrapper
 from tqdm import tqdm
 from opponents import RandomOpponent, StrategicOpponent
 
-# Import both MCTS implementations
+# Import MCTS implementation
 from mcts import MCTS as SerialMCTS, add_dirichlet_noise
-from mcts_parallel import ParallelMCTS
-from mcts_parallel_v2 import ParallelMCTSv2
-from mcts_batched import BatchedMCTS
 import math
 from collections import defaultdict
 from eval_model import policy_vs_mcts_eval
 import torch.nn.functional as F
-from mcts_trace_logger import get_trace_logger
+
+# Simple trace logger stub (original mcts_trace_logger.py was removed)
+class TraceLogger:
+    def __init__(self):
+        self.log_entries = []
+    def enable(self): pass
+    def disable(self): pass
+    def log_network_prediction(self, *args, **kwargs): pass
+    def log_mcts_search_start(self, *args, **kwargs): pass
+    def log_mcts_search_end(self, *args, **kwargs): pass
+    def log_game_end(self, *args, **kwargs): pass
+
+def get_trace_logger():
+    return TraceLogger()
 
 # Training mode configurations
 TRAINING_MODES = {
@@ -36,30 +46,30 @@ TRAINING_MODES = {
     },
     "stable": {
         "episodes": 100,
-        "epochs": 25,
-        "min_mcts_sims": 400,
-        "max_mcts_sims": 800,
+        "epochs": 20,
+        "min_mcts_sims": 800,
+        "max_mcts_sims": 1600,
         "max_iterations": 50,
         "eval_interval": 10,
         "eval_games": 40,
-        "description": "Efficient run (100 games, 400-800 sims, 50 iters)",
+        "description": "VALUE BOOTSTRAPPING (80% MCTS values, pure self-play, 800-1600 sims)",
     },
 }
 
 # Default values (will be overridden by mode)
 DEFAULT_EPISODES = 100
-DEFAULT_BATCH_SIZE = 512
+DEFAULT_BATCH_SIZE = 256
 DEFAULT_SAVE_INTERVAL = 5
 DEFAULT_NUM_CHECKPOINTS = 5
 DEFAULT_MCTS_RATIO = 1.0
-DEFAULT_BUFFER_SIZE = 8000
-DEFAULT_POLICY_WEIGHT = 0.5
-DEFAULT_NUM_EPOCHS = 12
+DEFAULT_BUFFER_SIZE = 6000
+DEFAULT_POLICY_WEIGHT = 0.2  # Balanced - 80% value, 20% policy (was 0.05, too extreme)
+DEFAULT_NUM_EPOCHS = 20
 DEFAULT_EVAL_INTERVAL = 10
 DEFAULT_EVAL_GAMES = 40
 DEFAULT_STRATEGIC_EVAL_GAMES = 40
-DEFAULT_MIN_MCTS_SIMS = 400
-DEFAULT_MAX_MCTS_SIMS = 800
+DEFAULT_MIN_MCTS_SIMS = 600  # REVERTED to Exp 1 baseline - faster iterations
+DEFAULT_MAX_MCTS_SIMS = 1200  # REVERTED to Exp 1 baseline - faster iterations
 MAX_ITERATIONS = 50
 
 # Early stopping criteria
@@ -69,7 +79,7 @@ EARLY_STOPPING_MIN_WINRATE = (
     25.0  # Minimum win rate vs Strategic opponent to continue training
 )
 
-BALANCE_REPLAY_BUFFER = False
+BALANCE_REPLAY_BUFFER = False  # REVERTED to Exp 1 baseline - natural distribution
 
 # Dirichlet noise - curriculum learning approach
 DIRICHLET_INITIAL_SCALE = 0.3  # CURRICULUM: High exploration early
@@ -81,19 +91,10 @@ ENTROPY_BONUS_SCALE = 0.05  # Small entropy bonus to encourage exploration (was 
 
 def get_mcts_class(device):
     """
-    Select the best MCTS implementation based on device.
-
-    - GPU (cuda): Use BatchedMCTS for 2.0x speedup via batched inference
-    - CPU: Use SerialMCTS - parallel overhead is too high on CPU
-
-    Returns the appropriate MCTS class.
+    Returns the SerialMCTS implementation.
     """
-    if device == "cuda":
-        print("MCTS Strategy: Using BatchedMCTS for GPU (batched inference)")
-        return BatchedMCTS
-    else:
-        print("MCTS Strategy: Using SerialMCTS for CPU (reusable instance)")
-        return SerialMCTS
+    print("MCTS Strategy: Using SerialMCTS (reusable instance)")
+    return SerialMCTS
 
 
 def get_dirichlet_scale(iteration):
@@ -108,21 +109,19 @@ def get_dirichlet_scale(iteration):
 
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Keep disabled
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.7  # Start with 70% Strategic for bootstrapping
-FINAL_STRATEGIC_OPPONENT_RATIO = (
-    0.1  # End with 10% Strategic (reduced from 20% to avoid anti-Strategic patterns)
-)
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.7  # Start with 70% Strategic opponent games (Exp 1 baseline)
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.1  # End with 10% Strategic (Exp 1 baseline)
 OPPONENT_TRANSITION_ITERATIONS = (
-    30  # Transition faster (reduced from 40) to shift to self-play sooner
+    30  # Transition over 30 iterations (Exp 1 baseline)
 )
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
 DEFAULT_FINAL_RANDOM_CHANCE = 0.0
 DEFAULT_RANDOM_CHANCE_TRANSITION_ITERATIONS = MAX_ITERATIONS
 
-BOOTSTRAP_MIN_WEIGHT = 0.0  # Start with modest bootstrapping
-BOOTSTRAP_MAX_WEIGHT = 0.0  # Increase to a moderate maximum
-BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS
+BOOTSTRAP_MIN_WEIGHT = 0.0  # Pure game outcomes (Exp 1 baseline) - AlphaZero's approach
+BOOTSTRAP_MAX_WEIGHT = 0.0  # No bootstrapping (Exp 1 baseline)
+BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS  # No transition, keep constant
 
 DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint_interrupted.pth"
 
@@ -138,7 +137,9 @@ def get_reward_values(reward_config="discrete"):
     elif reward_config == "discrete_mild":
         return (1.0, -1.0, -0.3)
     elif reward_config == "discrete_light":
-        return (1.0, -1.0, -0.15)
+        return (1.0, -1.0, -0.2)
+    elif reward_config == "discrete_heavy":
+        return (1.0, -1.0, -0.6)  # Strong draw penalty to break conservative play
     else:
         # For continuous configs, use thresholds
         return (1.0, -1.0, 0.0)
@@ -278,12 +279,22 @@ def log_iteration_report(
     buffer_loss_pct = (buffer_loss_samples / max(1, buffer_size)) * 100
     buffer_draw_pct = (buffer_draw_samples / max(1, buffer_size)) * 100
 
+    # Extract gradient statistics if available
+    policy_grad_norm = grad_stats.get('policy_grad_norm', 0) if grad_stats else 0
+    value_grad_norm = grad_stats.get('value_grad_norm', 0) if grad_stats else 0
+    grad_ratio = grad_stats.get('grad_ratio', 0) if grad_stats else 0
+    adaptive_weight = grad_stats.get('adaptive_policy_weight', 0) if grad_stats else 0
+
     # Build the consolidated report - SIMPLIFIED for readability
     print(f"\n{'='*20} ITER {iteration} {'='*20}")
     print(f"Time: {int(hours)}h{int(minutes):02d}m | Iter: {iteration_time:.0f}s")
     print(
         f"Loss: {avg_total:.4f} (P:{avg_policy:.4f} V:{avg_value:.4f}) LR:{model.optimizer.param_groups[0]['lr']:.6f}"
     )
+    if adaptive_weight > 0:
+        print(
+            f"Grads: P/V ratio={grad_ratio:.2f} | Adaptive weight={adaptive_weight:.3f}"
+        )
     print(
         f"Value: mean={avg_value_prediction:.3f} std={value_std:.3f} corr={pearson_correlation:.3f}"
     )
@@ -413,6 +424,10 @@ def training_loop(
     running_count = 0
     iteration = 0
 
+    # Adaptive policy weight - starts at DEFAULT but adjusts based on gradient balance
+    adaptive_policy_weight = DEFAULT_POLICY_WEIGHT
+    grad_ratio_history = []  # Track gradient ratio over time
+
     stats_template = {
         "win_rate": 0.0,
         "loss_rate": 0.0,
@@ -456,6 +471,8 @@ def training_loop(
                 "running_count": running_count,
                 "iteration": iteration,
                 "rng_state": rng.__getstate__(),
+                "adaptive_policy_weight": adaptive_policy_weight,
+                "grad_ratio_history": grad_ratio_history,
             }
             model.save_checkpoint(checkpoint_path, training_state)
             print(f"Saved checkpoint to {checkpoint_path}")
@@ -468,9 +485,9 @@ def training_loop(
     # Start the training timer
     training_start = time.time()
 
-    # Setup trace logging - will trigger at iteration 5 for one game
+    # Setup trace logging - DISABLED (stub implementation causes errors)
     trace_logger = get_trace_logger()
-    trace_enabled_iteration = 5
+    trace_enabled_iteration = 999  # Never trigger
     trace_logged = False
 
     # Base stats template - simplified
@@ -500,9 +517,12 @@ def training_loop(
         "value_prediction_abs_sum": 0,
         "value_prediction_count": 0,
         # correlation stats
-        "value_actual_pred_products": 0,  # needed for pearson correlation
-        "value_actual_squared": 0,  # needed for pearson correlation
-        "value_pred_squared": 0,  # needed for pearson correlation
+        "value_actual_sum": 0,  # Σ(actual) needed for pearson correlation
+        "value_pred_sum_for_corr": 0,  # Σ(predicted) for correlation only
+        "value_actual_pred_products": 0,  # Σ(actual*pred) needed for pearson correlation
+        "value_actual_squared": 0,  # Σ(actual²) needed for pearson correlation
+        "value_pred_squared": 0,  # Σ(pred²) needed for pearson correlation
+        "value_corr_count": 0,  # count of samples for correlation
         # cache stats
         "cache_hits": 0,
         "cache_misses": 0,
@@ -550,13 +570,22 @@ def training_loop(
                 return -0.3
 
         elif reward_config == "discrete_light":
-            # Win: +1, Loss: -1, Draw: -0.15 (light draw penalty)
+            # Win: +1, Loss: -1, Draw: -0.2 (light draw penalty)
             if score_diff > 0:
                 return 1.0
             elif score_diff < 0:
                 return -1.0
             else:
-                return -0.15
+                return -0.2
+
+        elif reward_config == "discrete_heavy":
+            # Win: +1, Loss: -1, Draw: -0.6 (strong draw penalty to break conservative play)
+            if score_diff > 0:
+                return 1.0
+            elif score_diff < 0:
+                return -1.0
+            else:
+                return -0.6
 
         elif reward_config == "score_diff":
             # Original: continuous score differential
@@ -902,10 +931,7 @@ def training_loop(
         "dirichlet_scale": get_dirichlet_scale(0),  # Will be updated
         "enable_early_stopping": enable_early_stopping,
     }
-    if MCTSClass == ParallelMCTS or MCTSClass == ParallelMCTSv2:
-        mcts_kwargs["num_workers"] = (
-            7  # Parallel MCTS not used on CPU, but keep for GPU compatibility
-        )
+    # Using SerialMCTS only - no parallel/batched implementations
     reusable_mcts = MCTSClass(**mcts_kwargs)
 
     try:
@@ -1092,6 +1118,8 @@ def training_loop(
                                 # iter_stats["value_error_sum"] += error
 
                                 # 4. Track for correlation calculation
+                                iter_stats["value_actual_sum"] += outcome_value
+                                iter_stats["value_pred_sum_for_corr"] += example.mcts_value
                                 iter_stats["value_actual_pred_products"] += (
                                     outcome_value * example.mcts_value
                                 )
@@ -1101,6 +1129,7 @@ def training_loop(
                                 iter_stats["value_pred_squared"] += (
                                     example.mcts_value * example.mcts_value
                                 )
+                                iter_stats["value_corr_count"] += 1
 
                                 # removed tracking error by confidence level
                                 # removed storing time series data
@@ -1131,6 +1160,8 @@ def training_loop(
                                     # iter_stats["value_error_sum"] += error
 
                                     # 4. Track for correlation calculation
+                                    iter_stats["value_actual_sum"] += outcome_value
+                                    iter_stats["value_pred_sum_for_corr"] += bootstrap_value
                                     iter_stats["value_actual_pred_products"] += (
                                         outcome_value * bootstrap_value
                                     )
@@ -1140,6 +1171,7 @@ def training_loop(
                                     iter_stats["value_pred_squared"] += (
                                         bootstrap_value * bootstrap_value
                                     )
+                                    iter_stats["value_corr_count"] += 1
 
                                     # removed tracking error by confidence level
                                     # removed storing time series data
@@ -1245,6 +1277,13 @@ def training_loop(
                 range(DEFAULT_NUM_EPOCHS), desc="Training Epochs", leave=False
             )
             epoch_losses = {"total": 0, "policy": 0, "value": 0}
+            epoch_grad_stats = {
+                "policy_grad_norm": 0,
+                "value_grad_norm": 0,
+                "grad_ratio": 0,
+                "recommended_policy_weight": 0,
+                "count": 0,
+            }
 
             in_training_phase = True  # Set flag to indicate we're in training
 
@@ -1263,14 +1302,22 @@ def training_loop(
                 policy_targets = np.array([ex.policy for ex in batch])
                 value_targets = np.array([ex.value for ex in batch])
 
-                # Train network with weighted losses
+                # Train network with adaptive policy weight
                 total_loss, policy_loss, value_loss, step_grad_stats = model.train_step(
                     board_inputs,
                     flat_inputs,
                     policy_targets,
                     value_targets,
-                    policy_weight=DEFAULT_POLICY_WEIGHT,
+                    policy_weight=adaptive_policy_weight,
                 )
+
+                # Accumulate gradient statistics for this epoch
+                if 'policy_grad_norm' in step_grad_stats:
+                    epoch_grad_stats['policy_grad_norm'] += step_grad_stats['policy_grad_norm']
+                    epoch_grad_stats['value_grad_norm'] += step_grad_stats['value_grad_norm']
+                    epoch_grad_stats['grad_ratio'] += step_grad_stats['grad_ratio']
+                    epoch_grad_stats['recommended_policy_weight'] += step_grad_stats['recommended_policy_weight']
+                    epoch_grad_stats['count'] += 1
 
                 # Update running averages
                 running_count += 1
@@ -1325,6 +1372,20 @@ def training_loop(
             avg_total = epoch_losses["total"] / DEFAULT_NUM_EPOCHS
             avg_policy = epoch_losses["policy"] / DEFAULT_NUM_EPOCHS
             avg_value = epoch_losses["value"] / DEFAULT_NUM_EPOCHS
+
+            # Update adaptive policy weight based on gradient statistics (RE-ENABLED)
+            if epoch_grad_stats['count'] > 0:
+                avg_policy_grad = epoch_grad_stats['policy_grad_norm'] / epoch_grad_stats['count']
+                avg_value_grad = epoch_grad_stats['value_grad_norm'] / epoch_grad_stats['count']
+                avg_grad_ratio = epoch_grad_stats['grad_ratio'] / epoch_grad_stats['count']
+                avg_recommended = epoch_grad_stats['recommended_policy_weight'] / epoch_grad_stats['count']
+
+                # Smooth adaptation using exponential moving average (alpha=0.3)
+                # This prevents wild swings in policy weight
+                adaptive_policy_weight = 0.7 * adaptive_policy_weight + 0.3 * avg_recommended
+
+                # Track gradient ratio history for monitoring
+                grad_ratio_history.append(avg_grad_ratio)
 
             # Step the scheduler once per iteration
             model.scheduler.step()
@@ -1391,6 +1452,13 @@ def training_loop(
             # Collect gradient statistics for reporting
             grad_stats = inspect_value_head_gradients(model)
 
+            # Add adaptive weighting statistics to grad_stats
+            if epoch_grad_stats['count'] > 0:
+                grad_stats['policy_grad_norm'] = avg_policy_grad
+                grad_stats['value_grad_norm'] = avg_value_grad
+                grad_stats['grad_ratio'] = avg_grad_ratio
+                grad_stats['adaptive_policy_weight'] = adaptive_policy_weight
+
             # Calculate average MCTS confidence
             iter_stats["avg_mcts_confidence"] = (
                 iter_stats["mcts_policy_confidence_sum"]
@@ -1401,16 +1469,28 @@ def training_loop(
 
             # Calculate value metrics (simplified)
             value_pred_count = iter_stats["value_prediction_count"]
-            actual_sq = iter_stats["value_actual_squared"]
-            pred_sq = iter_stats["value_pred_squared"]
+
+            # Pearson correlation: r = (n*Σxy - Σx*Σy) / (sqrt(n*Σx² - (Σx)²) * sqrt(n*Σy² - (Σy)²))
+            n = iter_stats["value_corr_count"]
+            sum_xy = iter_stats["value_actual_pred_products"]
+            sum_x = iter_stats["value_actual_sum"]
+            sum_y = iter_stats["value_pred_sum_for_corr"]  # Sum of predictions used in correlation
+            sum_x_sq = iter_stats["value_actual_squared"]
+            sum_y_sq = iter_stats["value_pred_squared"]
+
+            if n > 1:
+                numerator = n * sum_xy - sum_x * sum_y
+                denom_x = n * sum_x_sq - sum_x * sum_x
+                denom_y = n * sum_y_sq - sum_y * sum_y
+                if denom_x > 0 and denom_y > 0:
+                    pearson_corr = numerator / (math.sqrt(denom_x) * math.sqrt(denom_y))
+                else:
+                    pearson_corr = 0
+            else:
+                pearson_corr = 0
 
             value_metrics = {
-                "pearson_correlation": (
-                    iter_stats["value_actual_pred_products"]
-                    / (math.sqrt(actual_sq) * math.sqrt(pred_sq))
-                    if actual_sq > 0 and pred_sq > 0
-                    else 0
-                ),
+                "pearson_correlation": pearson_corr,
                 "avg_value_prediction": (
                     iter_stats["value_prediction_sum"] / value_pred_count
                     if value_pred_count > 0
@@ -1655,6 +1735,8 @@ if __name__ == "__main__":
         print("  Win: +1.0, Loss: -1.0, Draw: -0.3 (moderate draw penalty)")
     elif reward_config == "discrete_light":
         print("  Win: +1.0, Loss: -1.0, Draw: -0.15 (light draw penalty)")
+    elif reward_config == "discrete_heavy":
+        print("  Win: +1.0, Loss: -1.0, Draw: -0.6 (STRONG draw penalty - break conservative play)")
     elif reward_config == "score_diff":
         print("  Score differential (continuous, no draw penalty)")
     elif reward_config == "score_diff_penalty":

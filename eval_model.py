@@ -94,8 +94,19 @@ def policy_vs_mcts_eval(
                 if policy_sum > 0:
                     masked_policy = masked_policy / policy_sum
 
-                # Use softmax sampling (temperature=1.0)
+                # Apply temperature for human-like play (lower = more deterministic)
+                eval_temperature = 0.4
                 policy_flat = masked_policy.flatten()
+
+                # Apply temperature scaling
+                if eval_temperature != 1.0 and np.sum(policy_flat) > 0:
+                    log_probs = np.log(policy_flat + 1e-10)
+                    scaled_logits = log_probs / eval_temperature
+                    # Numerically stable softmax
+                    scaled_logits = scaled_logits - np.max(scaled_logits)
+                    exp_logits = np.exp(scaled_logits)
+                    policy_flat = exp_logits / np.sum(exp_logits)
+
                 if np.sum(policy_flat) > 0:
                     move_idx = rng.choice(len(policy_flat), p=policy_flat)
                     move_coords = np.unravel_index(move_idx, masked_policy.shape)
@@ -227,8 +238,19 @@ def policy_vs_mcts_eval(
                 if policy_sum > 0:
                     masked_policy = masked_policy / policy_sum
 
-                # Use softmax sampling (temperature=1.0)
+                # Apply temperature for human-like play (lower = more deterministic)
+                eval_temperature = 0.4
                 policy_flat = masked_policy.flatten()
+
+                # Apply temperature scaling
+                if eval_temperature != 1.0 and np.sum(policy_flat) > 0:
+                    log_probs = np.log(policy_flat + 1e-10)
+                    scaled_logits = log_probs / eval_temperature
+                    # Numerically stable softmax
+                    scaled_logits = scaled_logits - np.max(scaled_logits)
+                    exp_logits = np.exp(scaled_logits)
+                    policy_flat = exp_logits / np.sum(exp_logits)
+
                 if np.sum(policy_flat) > 0:
                     move_idx = rng.choice(len(policy_flat), p=policy_flat)
                     move_coords = np.unravel_index(move_idx, masked_policy.shape)

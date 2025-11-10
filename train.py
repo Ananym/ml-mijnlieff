@@ -109,10 +109,10 @@ def get_dirichlet_scale(iteration):
 
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Keep disabled
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.7  # Start with 70% Strategic opponent games (Exp 1 baseline)
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.1  # End with 10% Strategic (Exp 1 baseline)
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.4  # Experiment 8: INVERTED CURRICULUM - Start low (40%)
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.8  # End high (80%) - Learn to beat Strategic when model is strong
 OPPONENT_TRANSITION_ITERATIONS = (
-    30  # Transition over 30 iterations (Exp 1 baseline)
+    50  # Gradual increase over full training (inverted approach)
 )
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0

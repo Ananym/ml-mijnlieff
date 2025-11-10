@@ -32,8 +32,8 @@ class PolicyValueNet(nn.Module):
         super().__init__()
         # input channels: 6 channels for board state
         in_channels = 6
-        # Restored to original capacity for better learning
-        hidden_channels = 128  # RESTORED from 64 for ~400K param model
+        # Experiment 8: Reverted to baseline (Exp 7 showed capacity wasn't bottleneck)
+        hidden_channels = 128  # ~1.2M params baseline
 
         # First convolution layer
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)

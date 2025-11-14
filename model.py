@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 # Scale factor for policy entropy bonus (lower = less exploration)
 # This should be synced with ENTROPY_BONUS_SCALE in train.py
-ENTROPY_BONUS_SCALE = 0.05
+ENTROPY_BONUS_SCALE = 0.07  # INCREASED from 0.05 for better generalization vs human players
 
 
 class ResBlock(nn.Module):

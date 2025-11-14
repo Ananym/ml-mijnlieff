@@ -70,23 +70,23 @@ DEFAULT_EVAL_GAMES = 40
 DEFAULT_STRATEGIC_EVAL_GAMES = 40
 DEFAULT_MIN_MCTS_SIMS = 600  # REVERTED to Exp 1 baseline - faster iterations
 DEFAULT_MAX_MCTS_SIMS = 1200  # REVERTED to Exp 1 baseline - faster iterations
-MAX_ITERATIONS = 50
+MAX_ITERATIONS = 100  # Extended run for higher specialization while maintaining generalization
 
 # Early stopping criteria
 EARLY_STOPPING_ENABLED = True
-EARLY_STOPPING_CHECK_ITERATION = 30  # Check earlier to catch failure modes
+EARLY_STOPPING_CHECK_ITERATION = 50  # Adjusted for 100-iteration run
 EARLY_STOPPING_MIN_WINRATE = (
     25.0  # Minimum win rate vs Strategic opponent to continue training
 )
 
 BALANCE_REPLAY_BUFFER = False  # REVERTED to Exp 1 baseline - natural distribution
 
-# Dirichlet noise - curriculum learning approach
+# Dirichlet noise - curriculum learning approach (ANTI-OVERFITTING)
 DIRICHLET_INITIAL_SCALE = 0.3  # CURRICULUM: High exploration early
-DIRICHLET_FINAL_SCALE = 0.15  # CURRICULUM: Moderate exploration later
-DIRICHLET_TRANSITION_ITERATIONS = 30  # Transition over 30 iterations
+DIRICHLET_FINAL_SCALE = 0.20  # INCREASED from 0.15 - maintain exploration for generalization!
+DIRICHLET_TRANSITION_ITERATIONS = 70  # EXTENDED from 30 - gradual decay over most of training
 
-ENTROPY_BONUS_SCALE = 0.05  # Small entropy bonus to encourage exploration (was 0.0)
+ENTROPY_BONUS_SCALE = 0.07  # INCREASED from 0.05 - encourage policy diversity for human play
 
 
 def get_mcts_class(device):
@@ -109,10 +109,10 @@ def get_dirichlet_scale(iteration):
 
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Keep disabled
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.4  # Experiment 8: INVERTED CURRICULUM - Start low (40%)
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.8  # End high (80%) - Learn to beat Strategic when model is strong
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.4  # Experiment 9: EXTENDED INVERTED CURRICULUM - Start low (40%)
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.85  # INCREASED from 0.80 - specialize more, but maintain 15% self-play!
 OPPONENT_TRANSITION_ITERATIONS = (
-    50  # Gradual increase over full training (inverted approach)
+    100  # EXTENDED - gentler slope over full training for better generalization
 )
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0

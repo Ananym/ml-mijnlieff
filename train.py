@@ -49,7 +49,7 @@ TRAINING_MODES = {
         "epochs": 20,
         "min_mcts_sims": 800,
         "max_mcts_sims": 1600,
-        "max_iterations": 50,
+        "max_iterations": 100,  # Extended for Experiment 9
         "eval_interval": 10,
         "eval_games": 40,
         "description": "VALUE BOOTSTRAPPING (80% MCTS values, pure self-play, 800-1600 sims)",
@@ -81,12 +81,12 @@ EARLY_STOPPING_MIN_WINRATE = (
 
 BALANCE_REPLAY_BUFFER = False  # REVERTED to Exp 1 baseline - natural distribution
 
-# Dirichlet noise - curriculum learning approach (ANTI-OVERFITTING)
-DIRICHLET_INITIAL_SCALE = 0.3  # CURRICULUM: High exploration early
-DIRICHLET_FINAL_SCALE = 0.20  # INCREASED from 0.15 - maintain exploration for generalization!
-DIRICHLET_TRANSITION_ITERATIONS = 70  # EXTENDED from 30 - gradual decay over most of training
+# Dirichlet noise - Experiment 11: Plateau Curriculum
+DIRICHLET_PHASE_1_2 = 0.25  # Constant moderate exploration during specialization & plateau
+DIRICHLET_PHASE_3_START = 0.25  # Starting noise for generalization phase
+DIRICHLET_PHASE_3_END = 0.30  # Ending noise for generalization phase (higher exploration)
 
-ENTROPY_BONUS_SCALE = 0.07  # INCREASED from 0.05 - encourage policy diversity for human play
+ENTROPY_BONUS_SCALE = 0.07  # Encourage policy diversity for human play
 
 
 def get_mcts_class(device):
@@ -98,22 +98,34 @@ def get_mcts_class(device):
 
 
 def get_dirichlet_scale(iteration):
-    """Calculate adaptive Dirichlet noise scale - high early, lower later"""
-    if iteration >= DIRICHLET_TRANSITION_ITERATIONS:
-        return DIRICHLET_FINAL_SCALE
-    progress = iteration / DIRICHLET_TRANSITION_ITERATIONS
-    return DIRICHLET_INITIAL_SCALE - progress * (
-        DIRICHLET_INITIAL_SCALE - DIRICHLET_FINAL_SCALE
-    )
+    """
+    Calculate adaptive Dirichlet noise scale - Experiment 11: Plateau Curriculum
+    - Phase 1 (1 -> 40): 0.25 (constant moderate exploration during fast specialization)
+    - Phase 2 (40 -> 60): 0.25 (constant during plateau)
+    - Phase 3 (60 -> 100): 0.25 -> 0.30 (gradually increase during generalization)
+    """
+    PHASE_1_END = 40
+    PHASE_2_END = 60
+
+    if iteration <= PHASE_2_END:
+        # Phases 1 & 2: Constant moderate noise
+        return DIRICHLET_PHASE_1_2
+    else:
+        # Phase 3: Gradually increase noise for generalization
+        progress = (iteration - PHASE_2_END) / (MAX_ITERATIONS - PHASE_2_END)
+        return DIRICHLET_PHASE_3_START + progress * (DIRICHLET_PHASE_3_END - DIRICHLET_PHASE_3_START)
 
 
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Keep disabled
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.4  # Experiment 9: EXTENDED INVERTED CURRICULUM - Start low (40%)
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.85  # INCREASED from 0.80 - specialize more, but maintain 15% self-play!
-OPPONENT_TRANSITION_ITERATIONS = (
-    100  # EXTENDED - gentler slope over full training for better generalization
-)
+
+# Experiment 11: PLATEAU CURRICULUM - Fast specialization, plateau, then generalization
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.40  # Start with balanced play
+PEAK_STRATEGIC_OPPONENT_RATIO = 0.85  # Peak specialization (higher than Exp 10)
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.40  # Return to balanced play for generalization
+PHASE_1_END = 40  # Fast ramp to peak
+PHASE_2_END = 60  # Plateau at peak
+OPPONENT_TRANSITION_ITERATIONS = 100  # Total iterations
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
 DEFAULT_FINAL_RANDOM_CHANCE = 0.0
@@ -859,15 +871,29 @@ def training_loop(
 
     # Function to update opponent ratios based on current iteration
     def get_opponent_ratios(iteration):
-        progress = min(1.0, iteration / OPPONENT_TRANSITION_ITERATIONS)
+        """
+        Experiment 11: Plateau Curriculum
+        - Phase 1 (iter 1 -> 40): Ramp up quickly to 85% Strategic (fast specialization)
+        - Phase 2 (iter 40 -> 60): Maintain 85% Strategic (plateau to consolidate learning)
+        - Phase 3 (iter 60 -> 100): Ramp down to 40% Strategic (restore generalization)
+        """
+        random_ratio = INITIAL_RANDOM_OPPONENT_RATIO  # Always 0 for now
 
-        # Linear interpolation between initial and final values
-        random_ratio = INITIAL_RANDOM_OPPONENT_RATIO + progress * (
-            FINAL_RANDOM_OPPONENT_RATIO - INITIAL_RANDOM_OPPONENT_RATIO
-        )
-        strategic_ratio = INITIAL_STRATEGIC_OPPONENT_RATIO + progress * (
-            FINAL_STRATEGIC_OPPONENT_RATIO - INITIAL_STRATEGIC_OPPONENT_RATIO
-        )
+        if iteration <= PHASE_1_END:
+            # Phase 1: Fast ramp up to peak (build expertise quickly)
+            progress = iteration / PHASE_1_END
+            strategic_ratio = INITIAL_STRATEGIC_OPPONENT_RATIO + progress * (
+                PEAK_STRATEGIC_OPPONENT_RATIO - INITIAL_STRATEGIC_OPPONENT_RATIO
+            )
+        elif iteration <= PHASE_2_END:
+            # Phase 2: Plateau at peak (consolidate learning)
+            strategic_ratio = PEAK_STRATEGIC_OPPONENT_RATIO
+        else:
+            # Phase 3: Ramp down from peak (restore generalization)
+            progress = (iteration - PHASE_2_END) / (OPPONENT_TRANSITION_ITERATIONS - PHASE_2_END)
+            strategic_ratio = PEAK_STRATEGIC_OPPONENT_RATIO + progress * (
+                FINAL_STRATEGIC_OPPONENT_RATIO - PEAK_STRATEGIC_OPPONENT_RATIO
+            )
 
         # Ensure self-play ratio is always positive by capping total opponent ratio
         total_opponent_ratio = random_ratio + strategic_ratio

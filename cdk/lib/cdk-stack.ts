@@ -35,6 +35,7 @@ export class MijnlieffStack extends cdk.Stack {
     );
 
     // Create Lambda function from container image
+    // TODO: Add reservedConcurrentExecutions: 1 after requesting Lambda quota increase
     const lambdaFunction = new lambda.DockerImageFunction(
       this,
       "ContainerFunction",
@@ -44,7 +45,6 @@ export class MijnlieffStack extends cdk.Stack {
         }),
         memorySize: 1024,
         timeout: cdk.Duration.seconds(30),
-        reservedConcurrentExecutions: 1,
       }
     );
 

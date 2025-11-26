@@ -94,8 +94,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Build the Docker image with model path
+# --provenance=false prevents OCI image index format that Lambda doesn't support
 Write-Host "Building Docker image..." -ForegroundColor Yellow
-$buildArgs = @("build", "--build-arg", "MODEL_PATH=$modelPath", "-t", "${ecrRepository}:latest")
+$buildArgs = @("build", "--provenance=false", "--build-arg", "MODEL_PATH=$modelPath", "-t", "${ecrRepository}:latest")
 if ($noCache) {
     Write-Host "  (with --no-cache flag)"
     $buildArgs += "--no-cache"

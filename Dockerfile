@@ -18,8 +18,11 @@ RUN microdnf install -y findutils && microdnf clean all && \
 FROM public.ecr.aws/lambda/python:3.13
 COPY --from=builder /var/lang/lib/python3.13/site-packages /var/lang/lib/python3.13/site-packages
 
+# Model path build arg (default to saved_models/model_final.pth)
+ARG MODEL_PATH=saved_models/model_final.pth
+
 # Set environment variables
-ENV TICTACDO_MODEL_PATH=/var/task/models/model_compressed.pth
+ENV TICTACDO_MODEL_PATH=/var/task/models/model.pth
 ENV FORCE_CPU=1
 ENV CUDA_VISIBLE_DEVICES=""
 
@@ -53,7 +56,7 @@ RUN rm -rf /root/.cache/pip/* && \
     mkdir -p ${LAMBDA_TASK_ROOT}/models
 # Copy application files
 COPY play.py game.py model.py lambda_handler.py ${LAMBDA_TASK_ROOT}/
-COPY optimized_models/model_compressed.pth ${LAMBDA_TASK_ROOT}/models/
+COPY ${MODEL_PATH} ${LAMBDA_TASK_ROOT}/models/model.pth
 
 # Set the handler
 CMD [ "lambda_handler.handler" ]

@@ -9,15 +9,48 @@ param(
     [string]$ecrRepoName = "mijnlieff",
 
     [Parameter(Mandatory=$false)]
+    [string]$modelPath,
+
+    [Parameter(Mandatory=$false)]
     [switch]$noCache = $false
 )
 
 # Set defaults if not provided
 if (-not $awsRegion) { $awsRegion = "eu-west-2" }
 
-# Validate required parameters
+# Model selection
+$modelOptions = @{
+    "1" = @{ Path = "saved_models/model_final.pth"; Name = "Final (saved_models/model_final.pth)" }
+    "2" = @{ Path = "optimized_models/model_compressed.pth"; Name = "Compressed (optimized_models/model_compressed.pth)" }
+}
+
+if (-not $modelPath) {
+    Write-Host ""
+    Write-Host "Select model to deploy:" -ForegroundColor Cyan
+    Write-Host "  [1] Final model (saved_models/model_final.pth)" -ForegroundColor White
+    Write-Host "  [2] Compressed model (optimized_models/model_compressed.pth)" -ForegroundColor White
+    Write-Host ""
+
+    $choice = Read-Host "Enter choice (1 or 2)"
+
+    if ($modelOptions.ContainsKey($choice)) {
+        $modelPath = $modelOptions[$choice].Path
+    } else {
+        Write-Error "Invalid choice. Please enter 1 or 2."
+        exit 1
+    }
+}
+
+# Verify model file exists
+if (-not (Test-Path $modelPath)) {
+    Write-Error "Model file not found: $modelPath"
+    exit 1
+}
+
+Write-Host "Using model: $modelPath" -ForegroundColor Cyan
+
+# Validate AWS account
 if (-not $awsAccountId) {
-    # Try to get from AWS CLI
     $awsAccountId = aws sts get-caller-identity --query Account --output text 2>$null
     if (-not $awsAccountId) {
         Write-Error "AWS Account ID not found. Set AWS_ACCOUNT_ID environment variable or configure AWS CLI."
@@ -44,11 +77,14 @@ try {
     exit 1
 }
 
+Write-Host ""
 Write-Host "Starting Docker build and push to ECR..." -ForegroundColor Green
 Write-Host "  Region: $awsRegion" -ForegroundColor Cyan
 Write-Host "  Repository: $ecrRepository" -ForegroundColor Cyan
+Write-Host "  Model: $modelPath" -ForegroundColor Cyan
 
 # Get ECR login token and login to Docker
+Write-Host ""
 Write-Host "Logging into ECR..." -ForegroundColor Yellow
 aws ecr get-login-password --region $awsRegion | docker login --username AWS --password-stdin "${awsAccountId}.dkr.ecr.${awsRegion}.amazonaws.com"
 
@@ -57,14 +93,16 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# Build the Docker image
+# Build the Docker image with model path
 Write-Host "Building Docker image..." -ForegroundColor Yellow
+$buildArgs = @("build", "--build-arg", "MODEL_PATH=$modelPath", "-t", "${ecrRepository}:latest")
 if ($noCache) {
     Write-Host "  (with --no-cache flag)"
-    docker build --no-cache -t "${ecrRepository}:latest" .
-} else {
-    docker build -t "${ecrRepository}:latest" .
+    $buildArgs += "--no-cache"
 }
+$buildArgs += "."
+
+docker @buildArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Docker build failed"

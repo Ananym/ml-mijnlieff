@@ -109,6 +109,7 @@ import {
   getDebugStringRepresentation,
   moveToString,
   passTurn,
+  currentPlayerHasValidMoves,
   DIFFICULTY_SETTINGS,
 } from './gameLogic';
 
@@ -145,11 +146,8 @@ export default {
         theme.value === 'dark' ||
         (theme.value === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
       theme.value = isDark ? 'light' : 'dark';
-      if (theme.value === 'system') {
-        document.documentElement.removeAttribute('data-theme');
-      } else {
-        document.documentElement.setAttribute('data-theme', theme.value);
-      }
+      // Toggle always sets an explicit theme, so always set the data-theme attribute
+      document.documentElement.setAttribute('data-theme', theme.value);
     };
 
     const isDarkMode = computed(() => {
@@ -309,8 +307,16 @@ export default {
           endGame();
           break;
         case TurnResults.OPP_MUST_PASS:
+          // AI must pass due to movement restrictions
           lastAIMove.value = null;
           passTurn(gameState.value);
+          // After AI passes, it's human's turn with no restrictions.
+          // But if human also can't move (no pieces), pass back to AI.
+          if (!currentPlayerHasValidMoves(gameState.value)) {
+            console.log('Human also cannot move after AI pass, passing back to AI');
+            passTurn(gameState.value);
+            await playAiTurn();
+          }
           break;
       }
     };

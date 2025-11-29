@@ -12,7 +12,10 @@ param(
     [string]$modelPath,
 
     [Parameter(Mandatory=$false)]
-    [switch]$noCache = $false
+    [switch]$noCache = $false,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$updateLambda = $false
 )
 
 # Set defaults if not provided
@@ -119,9 +122,35 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# Update Lambda function if requested
+if ($updateLambda) {
+    Write-Host ""
+    Write-Host "Updating Lambda function to use new image..." -ForegroundColor Yellow
+
+    # Find the Lambda function name
+    $functionName = aws lambda list-functions --query "Functions[?starts_with(FunctionName, 'MijnlieffStack-ContainerFunction')].FunctionName" --output text --region $awsRegion
+
+    if (-not $functionName) {
+        Write-Error "Could not find Lambda function. Has the CDK stack been deployed?"
+        exit 1
+    }
+
+    Write-Host "  Function: $functionName" -ForegroundColor Cyan
+
+    aws lambda update-function-code --function-name $functionName --image-uri "${ecrRepository}:latest" --region $awsRegion | Out-Null
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to update Lambda function"
+        exit 1
+    }
+
+    Write-Host "  Lambda updated successfully!" -ForegroundColor Green
+}
+
 Write-Host ""
 Write-Host "Deployment completed successfully!" -ForegroundColor Green
-Write-Host ""
-Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "  - Frontend is deployed via GitHub Actions to GitHub Pages"
-Write-Host "  - If Lambda URL changed, update LAMBDA_FUNCTION_URL in GitHub repo variables"
+
+if (-not $updateLambda) {
+    Write-Host ""
+    Write-Host "Tip: Use -updateLambda flag to update the Lambda function after pushing" -ForegroundColor DarkGray
+}

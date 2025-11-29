@@ -20,9 +20,9 @@ def get_model():
     global _model
     if _model is None:
         print("Initializing model...")
-        device = "cpu" if os.getenv("FORCE_CPU") else "cuda"
+        device = "cuda" if os.getenv("FORCE_CUDA") else "cpu"
         _model = ModelWrapper(device, mode="crunch")
-        model_path = os.getenv("TICTACDO_MODEL_PATH", "saved_models/model_latest.pth")
+        model_path = os.getenv("TICTACDO_MODEL_PATH", "saved_models/model_final.pth")
         _model.load_checkpoint(model_path)
         print("Model loaded successfully")
     return _model

@@ -23,7 +23,8 @@ ARG MODEL_PATH=saved_models/model_final.pth
 
 # Set environment variables
 ENV TICTACDO_MODEL_PATH=/var/task/models/model.pth
-ENV FORCE_CPU=1
+# CPU is now the default in play.py, no need for FORCE_CPU
+# Set FORCE_CUDA=1 if you want to use CUDA instead
 ENV CUDA_VISIBLE_DEVICES=""
 
 # Remove PyTorch test and development files

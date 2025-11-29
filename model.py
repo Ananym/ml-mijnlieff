@@ -25,56 +25,84 @@ class ResBlock(nn.Module):
         return F.relu(out)
 
 
+class SEResBlock(nn.Module):
+    """Residual block with Squeeze-and-Excitation attention for channel-wise feature recalibration"""
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+        # Squeeze-and-Excitation components
+        self.se_pool = nn.AdaptiveAvgPool2d(1)
+        self.se_fc1 = nn.Linear(channels, channels // reduction)
+        self.se_fc2 = nn.Linear(channels // reduction, channels)
+
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        # Squeeze-and-Excitation attention
+        b, c, _, _ = out.size()
+        se = self.se_pool(out).view(b, c)
+        se = F.relu(self.se_fc1(se))
+        se = torch.sigmoid(self.se_fc2(se)).view(b, c, 1, 1)
+        out = out * se
+
+        out += identity
+        return F.relu(out)
+
+
 class PolicyValueNet(nn.Module):
-    """Streamlined network for 4x4 grid game with movement constraints"""
+    """Large network for 4x4 grid game - Experiment 12: 10x scale with SE blocks"""
 
     def __init__(self):
         super().__init__()
         # input channels: 6 channels for board state
         in_channels = 6
-        # Experiment 8: Reverted to baseline (Exp 7 showed capacity wasn't bottleneck)
-        hidden_channels = 128  # ~1.2M params baseline
+        # Experiment 12: 10x scale-up (~12M params)
+        hidden_channels = 256  # 2x increase from 128
+        num_res_blocks = 8  # Up from 3
 
         # First convolution layer
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(hidden_channels)
 
-        # 3 residual blocks - RESTORED for better capacity
+        # 8 SE-Residual blocks for channel attention
         self.res_blocks = nn.ModuleList(
-            [
-                ResBlock(hidden_channels),
-                ResBlock(hidden_channels),
-                ResBlock(hidden_channels),
-            ]
+            [SEResBlock(hidden_channels) for _ in range(num_res_blocks)]
         )
 
-        # Policy head - RESTORED to original capacity
-        policy_channels = 64  # RESTORED from 32
+        # Policy head - expanded for larger model
+        policy_channels = 128  # Up from 64
         self.policy_conv = nn.Conv2d(hidden_channels, policy_channels, kernel_size=1)
         self.policy_bn = nn.BatchNorm2d(policy_channels)
         self.policy_out = nn.Conv2d(policy_channels, 4, kernel_size=1)  # 4 piece types
 
-        # Value head - RESTORED to original capacity
-        value_channels = 64  # RESTORED from 32
+        # Value head - expanded for larger model
+        value_channels = 128  # Up from 64
         self.value_conv = nn.Conv2d(hidden_channels, value_channels, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(value_channels)
 
         # Spatial features processing
-        # 64 channels on 4x4 board = 1024 features (was 512 with 32 channels)
-        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 256)  # INCREASED from 128
-        self.value_bn2 = nn.BatchNorm1d(256)  # UPDATED to match
+        # 128 channels on 4x4 board = 2048 features
+        self.value_fc1 = nn.Linear(value_channels * 4 * 4, 512)  # Up from 256
+        self.value_bn2 = nn.BatchNorm1d(512)
 
         # Flat features processing
-        flat_feature_size = 12  # assuming 12 flat features
-        self.flat_fc = nn.Linear(flat_feature_size, 64)  # INCREASED from 32
-        self.flat_bn = nn.BatchNorm1d(64)  # UPDATED to match
+        flat_feature_size = 12  # 12 flat features
+        self.flat_fc = nn.Linear(flat_feature_size, 128)  # Up from 64
+        self.flat_bn = nn.BatchNorm1d(128)
 
-        # Combined processing with restored capacity
-        self.value_fc2 = nn.Linear(256 + 64, 128)  # spatial + flat (INCREASED)
-        self.value_bn3 = nn.BatchNorm1d(128)  # UPDATED to match
-        self.value_fc3 = nn.Linear(128, 64)  # INCREASED from (64, 32)
-        self.value_bn4 = nn.BatchNorm1d(64)  # UPDATED to match
-        self.value_fc4 = nn.Linear(64, 1)  # INCREASED from (32, 1)
+        # Combined processing - expanded
+        self.value_fc2 = nn.Linear(512 + 128, 256)  # spatial + flat
+        self.value_bn3 = nn.BatchNorm1d(256)
+        self.value_fc3 = nn.Linear(256, 128)  # Up from (128, 64)
+        self.value_bn4 = nn.BatchNorm1d(128)
+        self.value_fc4 = nn.Linear(128, 1)
 
         # Apply initialization
         self._initialize_weights()
@@ -166,22 +194,22 @@ class ModelWrapper:
             return
 
         # Learning rate parameters
-        self.div_factor = 2.5  # Faster warmup (was 3)
-        self.final_div_factor = 4  # Less aggressive decay (was 5)
-        self.max_iterations = 50  # Keep synchronized with train.py MAX_ITERATIONS
+        self.div_factor = 2.5  # Faster warmup
+        self.final_div_factor = 4  # Less aggressive decay
+        self.max_iterations = 100  # Exp 12: Synchronized with train.py
 
-        # Learning rates - increased for smaller model
+        # Learning rates - Exp 12: Slightly lower for larger model stability
         if self.mode == "fast":
-            self.max_lr = 0.015  # Increased from 0.01
+            self.max_lr = 0.010  # Reduced from 0.015 for stability
         elif self.mode == "stable":
-            self.max_lr = 0.005  # Increased from 0.003 for faster convergence
+            self.max_lr = 0.003  # Reduced from 0.005 for 12M param model
 
-        # Optimizer parameters
-        weight_decay = 2e-5  # Reduced from 3e-5 for smaller model
+        # Optimizer parameters - Exp 12: Adjusted for larger model
+        weight_decay = 3e-5  # Increased from 2e-5 for larger model
         betas = (
             0.9,
             0.999,
-        )  # Standard betas - more stable for smaller model
+        )  # Standard betas
 
         # AdamW optimizer with tuned parameters
         self.optimizer = torch.optim.AdamW(

@@ -15,7 +15,7 @@ from opponents import RandomOpponent, StrategicOpponent
 from mcts import MCTS as SerialMCTS, add_dirichlet_noise
 import math
 from collections import defaultdict
-from eval_model import policy_vs_mcts_eval
+from eval_model import policy_vs_mcts_eval, extended_evaluation
 import torch.nn.functional as F
 
 # Simple trace logger stub (original mcts_trace_logger.py was removed)
@@ -62,7 +62,7 @@ DEFAULT_BATCH_SIZE = 256
 DEFAULT_SAVE_INTERVAL = 5
 DEFAULT_NUM_CHECKPOINTS = 5
 DEFAULT_MCTS_RATIO = 1.0
-DEFAULT_BUFFER_SIZE = 6000
+DEFAULT_BUFFER_SIZE = 8000  # Exp 12: Increased for larger model
 DEFAULT_POLICY_WEIGHT = 0.2  # Balanced - 80% value, 20% policy (was 0.05, too extreme)
 DEFAULT_NUM_EPOCHS = 20
 DEFAULT_EVAL_INTERVAL = 10
@@ -81,10 +81,8 @@ EARLY_STOPPING_MIN_WINRATE = (
 
 BALANCE_REPLAY_BUFFER = False  # REVERTED to Exp 1 baseline - natural distribution
 
-# Dirichlet noise - Experiment 11: Plateau Curriculum
-DIRICHLET_PHASE_1_2 = 0.25  # Constant moderate exploration during specialization & plateau
-DIRICHLET_PHASE_3_START = 0.25  # Starting noise for generalization phase
-DIRICHLET_PHASE_3_END = 0.30  # Ending noise for generalization phase (higher exploration)
+# Dirichlet noise - Experiment 12: Pure Self-Play (constant high exploration)
+DIRICHLET_SCALE = 0.30  # Constant exploration throughout - higher for pure self-play diversity
 
 ENTROPY_BONUS_SCALE = 0.07  # Encourage policy diversity for human play
 
@@ -99,32 +97,21 @@ def get_mcts_class(device):
 
 def get_dirichlet_scale(iteration):
     """
-    Calculate adaptive Dirichlet noise scale - Experiment 11: Plateau Curriculum
-    - Phase 1 (1 -> 40): 0.25 (constant moderate exploration during fast specialization)
-    - Phase 2 (40 -> 60): 0.25 (constant during plateau)
-    - Phase 3 (60 -> 100): 0.25 -> 0.30 (gradually increase during generalization)
+    Experiment 12: Pure Self-Play - constant high exploration
+    Returns constant 0.30 throughout training for diversity without opponent curriculum.
     """
-    PHASE_1_END = 40
-    PHASE_2_END = 60
-
-    if iteration <= PHASE_2_END:
-        # Phases 1 & 2: Constant moderate noise
-        return DIRICHLET_PHASE_1_2
-    else:
-        # Phase 3: Gradually increase noise for generalization
-        progress = (iteration - PHASE_2_END) / (MAX_ITERATIONS - PHASE_2_END)
-        return DIRICHLET_PHASE_3_START + progress * (DIRICHLET_PHASE_3_END - DIRICHLET_PHASE_3_START)
+    return DIRICHLET_SCALE
 
 
-INITIAL_RANDOM_OPPONENT_RATIO = 0.0  # Keep disabled
+# Experiment 12: PURE SELF-PLAY - No strategic opponent, only model vs model
+INITIAL_RANDOM_OPPONENT_RATIO = 0.0
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
 
-# Experiment 11: PLATEAU CURRICULUM - Fast specialization, plateau, then generalization
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.40  # Start with balanced play
-PEAK_STRATEGIC_OPPONENT_RATIO = 0.85  # Peak specialization (higher than Exp 10)
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.40  # Return to balanced play for generalization
-PHASE_1_END = 40  # Fast ramp to peak
-PHASE_2_END = 60  # Plateau at peak
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.0  # Pure self-play
+PEAK_STRATEGIC_OPPONENT_RATIO = 0.0  # No strategic opponent
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.0  # 100% self-play throughout
+PHASE_1_END = 40  # Not used in pure self-play
+PHASE_2_END = 60  # Not used in pure self-play
 OPPONENT_TRANSITION_ITERATIONS = 100  # Total iterations
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
@@ -1420,14 +1407,13 @@ def training_loop(
 
             # Run evaluation every DEFAULT_EVAL_INTERVAL iterations
             if iteration % DEFAULT_EVAL_INTERVAL == 0:
-                eval_results = policy_vs_mcts_eval(
+                # Exp 12: Use extended evaluation for pure self-play training
+                eval_results = extended_evaluation(
                     model,
                     rng,
                     iteration=iteration,
-                    num_games=DEFAULT_EVAL_GAMES,
-                    strategic_games=DEFAULT_STRATEGIC_EVAL_GAMES,
+                    num_games=DEFAULT_EVAL_GAMES // 2,  # Split across 5 eval types
                     mcts_simulations=DEFAULT_MAX_MCTS_SIMS,
-                    debug=False,
                 )
 
                 # Early stopping check

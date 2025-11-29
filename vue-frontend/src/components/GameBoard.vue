@@ -137,7 +137,7 @@ export default {
 <style scoped>
 .game-board {
   display: flex;
-  border: 2px solid #333;
+  border: 2px solid var(--board-border);
   /* flex-direction: column; */
 }
 
@@ -154,7 +154,7 @@ export default {
 .board-cell {
   width: 60px;
   height: 60px;
-  border: 1px solid #ccc;
+  border: 1px solid var(--cell-border);
   display: flex;
   justify-content: center;
   align-items: center;
@@ -162,54 +162,27 @@ export default {
   background-color: white;
 }
 
+.board-piece {
+  color: var(--piece-color);
+}
+
 .human-player {
-  background-color: #ccccff; /* Blue */
+  background-color: var(--human-color);
 }
 
 .ai-player {
-  background-color: #ffcccc; /* Red */
+  background-color: var(--ai-color);
 }
 
 .valid-move {
-  background-color: #ccffcc;
+  background-color: var(--valid-move-color);
 }
 
 .ai-valid-move {
-  background-color: #fffecc;
+  background-color: var(--ai-valid-move-color);
 }
 
 .last-ai-move {
   box-shadow: inset 0 0 10px #ff0000;
-}
-
-@media (prefers-color-scheme: dark) {
-  .board-cell {
-    background-color: white;
-    border-color: black;
-  }
-
-  .game-board {
-    border-color: black;
-  }
-
-  .board-piece {
-    color: black;
-  }
-
-  .human-player {
-    background-color: #8080ff;
-  }
-
-  .ai-player {
-    background-color: #ff8080;
-  }
-
-  .valid-move {
-    background-color: #80ff80;
-  }
-
-  .ai-valid-move {
-    background-color: #ffff80;
-  }
 }
 </style>

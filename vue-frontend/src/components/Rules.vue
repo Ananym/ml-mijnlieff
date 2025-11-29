@@ -50,6 +50,11 @@
           <li>A line of four: 2 points</li>
         </ul>
         <p>The player with the most points wins. Draws are possible.</p>
+        <h3>Notes:</h3>
+        <p>
+          This game generally favours player two, as the ideal player two opening is very hard to
+          beat even for the grandmaster AI!
+        </p>
       </div>
       <button @click="closeModal" class="close-button">Close</button>
     </div>

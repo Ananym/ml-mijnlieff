@@ -20,12 +20,15 @@
         <component :is="getPieceIcon(type)" />
       </div>
       <div class="count-container">
-        <span class="count human">{{
-          pieceCounts[isHumanFirst ? Players.ONE : Players.TWO][type]
-        }}</span>
-        <span class="count ai">{{
-          pieceCounts[isHumanFirst ? Players.TWO : Players.ONE][type]
-        }}</span>
+        <span class="piece-name">{{ getPieceName(type) }}</span>
+        <div class="counts">
+          <span class="count human">{{
+            pieceCounts[isHumanFirst ? Players.ONE : Players.TWO][type]
+          }}</span>
+          <span class="count ai">{{
+            pieceCounts[isHumanFirst ? Players.TWO : Players.ONE][type]
+          }}</span>
+        </div>
       </div>
     </div>
   </div>
@@ -84,6 +87,21 @@ export default {
       }
     };
 
+    const getPieceName = (pieceType: PieceType) => {
+      switch (pieceType) {
+        case PieceTypes.DIAG:
+          return 'Diag';
+        case PieceTypes.ORTHO:
+          return 'Ortho';
+        case PieceTypes.NEAR:
+          return 'Near';
+        case PieceTypes.FAR:
+          return 'Far';
+        default:
+          return '';
+      }
+    };
+
     const selectPiece = (type: PieceType) => {
       if (
         !props.disabled &&
@@ -139,6 +157,7 @@ export default {
 
     return {
       getPieceIcon,
+      getPieceName,
       selectPiece,
       handleScroll,
       handleKeyDown,
@@ -198,7 +217,18 @@ export default {
 
 .count-container {
   display: flex;
+  flex-direction: column;
+  align-items: center;
   margin-left: 10px;
+}
+
+.piece-name {
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+
+.counts {
+  display: flex;
 }
 
 .count {
@@ -210,20 +240,10 @@ export default {
 }
 
 .human {
-  background-color: #ccccff;
+  background-color: var(--human-color);
 }
 
 .ai {
-  background-color: #ffcccc;
-}
-
-@media (prefers-color-scheme: dark) {
-  .human {
-    background-color: #8080ff;
-  }
-
-  .ai {
-    background-color: #ff8080;
-  }
+  background-color: var(--ai-color);
 }
 </style>

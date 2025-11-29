@@ -1,6 +1,17 @@
 <template>
   <div id="app">
-    <h1>ML Mijnlieff</h1>
+    <div class="title-row">
+      <h1><GameLogo class="title-logo" /> ML Mijnlieff</h1>
+      <button class="theme-toggle" @click="toggleTheme" :title="isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'">
+        <svg v-if="isDarkMode" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="5"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+    </div>
     <template v-if="!gameStarted">
       <p class="intro-text">Play against an ML-powered opponent</p>
       <p class="designer-credit">
@@ -20,9 +31,13 @@
           {{ diff.name }}
         </button>
       </div>
-      <h2>Choose your player:</h2>
-      <button @click="startGame(true)">Go First</button>
-      <button @click="startGame(false)">Go Second</button>
+      <p class="difficulty-note">Lower difficulties use top-k sampling from the policy network (k=1 for Grandmaster, k=2-6 for Beginner)</p>
+      <h2>Start Game:</h2>
+      <div v-if="pendingGameStart !== null" class="lambda-startup">
+        Waking up Lambda... (this may take a few seconds)
+      </div>
+      <button @click="startGame(true)" :disabled="pendingGameStart !== null">Go First</button>
+      <button @click="startGame(false)" :disabled="pendingGameStart !== null">Go Second</button>
     </template>
     <template v-else>
       <div class="game-container" v-if="gameState !== null">
@@ -48,13 +63,16 @@
       <div class="game-controls">
         <button @click="restartGame" :disabled="isAIThinking">Restart Game</button>
         <button @click="showRules" :disabled="isAIThinking">Rules</button>
-        <div v-show="isAIThinking" :class="{ hidden: !isAIThinking }">AI is thinking...</div>
         <!-- <div>
           Current player is
           {{ gameState.currentPlayer === Player.ONE ? 'Player One' : 'Player Two' }}
         </div> -->
       </div>
-      <div v-if="prediction !== null && !gameOver">AI victory prediction: {{ prediction }}</div>
+      <div v-if="isAIThinking" class="prediction">AI is thinking...</div>
+      <div v-else-if="prediction !== null && !gameOver" class="prediction">
+        AI victory prediction: {{ prediction }}
+        <div class="prediction-hint">(0 = AI losing, 1 = even, 2 = AI winning)</div>
+      </div>
       <div v-if="gameOver">
         <h2>Game Over! {{ winnerProclamation }}</h2>
         <p>Human Score: {{ scores.HUMAN }}</p>
@@ -70,6 +88,7 @@ import { ref, computed, Ref } from 'vue';
 import GameBoard from './components/GameBoard.vue';
 import PieceSupplySelector from './components/PieceSupplySelector.vue';
 import Rules from './components/Rules.vue';
+import GameLogo from './components/icons/GameLogo.vue';
 import {
   initializeGameState,
   makeMove,
@@ -99,6 +118,7 @@ export default {
     GameBoard,
     PieceSupplySelector,
     Rules,
+    GameLogo,
   },
   setup() {
     const gameStarted = ref(false);
@@ -114,8 +134,30 @@ export default {
     const selectedDifficulty: Ref<number> = ref(0); // Default to hardest
     const difficulties = DIFFICULTY_SETTINGS;
     const apiError: Ref<string | null> = ref(null);
+    const pingInProgress: Ref<boolean> = ref(true);
+    const pendingGameStart: Ref<boolean | null> = ref(null); // null = not waiting, true/false = humanFirst value
+    const theme: Ref<'light' | 'dark' | 'system'> = ref('system');
 
     const useRandomDummy = false;
+
+    const toggleTheme = () => {
+      const isDark =
+        theme.value === 'dark' ||
+        (theme.value === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      theme.value = isDark ? 'light' : 'dark';
+      if (theme.value === 'system') {
+        document.documentElement.removeAttribute('data-theme');
+      } else {
+        document.documentElement.setAttribute('data-theme', theme.value);
+      }
+    };
+
+    const isDarkMode = computed(() => {
+      if (theme.value === 'system') {
+        return window.matchMedia('(prefers-color-scheme: dark)').matches;
+      }
+      return theme.value === 'dark';
+    });
 
     const sortedDifficulties = computed(() => {
       return Object.entries(difficulties)
@@ -140,6 +182,7 @@ export default {
     });
 
     const pingApi = async () => {
+      pingInProgress.value = true;
       try {
         const response = await fetch(`${import.meta.env.VITE_API_ENDPOINT}/ping`, {
           method: 'GET',
@@ -151,21 +194,35 @@ export default {
       } catch (error) {
         apiError.value = 'AI service unavailable. Please try again later.';
         console.error('API ping failed:', error);
+      } finally {
+        pingInProgress.value = false;
+        // If user was waiting to start game, start it now
+        if (pendingGameStart.value !== null) {
+          const humanFirst = pendingGameStart.value;
+          pendingGameStart.value = null;
+          actuallyStartGame(humanFirst);
+        }
       }
     };
 
-    const startGame = async (humanFirst: boolean) => {
-      // Start ping check but don't wait for it
-      pingApi();
-
+    const actuallyStartGame = (humanFirst: boolean) => {
       gameStarted.value = true;
       isHumanFirst.value = humanFirst;
-      const aiPlayer = humanFirst ? Players.TWO : Players.ONE;
       gameState.value = initializeGameState(GameTypes.AI_VS_HUMAN);
       if (!humanFirst) {
         playAiTurn();
         // this is the first turn so passing and winning are impossible
       }
+    };
+
+    const startGame = async (humanFirst: boolean) => {
+      // If ping is still in progress, wait for it
+      if (pingInProgress.value) {
+        pendingGameStart.value = humanFirst;
+        return;
+      }
+      // Ping is done, start immediately
+      actuallyStartGame(humanFirst);
     };
 
     const selectPiece = (pieceType: PieceType) => {
@@ -361,6 +418,10 @@ export default {
       selectDifficulty,
       sortedDifficulties,
       apiError,
+      pingInProgress,
+      pendingGameStart,
+      toggleTheme,
+      isDarkMode,
     };
   },
 };
@@ -399,6 +460,36 @@ export default {
   }
 }
 
+:root[data-theme="dark"] {
+  --bg-color: #242424;
+  --text-color: #e0e0e0;
+  --link-color: #6abf6e;
+  --link-hover-color: #7ccf80;
+  --button-bg: #2d2d2d;
+  --button-border: #404040;
+  --button-hover-bg: #3d3d3d;
+  --button-selected-bg: #4caf50;
+  --button-selected-color: #ffffff;
+  --button-selected-border: #45a049;
+  --button-selected-hover: #45a049;
+  --button-disabled-opacity: 0.4;
+}
+
+:root[data-theme="light"] {
+  --bg-color: #ffffff;
+  --text-color: #333333;
+  --link-color: #4caf50;
+  --link-hover-color: #45a049;
+  --button-bg: #f0f0f0;
+  --button-border: #ddd;
+  --button-hover-bg: #e0e0e0;
+  --button-selected-bg: #4caf50;
+  --button-selected-color: white;
+  --button-selected-border: #45a049;
+  --button-selected-hover: #45a049;
+  --button-disabled-opacity: 0.6;
+}
+
 html,
 body {
   margin: 0;
@@ -413,6 +504,37 @@ body {
   color: var(--text-color);
   min-height: 100vh;
   background-color: transparent;
+}
+
+.title-row {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 15px;
+}
+
+.theme-toggle {
+  padding: 6px;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--text-color);
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.theme-toggle:hover {
+  opacity: 1;
+}
+
+.title-logo {
+  width: 52px;
+  height: 52px;
+  position: relative;
+  top: -6px;
 }
 
 .intro-text {
@@ -507,5 +629,28 @@ button:disabled {
   padding: 10px;
   background-color: rgba(255, 68, 68, 0.1);
   border-radius: 5px;
+}
+
+.lambda-startup {
+  color: var(--link-color);
+  margin: 10px 0;
+  font-style: italic;
+}
+
+.difficulty-note {
+  font-size: 0.85em;
+  color: var(--hint-color);
+  margin: 5px 0 15px;
+  font-style: italic;
+}
+
+.prediction {
+  margin: 10px 0;
+}
+
+.prediction-hint {
+  font-size: 0.85em;
+  color: var(--hint-color);
+  margin-left: 5px;
 }
 </style>

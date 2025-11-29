@@ -41,7 +41,7 @@ jobs:
         working-directory: vue-frontend
         env:
           VITE_API_ENDPOINT: ${{ vars.LAMBDA_FUNCTION_URL }}
-          VITE_BASE_URL: /${{ github.event.repository.name }}/
+          VITE_BASE_URL: ${{ vars.VITE_BASE_URL || '/' }}
         run: npm run build
 
       - name: Setup Pages

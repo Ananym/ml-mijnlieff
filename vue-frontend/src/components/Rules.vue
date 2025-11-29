@@ -43,7 +43,7 @@
           no restrictions.
         </p>
         <p>The game ends when a player starts their turn with zero pieces remaining.</p>
-        <p>An opponent can make one last move after a player plays their final piece.</p>
+        <p>An opponent can make one last move after a player plays their final piece, but this will be prevented if they are forced to pass, and the game will end.</p>
         <h3>Scoring:</h3>
         <ul>
           <li>A line of three: 1 point</li>

@@ -154,22 +154,10 @@ export function makeMove(gameState: GameState, move: Move): TurnResult {
   const oppMustPass = !currentPlayerHasValidMoves(gameState);
 
   if (oppMustPass && !selfHasPieces) {
-    // Both players would need to pass with current restrictions.
-    // But after a pass, restrictions are cleared (lastMove = null).
-    // Check if opponent could move with no restrictions (i.e., after passing).
-    const hasEmptyCell = gameState.board.some((col) =>
-      col.some((cell) => cell[0] === 0 && cell[1] === 0)
-    );
-
-    if (oppHasPieces && hasEmptyCell) {
-      // Opponent has pieces and there are empty cells.
-      // After the pass chain clears restrictions, opponent can move.
-      console.log('Opponent must pass, but can move after restrictions clear');
-      return TurnResults.OPP_MUST_PASS;
-    }
-
+    // Self just placed their last piece and opponent can't respond due to restrictions.
+    // Per game rules: opponent forfeits their one chance to respond, game ends.
     console.log(
-      'Game over because opponent has zero valid moves and current player has zero pieces (and no moves possible after pass)'
+      'Game over because opponent must pass and current player has no pieces left'
     );
     return TurnResults.GAME_OVER;
   } else if (!oppHasPieces) {

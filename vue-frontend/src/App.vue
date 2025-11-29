@@ -31,7 +31,7 @@
           {{ diff.name }}
         </button>
       </div>
-      <p class="difficulty-note">Lower difficulties use top-k sampling from the policy network (k=1 for Grandmaster, k=2-6 for Beginner)</p>
+      <p class="difficulty-note">Lower difficulties use top-k sampling from the policy head (k=1 for Grandmaster, k=2-6 for Beginner)</p>
       <h2>Start Game:</h2>
       <div v-if="pendingGameStart !== null" class="lambda-startup">
         Waking up Lambda... (this may take a few seconds)
@@ -109,7 +109,6 @@ import {
   getDebugStringRepresentation,
   moveToString,
   passTurn,
-  currentPlayerHasValidMoves,
   DIFFICULTY_SETTINGS,
 } from './gameLogic';
 
@@ -307,16 +306,9 @@ export default {
           endGame();
           break;
         case TurnResults.OPP_MUST_PASS:
-          // AI must pass due to movement restrictions
+          // AI must pass due to movement restrictions, human gets another turn
           lastAIMove.value = null;
           passTurn(gameState.value);
-          // After AI passes, it's human's turn with no restrictions.
-          // But if human also can't move (no pieces), pass back to AI.
-          if (!currentPlayerHasValidMoves(gameState.value)) {
-            console.log('Human also cannot move after AI pass, passing back to AI');
-            passTurn(gameState.value);
-            await playAiTurn();
-          }
           break;
       }
     };
@@ -326,15 +318,10 @@ export default {
       if (gameState.value === null) {
         return;
       }
-      // IN THEORY this is never called while game would be over
-      // IN THEORY impossible to have no valid moves at start of turn
 
       while (true) {
         isAIThinking.value = true;
         let move: Move;
-        // console.log(`Getting AI move...`);
-
-        // console.log(JSON.stringify(gameState.value.pieceCounts));
 
         if (useRandomDummy) {
           const validMoves = getValidMoves(gameState.value);

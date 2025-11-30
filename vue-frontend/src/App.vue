@@ -72,6 +72,7 @@
       <div v-else-if="prediction !== null && !gameOver" class="prediction">
         AI victory prediction: {{ prediction }}
         <div class="prediction-hint">(0 = AI losing, 1 = even, 2 = AI winning)</div>
+        <div v-if="moveTimeMs !== null" class="move-time">Computed in {{ moveTimeMs }}ms</div>
       </div>
       <div v-if="gameOver">
         <h2>Game Over! {{ winnerProclamation }}</h2>
@@ -130,6 +131,7 @@ export default {
     const isHumanFirst: Ref<boolean> = ref(true);
     const lastAIMove: Ref<Move | null> = ref(null);
     const prediction: Ref<number | null> = ref(null);
+    const moveTimeMs: Ref<number | null> = ref(null);
     const rulesVisible: Ref<boolean> = ref(false);
     const selectedDifficulty: Ref<number> = ref(0); // Default to hardest
     const difficulties = DIFFICULTY_SETTINGS;
@@ -273,8 +275,9 @@ export default {
       if (gameState.value === null) {
         return;
       }
-      // Clear the prediction when human makes a move
+      // Clear the prediction and move time when human makes a move
       prediction.value = null;
+      moveTimeMs.value = null;
       let turnResult;
       const move = { x, y, pieceType: selectedPieceType.value };
       try {
@@ -344,6 +347,7 @@ export default {
           }
           const data = await response.json();
           prediction.value = Number(data.aiWinProbability.toPrecision(3));
+          moveTimeMs.value = data.moveTimeMs || null;
           move = data;
         }
 
@@ -377,6 +381,7 @@ export default {
       isAIThinking.value = false;
       lastAIMove.value = null;
       prediction.value = null;
+      moveTimeMs.value = null;
     };
 
     const selectDifficulty = (level: number) => {
@@ -415,6 +420,7 @@ export default {
       pendingGameStart,
       toggleTheme,
       isDarkMode,
+      moveTimeMs,
     };
   },
 };
@@ -645,5 +651,12 @@ button:disabled {
   font-size: 0.85em;
   color: var(--hint-color);
   margin-left: 5px;
+}
+
+.move-time {
+  font-size: 0.8em;
+  color: var(--hint-color);
+  margin-top: 4px;
+  opacity: 0.7;
 }
 </style>

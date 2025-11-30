@@ -10,21 +10,32 @@ print(f"Torch import took {time.time() - start_time:.2f} seconds")
 from game import GameState, Move, Player, PieceType, print_full_legal_moves
 import random
 from model import ModelWrapper
+from mcts import MCTS
 
 # Global model instance
 _model = None
+_model_path = None
+
+# MCTS simulation count from env var, default 25
+MCTS_SIMS = int(os.getenv("MCTS_SIMS", "25"))
+
+
+def set_model_path(path):
+    """Set the model path before initializing"""
+    global _model_path
+    _model_path = path
 
 
 def get_model():
     """Get or initialize the model singleton"""
-    global _model
+    global _model, _model_path
     if _model is None:
         print("Initializing model...")
         device = "cuda" if os.getenv("FORCE_CUDA") else "cpu"
         _model = ModelWrapper(device, mode="crunch")
-        model_path = os.getenv("TICTACDO_MODEL_PATH", "saved_models/model_final.pth")
+        model_path = _model_path or os.getenv("TICTACDO_MODEL_PATH", "saved_models/model_final.pth")
         _model.load_checkpoint(model_path)
-        print("Model loaded successfully")
+        print(f"Model loaded: {model_path}")
     return _model
 
 
@@ -71,6 +82,9 @@ def convert_frontend_state_to_game_state(frontend_state):
 
 
 def get_ai_move_logic(frontend_state):
+    # Start timing
+    move_start_time = time.time()
+
     # Get difficulty from request, default to hardest (0)
     difficulty = frontend_state.get("difficulty", 0)
 
@@ -82,21 +96,24 @@ def get_ai_move_logic(frontend_state):
 
     print(f"Current player: {game_state.current_player}")
     print(f"Difficulty: {ModelWrapper.DIFFICULTY_SETTINGS[difficulty]['name']}")
+    print(f"MCTS sims: {MCTS_SIMS}")
     print_full_legal_moves(legal_moves)
 
-    # Get move probabilities from policy network with difficulty
-    state_rep = game_state.get_game_state_representation()
     model = get_model()  # Get the singleton model instance
-    policy, _ = model.predict(
-        state_rep.board, state_rep.flat_values, legal_moves, difficulty=difficulty
-    )
 
-    # Remove batch dimension and get best move
-    policy = policy.squeeze(0)
-
-    # Convert policy to numpy array if it's a tensor
-    if isinstance(policy, torch.Tensor):
-        policy = policy.detach().cpu().numpy()
+    if MCTS_SIMS > 0:
+        # Use MCTS for move selection
+        mcts = MCTS(model=model, num_simulations=MCTS_SIMS, c_puct=1.0, dirichlet_scale=0.0)
+        policy, _ = mcts.search(game_state)
+    else:
+        # Raw policy only
+        state_rep = game_state.get_game_state_representation()
+        policy, _ = model.predict(
+            state_rep.board, state_rep.flat_values, legal_moves, difficulty=difficulty
+        )
+        policy = policy.squeeze(0)
+        if isinstance(policy, torch.Tensor):
+            policy = policy.detach().cpu().numpy()
 
     # Find the best move coordinates
     try:
@@ -132,9 +149,14 @@ def get_ai_move_logic(frontend_state):
     # Opponent's value is from their perspective, so we invert it for AI's perspective
     ai_win_probability = 1.0 - float(opponent_value.squeeze())
 
+    # Calculate total move time
+    move_time_ms = int((time.time() - move_start_time) * 1000)
+    print(f"Move selection took {move_time_ms}ms")
+
     return {
         "x": int(move.x),
         "y": int(move.y),
         "pieceType": int(move.piece_type.value) + 1,
         "aiWinProbability": ai_win_probability,
+        "moveTimeMs": move_time_ms,
     }

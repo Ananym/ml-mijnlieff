@@ -45,6 +45,8 @@ r = (n*Σxy - Σx*Σy) / (sqrt(n*Σx² - (Σx)²) * sqrt(n*Σy² - (Σy)²))
 | **9** | 800-1600 | ❌ | 0.0 | **40%→85% (100 iter)** | 0.2 | 75% (iter 70) → 59.5% (iter 100) | 0.433 | 11h51m | ⚠️ Late-stage decline |
 | **10** | 800-1600 | ❌ | 0.0 | **40%→80%→50% (Inverted V)** | 0.2 | 65% (iter 60) → 62.5% (iter 100) | 0.356 | 11h34m | ✗ Never reached peak |
 | **11** | 800-1600 | ❌ | 0.0 | **40%→85%→40% (Plateau)** | 0.2 | 65% (iter 40) → **72.5%** (iter 100) | 0.388 | 11h54m | ✓ **Late improvement!** |
+| **12** | 800-1600 | ❌ | 0.0 | 0% (pure self-play) | 0.2 | 67.5% (iter 10) → ~45% avg | - | 17h | ✗ Unstable (10.8M model) |
+| **13** | 800-1600 | ❌ | 0.0 | **40%→85%→40% (Plateau)** | 0.2 | 70% (iter 80) → 65% (iter 100) | - | 17h12m | ✗ **Overfit to Strategic** |
 
 ---
 
@@ -630,9 +632,106 @@ Three-phase plateau curriculum: Fast specialization (40%→85% over 40 iter) →
 
 ---
 
+## Experiment 13 - Large Model + Plateau Curriculum (FAILED - Worse Play Quality)
+
+**Hypothesis:**
+Combine the 10x larger model from Exp 12 (10.8M params) with the successful plateau curriculum from Exp 11 to get both capacity AND good training dynamics.
+
+**Configuration:**
+- MCTS: 800-1600 simulations
+- **Model: 10,848,517 parameters** (SE-ResNet from Exp 12)
+  - 256 hidden channels
+  - 8 SE-ResBlocks with squeeze-and-excitation
+- **Learning rate: 0.002** (reduced from 0.003 for stability)
+- Buffer balancing: Disabled
+- Bootstrap: 0.0
+- **Strategic curriculum: 40%→85%→40% (Plateau, same as Exp 11)**
+  - Phase 1 (Iter 1-40): 40% → 85% Strategic
+  - Phase 2 (Iter 40-60): 85% Strategic (plateau)
+  - Phase 3 (Iter 60-100): 85% → 40% Strategic
+- Dirichlet noise: 0.25 base, increasing to 0.30 in Phase 3
+- Policy weight: 0.2 adaptive
+
+**Results - Strategic Win Rate Progression:**
+| Iter | Time | vs Strategic | Self-Play P1 | MCTS Contribution |
+|------|------|--------------|--------------|-------------------|
+| 10 | 2h 2m | 57.5% | 55% | P1:55% P2:10% |
+| 20 | 3h 43m | 52.5% | 25% | P1:35% P2:15% |
+| 30 | 5h 26m | 42.5% | 40% | P1:50% P2:40% |
+| 40 | 7h 0m | 57.5% | 40% | P1:100% P2:30% |
+| 50 | 8h 27m | 52.5% | 35% | P1:55% P2:30% |
+| 60 | 9h 53m | 60.0% | 0% | P1:10% P2:85% |
+| 70 | 11h 30m | 55.0% | 15% | P1:20% P2:10% |
+| **80** | 13h 11m | **70.0%** | 0% | P1:0% P2:25% |
+| 90 | 15h 8m | 60.0% | 0% | P1:5% P2:20% |
+| 100 | 17h 12m | 65.0% | 0% | P1:0% P2:5% |
+
+**Final Metrics (Iter 100):**
+- Strategic win rate: 65.0% (75% as P1, 55% as P2)
+- Value loss: 0.188 (very low)
+- Policy loss: 1.20
+- Training time: 17h 12m
+
+**Critical Finding - METRICS LIE:**
+**Despite achieving 70% peak and 65% final vs Strategic, the model plays MUCH WORSE against humans than Exp 12!**
+
+User feedback: "This one feels a lot stupider to play against than our previous entirely-self-play attempt... it's much much easier to beat than 12."
+
+**Why It Failed (Despite Good Strategic Win Rate):**
+
+1. **Self-play collapsed to 0% P1 wins**
+   - By iter 60, self-play showed 0% P1 wins (complete P2 dominance)
+   - Model learned heavily biased strategies that only work from one side
+   - Indicates degenerate, exploitable patterns
+
+2. **MCTS contribution dropped to ~0%**
+   - By iter 100, MCTS provided almost no improvement over raw policy
+   - Policy became overconfident in bad strategies
+   - No diversity in move selection
+
+3. **Overfit to Strategic opponent specifically**
+   - 85% Strategic exposure during plateau phase (iter 40-60) caused narrow specialization
+   - Model learned to beat Strategic's specific patterns, not general good play
+   - Strategic win rate ≠ actual playing strength
+
+4. **Large model amplified overfitting**
+   - 10.8M parameters = more capacity to memorize Strategic's patterns
+   - Without diverse training signal, capacity becomes a liability
+   - Smaller models (1.2M) may generalize better
+
+**Comparison to Exp 11 & 12:**
+
+| Metric | Exp 11 (1.2M) | Exp 12 (10.8M) | Exp 13 (10.8M) |
+|--------|---------------|----------------|----------------|
+| Curriculum | Plateau | Pure self-play | Plateau |
+| Peak Strategic | 70% @ 80 | 67.5% @ 10 | 70% @ 80 |
+| Final Strategic | 72.5% | ~45% | 65% |
+| Human play quality | Good | Unstable but creative | **Stupid, easily beaten** |
+| Self-play balance | Healthy | Varied | **Collapsed (0% P1)** |
+| Training time | 12h | 17h | 17h |
+
+**Key Insight - Strategic Win Rate Is a Bad Metric:**
+- Exp 13 achieved similar Strategic win rate to Exp 11 (65% vs 72.5%)
+- But plays MUCH worse against humans
+- Strategic opponent is too predictable - model overfit to its patterns
+- Need a metric that measures general playing strength, not opponent-specific performance
+
+**Lessons Learned:**
+1. ✗ **Large model + plateau curriculum doesn't combine well** - amplifies overfitting
+2. ✗ **Self-play collapse is a critical warning sign** - indicates degenerate strategies
+3. ✗ **Strategic win rate doesn't predict human play quality** - can overfit to one opponent
+4. ✗ **MCTS contribution near 0% indicates overconfident policy** - bad sign
+5. 💡 **Smaller models may generalize better** - capacity without diversity = overfitting
+6. 💡 **Need diverse opponents during training** - Strategic alone is insufficient
+7. 💡 **Need better evaluation metrics** - Strategic win rate is misleading
+
+**Status**: **FAILED - Good metrics, bad actual play quality**
+
+---
+
 ## Conclusion
 
-After 11 comprehensive experiments:
+After 13 comprehensive experiments:
 1. **Best Peak**: 75% Strategic win rate (Exp 9 at iter 70) ✓ **TARGET MET**
 2. **Best Stable**: 72.5% Strategic win rate (Exp 8 @ iter 50, Exp 11 @ iter 100) ✓
 3. **Discovered**:
@@ -642,23 +741,31 @@ After 11 comprehensive experiments:
    - Late-stage overfitting from monotonic curriculum (Exp 9)
    - Inverted V curriculum failed to reach peak (Exp 10)
    - **Generalization phase can IMPROVE performance** (Exp 11) ✓✓
+   - **Strategic win rate is a misleading metric** (Exp 13) - can overfit to one opponent
+   - **Large models amplify overfitting** (Exp 12, 13) - capacity without diversity = worse play
 4. **Learned**:
    - Build general skills (self-play) BEFORE specializing (Strategic opponent) ✓
    - Extended training can backfire WITHOUT generalization (Exp 9)
    - **Curriculum reversal WORKS when aggressive enough** (85%→40% in Exp 11)
    - **Self-play is critical for finding optimal strategies** - Strategic alone isn't enough
    - Higher exploration (Dirichlet 0.30) enables discovery of better moves
+   - **Self-play collapse (0% P1 wins) indicates degenerate strategies** (Exp 13)
+   - **MCTS contribution near 0% = overconfident bad policy** (Exp 13)
+   - **Smaller models (1.2M) may generalize better than large models (10.8M)**
 5. **Status**: **75% achieved (Exp 9 iter 70, unstable) | 72.5% achieved (Exp 8 & 11, stable)**
 
 **Best Models**:
-1. **Experiment 9, Iteration 70** - 75% Strategic (peak, use with early stopping)
-2. **Experiment 11, Iteration 100** - 72.5% Strategic (stable, better generalization)
-3. **Experiment 8, Iteration 50** - 72.5% Strategic (stable baseline, faster training)
+1. **Experiment 11, Iteration 100** - 72.5% Strategic (stable, best generalization, good human play)
+2. **Experiment 8, Iteration 50** - 72.5% Strategic (stable baseline, faster training)
+3. **Experiment 9, Iteration 70** - 75% Strategic (peak, use with early stopping)
 
 **Recommended Model**: **Experiment 11** - 72.5% Strategic with proven generalization
 - Same performance as Exp 8 but with explicit generalization phase
 - More training data (100 iter vs 50 iter)
 - Better equipped for diverse opponents (human play)
+- **Smaller model (1.2M) generalizes better than 10.8M models**
+
+**Warning**: Large models (Exp 12, 13) achieved decent Strategic win rates but played WORSE against humans. Strategic win rate alone is insufficient for evaluating actual playing strength.
 
 ---
 
@@ -676,6 +783,8 @@ Exp 8:  72.5% - Inverted curriculum (40%→80%) ✓✓ BREAKTHROUGH (stable base
 Exp 9:  75% peak @ iter 70 → 59.5% final - Extended inverted, late-stage overfitting
 Exp 10: 65% peak @ iter 60 → 62.5% final - Inverted V ✗ FAILED (never reached peak)
 Exp 11: 65% @ iter 40 → 72.5% final - Plateau curriculum ✓✓ LATE IMPROVEMENT (generalization works!)
+Exp 12: 67.5% peak @ iter 10 → ~45% avg - 10x model + pure self-play ✗ UNSTABLE (see EXPERIMENT_12_SUMMARY.md)
+Exp 13: 70% peak @ iter 80 → 65% final - 10x model + plateau curriculum ✗ WORSE PLAY QUALITY (overfit to Strategic)
 ```
 
 **Key Insights**:
@@ -684,3 +793,7 @@ Exp 11: 65% @ iter 40 → 72.5% final - Plateau curriculum ✓✓ LATE IMPROVEME
 3. **Monotonic increase causes overfitting** (Exp 9: 75%→59.5%)
 4. **Aggressive curriculum reversal WORKS** (Exp 11: 85%→40% improved 65%→72.5%)
 5. **Generalization phase can improve performance** (Exp 11: Phase 3 added +7.5%)
+6. **Pure self-play requires curriculum anchor** (Exp 12: 10x model failed without Strategic opponent)
+7. **Strategic win rate ≠ human play quality** (Exp 13: 65% Strategic but easily beaten by humans)
+8. **Large models (10.8M) overfit more than small (1.2M)** - capacity amplifies bad training signals
+9. **Self-play collapse to 0% P1 = degenerate strategies** - critical warning sign

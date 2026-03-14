@@ -57,7 +57,7 @@ class SEResBlock(nn.Module):
 
 
 class PolicyValueNet(nn.Module):
-    """Large network for 4x4 grid game - Experiment 12: 10x scale with SE blocks"""
+    """Large network for 4x4 grid game - Experiment 13: 10.8M params with SE blocks"""
 
     def __init__(self):
         super().__init__()
@@ -198,11 +198,11 @@ class ModelWrapper:
         self.final_div_factor = 4  # Less aggressive decay
         self.max_iterations = 100  # Exp 12: Synchronized with train.py
 
-        # Learning rates - Exp 12: Slightly lower for larger model stability
+        # Learning rates - Exp 13: Lower for large model stability with curriculum
         if self.mode == "fast":
             self.max_lr = 0.010  # Reduced from 0.015 for stability
         elif self.mode == "stable":
-            self.max_lr = 0.003  # Reduced from 0.005 for 12M param model
+            self.max_lr = 0.002  # Reduced from 0.003 for better stability with 10.8M params
 
         # Optimizer parameters - Exp 12: Adjusted for larger model
         weight_decay = 3e-5  # Increased from 2e-5 for larger model
@@ -528,7 +528,8 @@ class ModelWrapper:
 
     def load_checkpoint(self, path):
         """Load full checkpoint including training state"""
-        checkpoint = torch.load(path, map_location=self.device)
+        # weights_only=False needed to load TrainingExample objects in replay buffer
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         # Load model state
         if "model_state_dict" in checkpoint:

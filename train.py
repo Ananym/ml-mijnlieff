@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import torch
 from game import GameState, PieceType, Player, GameStateRepresentation, TurnResult, Move
@@ -81,8 +82,8 @@ EARLY_STOPPING_MIN_WINRATE = (
 
 BALANCE_REPLAY_BUFFER = False  # REVERTED to Exp 1 baseline - natural distribution
 
-# Dirichlet noise - Experiment 12: Pure Self-Play (constant high exploration)
-DIRICHLET_SCALE = 0.30  # Constant exploration throughout - higher for pure self-play diversity
+# Dirichlet noise - Experiment 13: Plateau Curriculum (moderate, increases in Phase 3)
+DIRICHLET_SCALE = 0.25  # Base exploration, increases to 0.30 in generalization phase
 
 ENTROPY_BONUS_SCALE = 0.07  # Encourage policy diversity for human play
 
@@ -97,21 +98,24 @@ def get_mcts_class(device):
 
 def get_dirichlet_scale(iteration):
     """
-    Experiment 12: Pure Self-Play - constant high exploration
-    Returns constant 0.30 throughout training for diversity without opponent curriculum.
+    Experiment 14: Constant moderate exploration throughout
+    No phases - just steady 0.25 Dirichlet noise
     """
-    return DIRICHLET_SCALE
+    return DIRICHLET_SCALE  # 0.25 constant
 
 
-# Experiment 12: PURE SELF-PLAY - No strategic opponent, only model vs model
+# Experiment 14: Mostly Self-Play with Strategic Anchor
+# Constant 15% Strategic throughout - no curriculum ramp
+# 85% self-play to preserve creative strategies (Exp 12 was best human-facing model)
 INITIAL_RANDOM_OPPONENT_RATIO = 0.0
 FINAL_RANDOM_OPPONENT_RATIO = 0.0
 
-INITIAL_STRATEGIC_OPPONENT_RATIO = 0.0  # Pure self-play
-PEAK_STRATEGIC_OPPONENT_RATIO = 0.0  # No strategic opponent
-FINAL_STRATEGIC_OPPONENT_RATIO = 0.0  # 100% self-play throughout
-PHASE_1_END = 40  # Not used in pure self-play
-PHASE_2_END = 60  # Not used in pure self-play
+STRATEGIC_OPPONENT_RATIO = 0.15  # Constant 15% Strategic, 85% self-play
+INITIAL_STRATEGIC_OPPONENT_RATIO = 0.15  # All same for constant ratio
+PEAK_STRATEGIC_OPPONENT_RATIO = 0.15
+FINAL_STRATEGIC_OPPONENT_RATIO = 0.15
+PHASE_1_END = 100   # No phases - constant throughout
+PHASE_2_END = 100   # No phases - constant throughout
 OPPONENT_TRANSITION_ITERATIONS = 100  # Total iterations
 
 DEFAULT_INITIAL_RANDOM_CHANCE = 0.0
@@ -122,7 +126,8 @@ BOOTSTRAP_MIN_WEIGHT = 0.0  # Pure game outcomes (Exp 1 baseline) - AlphaZero's 
 BOOTSTRAP_MAX_WEIGHT = 0.0  # No bootstrapping (Exp 1 baseline)
 BOOTSTRAP_TRANSITION_ITERATIONS = MAX_ITERATIONS  # No transition, keep constant
 
-DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint_interrupted.pth"
+DEFAULT_CHECKPOINT_PATH = "saved_models/checkpoint.pth"
+DEFAULT_CHECKPOINT_META_PATH = "saved_models/checkpoint_meta.json"
 
 
 def get_reward_values(reward_config="discrete"):
@@ -427,6 +432,37 @@ def training_loop(
     adaptive_policy_weight = DEFAULT_POLICY_WEIGHT
     grad_ratio_history = []  # Track gradient ratio over time
 
+    # Resume from checkpoint if path provided
+    if resume_path and os.path.exists(resume_path):
+        print(f"\n=== Resuming from checkpoint: {resume_path} ===")
+        checkpoint = model.load_checkpoint(resume_path)
+
+        # Restore training state
+        if "replay_buffer" in checkpoint:
+            replay_buffer = checkpoint["replay_buffer"]
+            print(f"  Restored replay buffer: {len(replay_buffer)} examples")
+        if "running_loss" in checkpoint:
+            running_loss = checkpoint["running_loss"]
+        if "running_count" in checkpoint:
+            running_count = checkpoint["running_count"]
+        if "iteration" in checkpoint:
+            iteration = checkpoint["iteration"]
+            print(f"  Resuming from iteration: {iteration}")
+        if "rng_state" in checkpoint:
+            rng.__setstate__(checkpoint["rng_state"])
+        if "adaptive_policy_weight" in checkpoint:
+            adaptive_policy_weight = checkpoint["adaptive_policy_weight"]
+        if "grad_ratio_history" in checkpoint:
+            grad_ratio_history = checkpoint["grad_ratio_history"]
+
+        print(f"  Will continue training from iteration {iteration + 1}")
+        print("=" * 50 + "\n")
+    else:
+        # Fresh start - clear any stale checkpoint metadata
+        if os.path.exists(DEFAULT_CHECKPOINT_META_PATH):
+            os.remove(DEFAULT_CHECKPOINT_META_PATH)
+            print("Cleared stale checkpoint metadata from previous run")
+
     stats_template = {
         "win_rate": 0.0,
         "loss_rate": 0.0,
@@ -440,8 +476,6 @@ def training_loop(
     random_opponent = RandomOpponent()
     os.makedirs("saved_models", exist_ok=True)
     os.makedirs("saved_plots", exist_ok=True)
-
-    checkpoint_path = DEFAULT_CHECKPOINT_PATH
 
     interrupt_received = False
     in_training_phase = False  # track whether we're in the training phase
@@ -463,7 +497,7 @@ def training_loop(
             if not os.path.exists("saved_models"):
                 os.makedirs("saved_models")
 
-            # Use the constant here
+            # Prepare training state for checkpoint
             training_state = {
                 "replay_buffer": replay_buffer,
                 "running_loss": running_loss,
@@ -473,9 +507,28 @@ def training_loop(
                 "adaptive_policy_weight": adaptive_policy_weight,
                 "grad_ratio_history": grad_ratio_history,
             }
-            model.save_checkpoint(checkpoint_path, training_state)
-            print(f"Saved checkpoint to {checkpoint_path}")
-            print(f"Resume with: --resume")  # Simplified message
+            model.save_checkpoint(DEFAULT_CHECKPOINT_PATH, training_state)
+            print(f"Saved checkpoint to {DEFAULT_CHECKPOINT_PATH}")
+
+            # Save human-readable metadata JSON
+            elapsed_time = time.time() - training_start
+            hours = int(elapsed_time // 3600)
+            minutes = int((elapsed_time % 3600) // 60)
+            metadata = {
+                "iteration": iteration,
+                "max_iterations": MAX_ITERATIONS,
+                "elapsed_time": f"{hours}h {minutes}m",
+                "elapsed_seconds": int(elapsed_time),
+                "replay_buffer_size": len(replay_buffer),
+                "running_loss": running_loss,
+                "training_mode": training_mode,
+                "reward_config": reward_config,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(DEFAULT_CHECKPOINT_META_PATH, "w") as f:
+                json.dump(metadata, f, indent=2)
+            print(f"Saved metadata to {DEFAULT_CHECKPOINT_META_PATH}")
+            print(f"Resume with: python train.py --resume")
 
         interrupt_received = True
 
@@ -859,38 +912,10 @@ def training_loop(
     # Function to update opponent ratios based on current iteration
     def get_opponent_ratios(iteration):
         """
-        Experiment 11: Plateau Curriculum
-        - Phase 1 (iter 1 -> 40): Ramp up quickly to 85% Strategic (fast specialization)
-        - Phase 2 (iter 40 -> 60): Maintain 85% Strategic (plateau to consolidate learning)
-        - Phase 3 (iter 60 -> 100): Ramp down to 40% Strategic (restore generalization)
+        Experiment 14: Constant 15% Strategic, 85% self-play
+        No curriculum ramp - preserves creative self-play strategies
         """
-        random_ratio = INITIAL_RANDOM_OPPONENT_RATIO  # Always 0 for now
-
-        if iteration <= PHASE_1_END:
-            # Phase 1: Fast ramp up to peak (build expertise quickly)
-            progress = iteration / PHASE_1_END
-            strategic_ratio = INITIAL_STRATEGIC_OPPONENT_RATIO + progress * (
-                PEAK_STRATEGIC_OPPONENT_RATIO - INITIAL_STRATEGIC_OPPONENT_RATIO
-            )
-        elif iteration <= PHASE_2_END:
-            # Phase 2: Plateau at peak (consolidate learning)
-            strategic_ratio = PEAK_STRATEGIC_OPPONENT_RATIO
-        else:
-            # Phase 3: Ramp down from peak (restore generalization)
-            progress = (iteration - PHASE_2_END) / (OPPONENT_TRANSITION_ITERATIONS - PHASE_2_END)
-            strategic_ratio = PEAK_STRATEGIC_OPPONENT_RATIO + progress * (
-                FINAL_STRATEGIC_OPPONENT_RATIO - PEAK_STRATEGIC_OPPONENT_RATIO
-            )
-
-        # Ensure self-play ratio is always positive by capping total opponent ratio
-        total_opponent_ratio = random_ratio + strategic_ratio
-        if total_opponent_ratio > 0.9:
-            # Scale down both to keep relative proportions but cap total
-            scale = 0.9 / total_opponent_ratio
-            random_ratio *= scale
-            strategic_ratio *= scale
-
-        return random_ratio, strategic_ratio
+        return 0.0, STRATEGIC_OPPONENT_RATIO  # 0% random, 15% strategic
 
     # Initialize opponent ratios for first iteration
     random_opponent_ratio, strategic_opponent_ratio = get_opponent_ratios(iteration)
@@ -1457,6 +1482,66 @@ def training_loop(
                                 f"Win rate vs Strategic is acceptable. Continuing training..."
                             )
                         print("=" * 50 + "\n")
+
+                # Save periodic checkpoint (same frequency as evals)
+                training_state = {
+                    "replay_buffer": replay_buffer,
+                    "running_loss": running_loss,
+                    "running_count": running_count,
+                    "iteration": iteration,
+                    "rng_state": rng.__getstate__(),
+                    "adaptive_policy_weight": adaptive_policy_weight,
+                    "grad_ratio_history": grad_ratio_history,
+                }
+                model.save_checkpoint(DEFAULT_CHECKPOINT_PATH, training_state)
+
+                # Save human-readable metadata JSON with eval results
+                elapsed_time = time.time() - training_start
+                hours = int(elapsed_time // 3600)
+                minutes = int((elapsed_time % 3600) // 60)
+
+                # Extract key eval metrics for the log
+                eval_summary = {
+                    "vs_strategic_p1_winrate": eval_results["vs_strategic_as_p1"]["model_wins"] / max(1, eval_results["vs_strategic_as_p1"]["total_games"]) * 100,
+                    "vs_strategic_p2_winrate": eval_results["vs_strategic_as_p2"]["model_wins"] / max(1, eval_results["vs_strategic_as_p2"]["total_games"]) * 100,
+                    "combined_strategic_winrate": eval_results["combined_strategic_winrate"],
+                    "self_play_p1_winrate": eval_results["self_play"]["p1_wins"] / max(1, eval_results["self_play"]["total_games"]) * 100,
+                    "mcts_contribution_p1": eval_results["mcts_as_p1"]["mcts_wins"] / max(1, eval_results["mcts_as_p1"]["total_games"]) * 100,
+                    "mcts_contribution_p2": eval_results["mcts_as_p2"]["mcts_wins"] / max(1, eval_results["mcts_as_p2"]["total_games"]) * 100,
+                }
+
+                checkpoint_entry = {
+                    "iteration": iteration,
+                    "max_iterations": MAX_ITERATIONS,
+                    "elapsed_time": f"{hours}h {minutes}m",
+                    "elapsed_seconds": int(elapsed_time),
+                    "replay_buffer_size": len(replay_buffer),
+                    "running_loss": running_loss,
+                    "training_mode": training_mode,
+                    "reward_config": reward_config,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "eval_results": eval_summary,
+                }
+
+                # Load existing history or create new
+                history = []
+                if os.path.exists(DEFAULT_CHECKPOINT_META_PATH):
+                    try:
+                        with open(DEFAULT_CHECKPOINT_META_PATH, "r") as f:
+                            history = json.load(f)
+                            if not isinstance(history, list):
+                                history = [history]  # Convert old format to list
+                    except (json.JSONDecodeError, IOError):
+                        history = []
+
+                # Append new entry (or update if same iteration exists)
+                history = [h for h in history if h.get("iteration") != iteration]
+                history.append(checkpoint_entry)
+                history.sort(key=lambda x: x.get("iteration", 0))
+
+                with open(DEFAULT_CHECKPOINT_META_PATH, "w") as f:
+                    json.dump(history, f, indent=2)
+                print(f"Checkpoint saved (iter {iteration})")
 
             # Gather all metrics for the consolidated report
             loss_stats = {"total": avg_total, "policy": avg_policy, "value": avg_value}
